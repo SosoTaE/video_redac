@@ -97,6 +97,11 @@ ifdef CPU
   OPENMP  ?= -fopenmp
   CFLAGS  += $(OPENMP)
   LDFLAGS += $(OPENMP)
+  # Turning OpenMP off (make CPU=1 OPENMP=) is a supported configuration, so
+  # the resulting "ignoring #pragma omp" flood is noise, not a finding.
+  ifeq ($(strip $(OPENMP)),)
+    CFLAGS += -Wno-unknown-pragmas
+  endif
 else
   C_SRCS  := $(filter-out src/renderer_cpu.c,$(ALL_C))
   CU_SRCS := $(wildcard src/*.cu)

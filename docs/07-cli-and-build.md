@@ -200,9 +200,18 @@ The binary lacks your GPU's architecture. Check `make info` and set `GENCODE`.
 **`nvcc fatal: unsupported GNU version`**
 Host compiler too new; set `NVCC_CCBIN` to gcc ≤ 15.
 
-**`ffmpeg ვერ გაეშვა` / ffmpeg failed to start**
+**`error: could not start ffmpeg (is it on PATH?)`**
 `ffmpeg` is not on `PATH`, or the chosen encoder is unavailable. Check with
 `ffmpeg -hide_banner -encoders | grep nvenc`.
+
+**`error: no CUDA-capable GPU found`**
+The CUDA build needs an NVIDIA GPU. Either build the CPU backend
+(`make CPU=1`), or use `--check` / `--dry-run`, which never touch CUDA.
+
+**`x264 [error]: invalid preset 'p5'`**
+An NVENC preset reached a software encoder. `vr_open_ffmpeg_pipe` drops a
+project's preset across an encoder-family fallback, so this means one was forced
+— check `output.preset` against `$VIDEO_REDAC_ENCODER`.
 
 **Text renders as empty boxes**
 The font lacks those glyphs. Cairo's toy API does no per-glyph fallback, so a
