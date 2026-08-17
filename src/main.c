@@ -36,6 +36,10 @@ static void print_usage(const char *prog)
             "  -c, --check          validate the project and exit (0 = clean)\n"
             "  -r, --range A:B      render only seconds A..B (fast preview)\n"
             "  -s, --set KEY=VALUE  set a ${KEY} variable; repeatable\n"
+            "  -f, --frame T        render one frame at T seconds (use a .png output)\n"
+            "  -j, --json           machine-readable --check / --dump output\n"
+            "      --list WHAT      effects | transitions | easings | actions |\n"
+            "                       properties | widgets, as JSON\n"
             "  -h, --help           this help\n"
             "\n"
             "Audio: a top-level 'audio' array of files (no speech synthesis).\n"
@@ -76,7 +80,9 @@ int main(int argc, char **argv)
     bool        want_dump   = false;
     bool        dry_run     = false;
     bool        want_check  = false;
+    bool        want_json   = false;   /* machine-readable diagnostics */
     double      range_start = 0.0, range_end = 0.0;
+    double      frame_at    = -1.0;    /* --frame T: a single still */
     char      **defines     = NULL;   /* array of --set values; points into argv */
     int         define_count = 0;
 
@@ -89,7 +95,32 @@ int main(int argc, char **argv)
             free(defines);
             return EXIT_SUCCESS;
         }
-        if (strcmp(arg, "-d") == 0 || strcmp(arg, "--dump") == 0) {
+        if (strcmp(arg, "--list") == 0) {
+            /* Handled before anything else: it needs no project file. */
+            if (i + 1 >= argc || !vr_list_table(argv[i + 1])) {
+                fprintf(stderr, "error: --list expects one of: effects, transitions, "
+                                "easings, actions, properties, widgets.\n");
+                free(defines);
+                return EXIT_FAILURE;
+            }
+            free(defines);
+            return EXIT_SUCCESS;
+        }
+        if (strcmp(arg, "-j") == 0 || strcmp(arg, "--json") == 0) {
+            want_json = true;
+        } else if (strcmp(arg, "-f") == 0 || strcmp(arg, "--frame") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "error: %s requires a timestamp in seconds.\n", arg);
+                free(defines);
+                return EXIT_FAILURE;
+            }
+            frame_at = atof(argv[++i]);
+            if (frame_at < 0.0) {
+                fprintf(stderr, "error: --frame needs a timestamp >= 0.\n");
+                free(defines);
+                return EXIT_FAILURE;
+            }
+        } else if (strcmp(arg, "-d") == 0 || strcmp(arg, "--dump") == 0) {
             want_dump = true;
         } else if (strcmp(arg, "-n") == 0 || strcmp(arg, "--dry-run") == 0) {
             dry_run = true;
@@ -153,15 +184,31 @@ int main(int argc, char **argv)
     }
 
     if (want_dump) {
-        editor_context_dump(ctx); /* texture sizes are known by now too */
+        if (want_json) {
+            editor_context_dump_json(ctx);
+        } else {
+            editor_context_dump(ctx); /* texture sizes are known by now too */
+        }
     }
 
     /* --- 3b. Validation --------------------------------------------------- */
     if (want_check) {
-        int problems = editor_context_check(ctx);
+        int problems = want_json ? editor_context_check_json(ctx)
+                                 : editor_context_check(ctx);
         editor_context_free(ctx);
         media_shutdown();
         return (problems == 0) ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+
+    /*
+     * --frame is a one-frame --range. Expressing it that way rather than as a
+     * separate path means the still comes from exactly the same code as the
+     * video — a preview that could disagree with the render would be worse than
+     * no preview at all.
+     */
+    if (frame_at >= 0.0) {
+        range_start = frame_at;
+        range_end   = frame_at + 0.5 / (double)ctx->config.fps;
     }
 
     ctx->range_start_sec = range_start;

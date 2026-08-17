@@ -302,6 +302,17 @@ typedef struct {
      */
     char      *group_name;
     int        group_index;   /* scene-local index into Scene::groups, or -1 */
+
+    /*
+     * Clip mask, in the object's own texture space as fractions 0..1.
+     * shape 0 = none, 1 = circle (cx, cy, r), 2 = rectangle (x, y, w, h).
+     *
+     * Fractions rather than pixels so a mask survives scaling: "the left half"
+     * stays the left half whatever size the object animates to.
+     */
+    int        mask_shape;
+    float      mask[4];
+    bool       mask_invert;
 } WidgetBase;
 
 /* A plain text object — titles, captions, formulae. */
@@ -377,6 +388,17 @@ typedef struct {
     Color  stroke_color;
     float  stroke_width;
     bool   filled;
+
+    /*
+     * An optional gradient fill, drawn by Cairo at rasterization time.
+     * kind 0 = none (flat `color`), 1 = linear, 2 = radial.
+     *
+     * Two stops covers what motion graphics actually use; more would mean a
+     * variable-length array in a struct that is otherwise plain data.
+     */
+    int    grad_kind;
+    Color  grad_from, grad_to;
+    float  grad_angle;      /* degrees, linear only */
 } ShapeWidget;
 
 /*
@@ -652,6 +674,22 @@ typedef struct {
  */
 #define VR_MAX_GROUPS 64
 
+/*
+ * A whole-scene transform: zoom, pan, roll and shake.
+ *
+ * It is composed onto every object exactly as a group is, and for the same
+ * reason — the alternative is animating each object identically, which is both
+ * verbose and impossible to keep in sync. A camera push replaces what would
+ * otherwise be a `scale` on every layer in the scene.
+ */
+typedef struct {
+    bool  present;
+    Track zoom;        /* 1 = neutral                                   */
+    Track x, y;        /* pan, in pixels; positive x moves content left */
+    Track rotation;    /* roll, degrees                                 */
+    Track shake;       /* amplitude in pixels; 0 = still               */
+} Camera;
+
 typedef struct {
     char          *id;
     int            duration_ms;
@@ -665,6 +703,8 @@ typedef struct {
 
     GroupDef      *groups;        /* scene-local, like everything else here    */
     size_t         group_count, group_cap;
+
+    Camera         camera;
 
     Color          bg_color;
     bool           has_bg;

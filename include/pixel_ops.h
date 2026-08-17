@@ -673,6 +673,14 @@ typedef struct {
     float tint_amount;
     float tint_r, tint_g, tint_b;
 
+    /*
+     * Clip mask in texture space, as fractions of the texture.
+     * 0 = none, 1 = circle (m[0],m[1] centre, m[2] radius), 2 = rect.
+     */
+    int   mask_shape;
+    float mask[4];
+    int   mask_invert;
+
     /* TYPEWRITE: line geometry in texture space. */
     float pad_y, line_height;
     int   line_count;
@@ -825,6 +833,30 @@ VR_PIX void vr_px_composite(uchar4 *VR_RESTRICT fb,
 
     if (u < 0.0f || u >= (float)p->tex_w || v < 0.0f || v >= (float)p->tex_h) {
         return; /* the texture does not cover this pixel */
+    }
+
+    /*
+     * Clip mask. Evaluated in normalised texture space, so it scales and
+     * rotates with the object instead of staying stuck to the screen.
+     */
+    if (p->mask_shape != 0) {
+        float nx = u / (float)p->tex_w;
+        float ny = v / (float)p->tex_h;
+        bool  in;
+
+        if (p->mask_shape == 1) {
+            float mdx = nx - p->mask[0], mdy = ny - p->mask[1];
+            in = (mdx * mdx + mdy * mdy) <= (p->mask[2] * p->mask[2]);
+        } else {
+            in = nx >= p->mask[0] && nx <= p->mask[0] + p->mask[2] &&
+                 ny >= p->mask[1] && ny <= p->mask[1] + p->mask[3];
+        }
+        if (p->mask_invert) {
+            in = !in;
+        }
+        if (!in) {
+            return;
+        }
     }
 
     /*

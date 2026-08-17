@@ -403,6 +403,65 @@ void vr_evaluate_scene(const EditorContext *ctx, const Scene *scene,
         rt[i].opacity *= g->opacity;
     }
 
+    /*
+     * --- the camera ---------------------------------------------------------
+     *
+     * The same composition as a group, but the pivot is the canvas centre and
+     * every object is a member. Applied after groups, so a camera move layers
+     * on top of whatever the scene's own hierarchy did rather than being
+     * overwritten by it.
+     */
+    if (scene->camera.present) {
+        const Camera *cam = &scene->camera;
+
+        float zoom = track_sample(&cam->zoom, t_sec);
+        float rot  = track_sample(&cam->rotation, t_sec) * (float)(M_PI / 180.0);
+        float panx = track_sample(&cam->x, t_sec);
+        float pany = track_sample(&cam->y, t_sec);
+        float amp  = track_sample(&cam->shake, t_sec);
+
+        if (zoom < 0.001f) {
+            zoom = 0.001f;
+        }
+
+        /*
+         * Shake is a hash of the millisecond, not a random number: the frame
+         * has to stay a pure function of time or --range and the two backends
+         * would each produce a different judder.
+         */
+        float sx = 0.0f, sy = 0.0f;
+        if (amp > 0.0f) {
+            unsigned int h = (unsigned int)local_ms * 2654435761u;
+            h ^= h >> 15; h *= 0x2c1b3c6du;
+            unsigned int h2 = h ^ 0x9e3779b9u;
+            h2 ^= h2 >> 13; h2 *= 0x297a2d39u;
+
+            sx = ((float)(h  & 0xFFFF) / 32768.0f - 1.0f) * amp;
+            sy = ((float)(h2 & 0xFFFF) / 32768.0f - 1.0f) * amp;
+        }
+
+        float ccx = (float)ctx->config.width  * 0.5f;
+        float ccy = (float)ctx->config.height * 0.5f;
+        float cs  = cosf(rot), sn = sinf(rot);
+
+        for (size_t i = 0; i < scene->widget_count; i++) {
+            float cx = rt[i].x + rt[i].w * 0.5f;
+            float cy = rt[i].y + rt[i].h * 0.5f;
+
+            /* Panning moves the camera, so the content moves the other way. */
+            float dx = (cx - ccx - panx) * zoom;
+            float dy = (cy - ccy - pany) * zoom;
+
+            cx = ccx + dx * cs - dy * sn + sx;
+            cy = ccy + dx * sn + dy * cs + sy;
+
+            rt[i].x         = cx - rt[i].w * 0.5f;
+            rt[i].y         = cy - rt[i].h * 0.5f;
+            rt[i].scale    *= zoom;
+            rt[i].rotation += rot;
+        }
+    }
+
     for (size_t i = 0; i < scene->widget_count; i++) {
         rt[i].opacity = vr_clampf(rt[i].opacity, 0.0f, 1.0f);
         rt[i].reveal  = vr_clampf(rt[i].reveal, 0.0f, 1.0f);
@@ -566,6 +625,12 @@ bool vr_composite_setup(int fb_w, int fb_h, int tex_w, int tex_h,
     out->bb_w  = x1 - x0;
     out->bb_h  = y1 - y0;
     out->alpha = rt->opacity;
+
+    out->mask_shape  = b->mask_shape;
+    out->mask_invert = b->mask_invert ? 1 : 0;
+    for (int m = 0; m < 4; m++) {
+        out->mask[m] = b->mask[m];
+    }
 
     const float inv255 = 1.0f / 255.0f;
     out->tint_amount = vr_clampf(rt->tint, 0.0f, 1.0f);
@@ -901,6 +966,36 @@ FILE *vr_open_ffmpeg_pipe(const EditorContext *ctx, const char *output_file,
 
     /* -tune hq is NVENC-only; x264's tunes mean something else entirely. */
     const char *tune = is_nvenc ? "-tune hq " : "";
+
+    /*
+     * A still image: --frame writes a .png, which needs a different tail.
+     * -movflags belongs to the mp4 muxer, and -pix_fmt nv12 would ask the PNG
+     * encoder for a format it does not have; rgb24 is what it wants.
+     */
+    size_t olen = strlen(output_file);
+    bool   is_png = (olen > 4 && strcmp(output_file + olen - 4, ".png") == 0);
+
+    if (is_png) {
+        char cmd_png[4096];
+        int  m = snprintf(cmd_png, sizeof cmd_png,
+                          "ffmpeg -hide_banner -loglevel error -y "
+                          "-f rawvideo -pixel_format nv12 -video_size %dx%d -framerate %d "
+                          "-colorspace bt709 -color_primaries bt709 -color_trc bt709 "
+                          "-color_range tv -i - "
+                          "-frames:v 1 -pix_fmt rgb24 %s",
+                          ctx->config.width, ctx->config.height, ctx->config.fps,
+                          quoted_out);
+        if (m < 0 || (size_t)m >= sizeof cmd_png) {
+            fprintf(stderr, "error: the ffmpeg command did not fit in the buffer.\n");
+            return NULL;
+        }
+        fprintf(stderr, "FFmpeg: %s\n", cmd_png);
+        FILE *pipe_png = popen(cmd_png, "w");
+        if (pipe_png == NULL) {
+            fprintf(stderr, "error: could not start ffmpeg (is it on PATH?).\n");
+        }
+        return pipe_png;
+    }
 
     char cmd[4096];
     int  n = snprintf(cmd, sizeof cmd,

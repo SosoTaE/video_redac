@@ -37,3 +37,13 @@ listing/photos/
 .DS_Store
 .vscode/
 .idea/
+
+# ---------------------------------------------------------------------------
+# MCP server
+# ---------------------------------------------------------------------------
+#
+# The virtualenv is a local build artefact — recreate it with:
+#   python3 -m venv mcp/.venv && mcp/.venv/bin/pip install -r mcp/requirements.txt
+mcp/.venv/
+__pycache__/
+*.pyc

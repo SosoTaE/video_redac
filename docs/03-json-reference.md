@@ -221,6 +221,35 @@ about their own midpoints, off to one side. See `anim/lines.json`.
 
 ---
 
+## `camera`
+
+A whole-scene transform, given per scene (or at the root in flat mode).
+
+```json
+"camera": {
+  "zoom":  [ {"t":0,"v":1}, {"t":1.5,"v":1.9,"ease":"cubicinout"}, {"t":3,"v":1} ],
+  "x":     [ {"t":0,"v":0}, {"t":1.5,"v":120} ],
+  "shake": [ {"t":3,"v":0}, {"t":3.2,"v":14}, {"t":3.8,"v":0} ]
+}
+```
+
+| Key | Type | Meaning |
+|---|---|---|
+| `zoom` | track | 1 is neutral |
+| `x`, `y` | track | pan in pixels; the content moves the opposite way |
+| `rotation` | track | roll, degrees |
+| `shake` | track | amplitude in pixels; 0 is still |
+
+Composed onto every object exactly as a group is, with the canvas centre as the
+pivot, and applied after groups — so a camera move layers on top of a scene's
+own hierarchy instead of being overwritten by it.
+
+**Shake is a hash of the timestamp, not a random number.** A frame has to stay
+a pure function of time, or `--range` and the two backends would each produce a
+different judder.
+
+---
+
 ## `groups[]`
 
 A parent transform shared by several objects.
@@ -252,6 +281,39 @@ scene may hold up to 64 groups.
 
 Twenty-four petals and a whole kaleidoscope come to **three** timeline events —
 see `anim/kaleido.json`.
+
+---
+
+## `counter` — a number that changes
+
+```json
+{ "type": "text", "x": "center", "y": 70, "size": 54, "color": "#F85149",
+  "counter": { "from": 0.842, "to": 0.041, "decimals": 3,
+               "prefix": "loss  ", "duration_ms": 2600, "rate": 14 } }
+```
+
+| Key | Type | Default |
+|---|---|---|
+| `from`, `to` | float | 0, 100 |
+| `decimals` | int | 0 |
+| `prefix`, `suffix` | string | "" |
+| `duration_ms` / `duration` | int / float | 1000 ms |
+| `start_ms` | int | 0 |
+| `rate` | int | 12 updates per second |
+| `ease` | string | `cubicout` |
+| `thousands` | bool | false — group the integer part |
+
+The parser expands this into one text object per displayed value, each visible
+for its own slice of the timeline. Re-rasterizing the text every frame would
+break the invariant the renderer is built on — a texture is drawn once and
+composited many times — so the values are enumerated instead.
+
+That is affordable because a counter does not need to change every frame. At the
+default rate a five-second count is about sixty small textures. Steps that
+render the same string are merged, so a low `decimals` costs far fewer.
+
+Values switch cleanly rather than crossfading: two numbers dissolving through
+each other reads as a blur, not as a count.
 
 ---
 
@@ -306,6 +368,23 @@ Particles disappear at the end of their life rather than freezing in place.
 ## `objects[]`
 
 ### Common to every object
+
+Two keys every object accepts, beyond position and the property tracks:
+
+| Key | Type | Meaning |
+|---|---|---|
+| `z` | int | explicit draw order, overriding array position |
+| `clip` / `mask` | object | clip the object to a shape |
+
+```json
+"clip": { "shape": "circle", "cx": 0.5, "cy": 0.5, "r": 0.45 }
+"clip": { "shape": "rect", "x": 0, "y": 0, "w": 1, "h": 0.5, "invert": true }
+```
+
+Mask coordinates are **fractions of the object's own box**, not pixels, so a
+mask survives scaling: "the left half" stays the left half at any size the
+object animates to. It rotates with the object too.
+
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
@@ -465,6 +544,17 @@ produces `object-fit: cover`:
 ```json
 { "type": "image", "path": "photo.jpg", "height": 1920, "y": 0 }
 ```
+
+### Gradients (`rect` / `circle`)
+
+```json
+"gradient": { "kind": "linear", "from": "#7EE787", "to": "#79C0FF", "angle": 90 }
+"gradient": { "kind": "radial", "from": "#FFD166", "to": "#F85149" }
+```
+
+Replaces the flat `color`. Two stops, evaluated by Cairo when the shape is
+rasterized — so a gradient costs nothing per frame, like everything else about
+a shape's appearance.
 
 ### Outlines (`rect` / `circle`)
 
@@ -634,6 +724,27 @@ Behaviour worth knowing:
   the earlier one.
 - A range beyond the end of the text is clamped; one starting beyond it draws
   nothing.
+
+### Custom easing curves
+
+A project-level `eases` block defines curves usable anywhere `ease` is accepted:
+
+```json
+"eases": {
+  "snappy":  [0.9, 0.0, 0.1, 1.0],
+  "springy": { "type": "spring", "bounces": 3, "damping": 0.35 }
+}
+```
+
+A four-number array is a CSS-style cubic-bezier. An object with
+`"type": "spring"` takes `bounces` (frequency) and `damping` 0..1 — smaller is
+bouncier. Measured overshoot: 44 % at `damping` 0.2, 24 % at 0.45 (the default),
+7 % at 1.0; every setting settles exactly on the target.
+
+A segment using a custom curve is **resampled into linear sub-keys during
+parsing**, so the renderer never learns that custom curves exist — no per-key
+parameters to carry and no lookup table to reach from a sampler that has no
+context. Twenty-four samples per segment puts the error well below a pixel.
 
 **Easing names:** `linear`, `easein`, `easeout`, `easeinout`, `cubicin`,
 `cubicout`, `cubicinout`, `expoin`, `expoout`, `expoinout`, `backin`, `backout`,

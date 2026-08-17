@@ -53,6 +53,23 @@ void editor_context_dump(const EditorContext *ctx);
  */
 int editor_context_check(const EditorContext *ctx);
 
+/*
+ * The same validation, emitting a JSON report on stdout instead of prose on
+ * stderr. Written for programs that consume the result — an MCP server, CI —
+ * where scraping "✓ no problems found" would be fragile.
+ */
+int editor_context_check_json(const EditorContext *ctx);
+
+/* The parsed project as JSON on stdout: resolved sizes, positions, timings. */
+void editor_context_dump_json(const EditorContext *ctx);
+
+/*
+ * Prints one of the engine's name tables as a JSON array:
+ * "effects", "transitions", "easings", "actions", "properties", "widgets".
+ * Returns false for an unknown table name.
+ */
+bool vr_list_table(const char *what);
+
 #ifdef __cplusplus
 }
 #endif

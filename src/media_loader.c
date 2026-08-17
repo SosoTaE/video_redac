@@ -869,8 +869,39 @@ bool media_render_shape_widget(ShapeWidget *w)
     cairo_paint(cr);
     cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
 
-    cairo_set_source_rgba(cr, w->color.r / 255.0, w->color.g / 255.0,
-                              w->color.b / 255.0, w->color.a / 255.0);
+    /*
+     * The fill: a flat colour, or a gradient Cairo evaluates per pixel.
+     *
+     * Doing this at rasterization rather than in the compositor means a
+     * gradient costs nothing per frame — it is baked into the texture, like
+     * everything else about a shape's appearance.
+     */
+    cairo_pattern_t *fill_pat = NULL;
+    if (w->grad_kind != 0) {
+        double a = w->grad_angle * 3.14159265358979323846 / 180.0;
+
+        if (w->grad_kind == 2) {
+            double r = (iw > ih ? iw : ih) * 0.5;
+            fill_pat = cairo_pattern_create_radial(iw * 0.5, ih * 0.5, 0.0,
+                                                   iw * 0.5, ih * 0.5, r);
+        } else {
+            /* The axis runs through the centre at `angle`, sized so the whole
+             * box is covered whichever way it points. */
+            double hx = cos(a) * iw * 0.5, hy = sin(a) * ih * 0.5;
+            fill_pat = cairo_pattern_create_linear(iw * 0.5 - hx, ih * 0.5 - hy,
+                                                   iw * 0.5 + hx, ih * 0.5 + hy);
+        }
+        cairo_pattern_add_color_stop_rgba(fill_pat, 0.0,
+            w->grad_from.r / 255.0, w->grad_from.g / 255.0,
+            w->grad_from.b / 255.0, w->grad_from.a / 255.0);
+        cairo_pattern_add_color_stop_rgba(fill_pat, 1.0,
+            w->grad_to.r / 255.0, w->grad_to.g / 255.0,
+            w->grad_to.b / 255.0, w->grad_to.a / 255.0);
+        cairo_set_source(cr, fill_pat);
+    } else {
+        cairo_set_source_rgba(cr, w->color.r / 255.0, w->color.g / 255.0,
+                                  w->color.b / 255.0, w->color.a / 255.0);
+    }
 
     /*
      * The outline is inset by half its width so it stays inside the texture.
@@ -907,6 +938,10 @@ bool media_render_shape_widget(ShapeWidget *w)
         cairo_stroke(cr);
     } else if (!w->filled) {
         cairo_new_path(cr);   /* nothing to draw — do not leave a dangling path */
+    }
+
+    if (fill_pat != NULL) {
+        cairo_pattern_destroy(fill_pat);
     }
 
     cairo_destroy(cr);
