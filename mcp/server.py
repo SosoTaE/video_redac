@@ -133,6 +133,52 @@ def _safe_name(name: str) -> str:
     return base or f"render_{int(time.time())}"
 
 
+def _contact_sheet(pngs: list[Path], max_width: int) -> bytes | None:
+    """
+    Tile several frames into one image.
+
+    Six separate pictures answer "what does this moment look like"; one strip
+    answers "does this timeline work" — which is the question an author actually
+    has. Reading them side by side is also how a stalled animation or a
+    mistimed entrance becomes obvious.
+    """
+    if not pngs or not shutil.which("ffmpeg"):
+        return None
+
+    cols = min(len(pngs), 3)
+    rows = (len(pngs) + cols - 1) // cols
+    cell = max(160, max_width // cols)
+
+    cmd: list[str] = ["ffmpeg", "-v", "error"]
+    for p in pngs:
+        cmd += ["-i", str(p)]
+
+    # Every input is scaled to the same cell size: xstack requires matching
+    # dimensions, and a scene's frames are all one size anyway.
+    #
+    # `grid=CxR` rather than a `layout` string. xstack's layout takes *pixel
+    # offsets*, not grid indices — "1_0" means one pixel right, not one cell
+    # right — so a hand-built index layout stacks every frame on the same spot.
+    chains = "".join(f"[{i}:v]scale={cell}:-2,setsar=1[v{i}];" for i in range(len(pngs)))
+    inputs = "".join(f"[v{i}]" for i in range(len(pngs)))
+
+    if len(pngs) == 1:
+        filt = f"{chains}[v0]null[out]"
+    else:
+        filt = (f"{chains}{inputs}"
+                f"xstack=inputs={len(pngs)}:grid={cols}x{rows}:fill=black[out]")
+
+    cmd += ["-filter_complex", filt, "-map", "[out]",
+            "-frames:v", "1", "-f", "image2", "-c:v", "png", "-"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=60)
+        if proc.returncode == 0 and proc.stdout:
+            return proc.stdout
+    except subprocess.TimeoutExpired:
+        pass
+    return None
+
+
 def _downscale(png: Path, max_width: int) -> bytes:
     """Shrink a preview for the reply only; the file on disk is untouched."""
     data = png.read_bytes()
@@ -283,6 +329,8 @@ def preview_frames(
     path: PathArg = None,
     max_width: Annotated[int, Field(default=PREVIEW_MAX_WIDTH,
                                     description="Downscale the returned image; the saved file keeps full size.")] = PREVIEW_MAX_WIDTH,
+    contact_sheet: Annotated[bool, Field(default=True,
+                                         description="Return one tiled strip instead of separate images.")] = True,
 ):
     if not times:
         raise EngineError("give at least one timestamp in `times`")
@@ -294,6 +342,7 @@ def preview_frames(
     stamp = f"preview_{int(time.time() * 1000)}"
 
     out: list[Image | str] = []
+    written: list[Path] = []
     try:
         for t in times:
             png = OUT / f"{stamp}_{t:g}s.png"
@@ -302,11 +351,22 @@ def preview_frames(
                 raise EngineError(
                     f"rendering the frame at {t}s failed:\n{proc.stderr.strip()[-1500:]}"
                 )
-            out.append(f"t = {t:g}s  →  {png}")
-            out.append(Image(data=_downscale(png, max_width), format="png"))
+            written.append(png)
     finally:
         _cleanup(tmp)
 
+    if contact_sheet and len(written) > 1:
+        sheet = _contact_sheet(written, max_width)
+        if sheet is not None:
+            labels = ",  ".join(f"{t:g}s" for t in times)
+            out.append(f"frames at {labels} (left to right, top to bottom)")
+            out.append(Image(data=sheet, format="png"))
+            out.append("saved: " + ", ".join(str(p) for p in written))
+            return out
+
+    for t, png in zip(times, written):
+        out.append(f"t = {t:g}s  →  {png}")
+        out.append(Image(data=_downscale(png, max_width), format="png"))
     return out
 
 

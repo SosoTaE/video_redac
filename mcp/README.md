@@ -39,10 +39,10 @@ Or by hand, in `~/.claude.json` under `mcpServers`:
 | Tool | Does |
 |---|---|
 | `get_authoring_guide` | the full JSON reference, or one section of it |
-| `list_vocabulary` | effect / transition / easing / action / property / object names, from the binary |
+| `list_vocabulary` | effect / transition / easing / action / property / object / **font** names, from the binary |
 | `validate_scene` | parse and check without rendering |
 | `describe_scene` | resolved positions, sizes and timings after expansion |
-| `preview_frames` | single frames at given timestamps, returned as images |
+| `preview_frames` | frames at given timestamps, returned as one tiled contact sheet (or separately with `contact_sheet: false`) |
 | `render_video` | render to MP4, return the path |
 
 A scene may be passed inline as `scene`, or by `path` to a `.json` file. Inline
@@ -67,6 +67,15 @@ All four were found by looking at a rendered frame. An agent authoring scenes is
 in exactly that position — writing JSON it cannot see. A preview is
 byte-identical to the corresponding frame of the full render and takes about
 0.05 s, so there is no reason to skip it.
+
+Frames come back tiled into one strip by default: six separate pictures answer
+"what does this moment look like", while one strip answers "does this timeline
+work" — which is the question an author actually has.
+
+**The one thing a preview cannot catch** is a missing font. Cairo substitutes
+silently, so a scene naming a font that is not installed renders in some other
+face and looks entirely plausible. `list_vocabulary(kind="fonts")` is the only
+defence.
 
 ## Design
 

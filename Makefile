@@ -54,8 +54,10 @@ GENCODE ?= -gencode arch=compute_89,code=sm_89 \
            -gencode arch=compute_120,code=compute_120
 
 # --- External dependencies --------------------------------------------------
-CAIRO_CFLAGS := $(shell pkg-config --cflags cairo)
-CAIRO_LIBS   := $(shell pkg-config --libs cairo)
+CAIRO_CFLAGS := $(shell pkg-config --cflags cairo fontconfig)
+# fontconfig is already a transitive dependency of cairo; naming it explicitly
+# is what lets --list fonts enumerate the installed families.
+CAIRO_LIBS   := $(shell pkg-config --libs cairo fontconfig)
 
 # --- Flags ------------------------------------------------------------------
 INCLUDES := -Iinclude
@@ -73,8 +75,12 @@ OPT      := -O3 -march=native -fno-strict-aliasing
 CFLAGS   := -std=c11 $(WARNINGS) $(OPT) -MMD -MP
 
 # -Xcompiler passes host flags through nvcc; -O3 on both sides (host+device).
+# -MMD -MP through to the host compiler, exactly as the .c rule does. Without
+# it a change to pixel_ops.h rebuilt renderer_cpu.o and left renderer.o stale —
+# and since the two backends are meant to be bit-identical, the resulting
+# mismatch looks like a bug in the code rather than in the build.
 NVCCFLAGS := -std=c++17 -O3 $(GENCODE) -ccbin $(NVCC_CCBIN) \
-             --expt-relaxed-constexpr -lineinfo \
+             --expt-relaxed-constexpr -lineinfo -MMD -MP \
              -Xcompiler "-Wall,-Wextra,-O3,-fno-strict-aliasing"
 
 LDLIBS   := $(CAIRO_LIBS) -lm
@@ -110,7 +116,7 @@ endif
 C_OBJS  := $(patsubst %.c,$(BUILD)/%.o,$(C_SRCS))
 CU_OBJS := $(patsubst %.cu,$(BUILD)/%.o,$(CU_SRCS))
 OBJS    := $(C_OBJS) $(CU_OBJS)
-DEPS    := $(C_OBJS:.o=.d)
+DEPS    := $(OBJS:.o=.d)
 
 # The CPU build links with plain gcc and never mentions the CUDA runtime;
 # the CUDA build links with nvcc so it can do device linking.

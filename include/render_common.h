@@ -103,6 +103,48 @@ bool vr_composite_setup(int fb_w, int fb_h, int tex_w, int tex_h,
 bool vr_highlight_setup(const CompositeParams *geom, const WidgetBase *b,
                         const WidgetRuntime *rt, HighlightParams *out);
 
+/*
+ * Which frame of a clip is showing, and the byte offset of its slice.
+ *
+ * Returns false for anything that is not a video, so a caller can use it as
+ * "does this widget need a per-frame slice?".
+ */
+bool vr_video_slice(const WidgetBase *b, int local_ms, size_t *out_offset);
+
+/*
+ * Fills `order` with the scene's widget indices, farthest first.
+ *
+ * Returns false when the scene uses no depth at all, in which case the caller
+ * should iterate normally — that keeps the painter's order (and therefore every
+ * existing project's output) exactly as it was.
+ *
+ * `order` must have room for scene->widget_count entries.
+ */
+bool vr_depth_order(const Scene *scene, const WidgetRuntime *rt, int *order);
+
+/*
+ * Transforms, projects, shades and culls a mesh into `out` (which must have
+ * room for m->tri_count entries), and fills `mp` with the screen bounding box.
+ *
+ * Returns the number of triangles actually written — culled and off-screen
+ * faces never reach the rasterizer — or 0 when there is nothing to draw.
+ *
+ * `light` is a world-space point light, or NULL for the camera-mounted default.
+ */
+int vr_mesh_project(const MeshWidget *m, const WidgetRuntime *rt,
+                    int fb_w, int fb_h, const float view[12],
+                    const float *light, ScreenTri *out, MeshParams *mp);
+
+/*
+ * The camera's view transform at time `t`, as a 3x4 matrix (rotation then
+ * translation) that takes a world point into view space.
+ *
+ * With no camera tracks this is the fixed viewpoint — eye at (0,0,-focal)
+ * looking down +z — which is a pure translation, so scenes that never move the
+ * camera go through exactly the arithmetic they always did.
+ */
+void vr_camera_view(const Scene *scene, float t_sec, float focal, float view[12]);
+
 /* ------------------------------------------------------------------------- */
 /* Effects                                                                    */
 /* ------------------------------------------------------------------------- */

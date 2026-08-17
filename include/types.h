@@ -161,7 +161,9 @@ typedef enum {
     WIDGET_RECT,    /* rectangle — scrims, lower thirds, divider bars */
     WIDGET_CIRCLE,  /* circle/ellipse — accents, pulses               */
     WIDGET_LINE,    /* straight segment — connectors, edges, arrows   */
-    WIDGET_PATH     /* polyline or bezier — curves, plots, glyphs      */
+    WIDGET_PATH,    /* polyline or bezier — curves, plots, glyphs      */
+    WIDGET_VIDEO,   /* a decoded clip — one texture per frame           */
+    WIDGET_MESH     /* a triangle mesh, rasterized with per-pixel depth  */
 } WidgetKind;
 
 /* ------------------------------------------------------------------------- */
@@ -204,6 +206,14 @@ typedef struct {
     float      x, y;         /* base position; after layout: the anchor point */
     bool       auto_center_x;/* true → x derived from the texture width       */
     int        z_order;      /* order in the JSON → painter's algorithm       */
+
+    /*
+     * Position in parse order, which `z_order` starts equal to but may be
+     * overridden away from. Scenes own a contiguous run of parse positions, so
+     * this is what lets the index check that sorting by z has not moved an
+     * object into a neighbouring scene's slice.
+     */
+    size_t     seq;
     Texture    tex;          /* the cached pixels                             */
     GlyphMetrics glyphs;     /* text only; zeroed for images and shapes       */
 
@@ -241,6 +251,34 @@ typedef struct {
     Track      tr_w, tr_h;
     bool       has_track_w, has_track_h;
 
+    /*
+     * 2.5D: depth, and rotation about the X and Y axes.
+     *
+     * A layer stays a flat quad — this is not a mesh renderer — but the quad is
+     * placed in space and projected, which is what gives cards that turn to
+     * face away, parallax between depths, and a carousel that actually recedes.
+     *
+     * `z` is positive *away* from the viewer. Zero everywhere means the whole
+     * 3D path is skipped and compositing takes exactly the affine route it
+     * always did — which is what keeps existing projects byte-identical.
+     */
+    Track      tr_z, tr_rx, tr_ry;
+    bool       has_track_z, has_track_rx, has_track_ry;
+
+    /*
+     * How a turned layer is treated.
+     *
+     * `shading` 0..1 darkens it as it turns away from the viewer — a flat quad
+     * has no lighting of its own, so without this a card in mid-turn reads as
+     * a shape that merely got narrower.
+     *
+     * `backface` 0 = show (the historical behaviour), 1 = hide, 2 = dim. Hiding
+     * is what a carousel wants: the cards on the far side face away and should
+     * not be seen through the near ones.
+     */
+    float      shading;
+    int        backface;
+
     /* `trim` 0..1 — how much of a line is drawn. Shares the compositor's
      * typewriter cutoff, so it needs no pixel code of its own. */
     Track      tr_trim;
@@ -265,6 +303,17 @@ typedef struct {
      * exists after rasterization.
      */
     char      *x_expr, *y_expr;
+
+    /*
+     * A binding: `"y": "=title.bottom + 24"`, resolved against other objects
+     * once every size and position is known.
+     *
+     * Layout expressions ("center", "bottom-160") answer "where on the
+     * canvas"; a binding answers "where relative to that other thing" — which
+     * is what captions, callouts and stacked panels actually need, and what
+     * otherwise gets hand-computed and then silently goes stale.
+     */
+    char      *x_bind, *y_bind;
     float      anchor_x, anchor_y;     /* 0 = edge, 0.5 = centre, 1 = far edge */
     bool       has_anchor_x, has_anchor_y;
 
@@ -313,6 +362,27 @@ typedef struct {
     int        mask_shape;
     float      mask[4];
     bool       mask_invert;
+
+    /*
+     * Drop shadow / glow.
+     *
+     * Both are the same operation: blur the object's own alpha, tint it, and
+     * draw it underneath. A glow is simply a shadow with no offset and a bright
+     * colour, so one set of fields covers both.
+     *
+     * Applied to the *texture* rather than by the compositor, so it costs
+     * nothing per frame — the same reasoning as gradients. The texture grows by
+     * `tex_pad` on every side to make room, and the object's position is pulled
+     * back by the same amount so the content does not move.
+     */
+    bool       shadow_on;
+    float      shadow_dx, shadow_dy;
+    float      shadow_blur;
+    Color      shadow_color;
+    int        tex_pad;
+
+    /* Blend mode: 0 = normal, 1 = additive, 2 = screen. See pixel_ops.h. */
+    int        blend;
 } WidgetBase;
 
 /* A plain text object — titles, captions, formulae. */
@@ -457,6 +527,98 @@ typedef struct {
     int      cap, join;      /* 0 = butt/miter, 1 = round, 2 = square/bevel */
 } PathWidget;
 
+/*
+ * A video clip, decoded to frames at load time.
+ *
+ * This is the one widget that breaks the pipeline's central assumption — a
+ * texture drawn once and composited many times. The resolution is to decode
+ * every frame up front, stacked into a single texture, and pick the right slice
+ * per frame at composite time. That keeps everything else intact: the frame is
+ * still a pure function of time, `--range` still works, and both backends need
+ * only an offset rather than a decoder.
+ *
+ * The cost is memory, which is why frames are decoded at the *destination*
+ * size rather than the source's: a 640x360 clip is 0.9 MB a frame, a 1080p one
+ * is 8.3 MB. See `mem_budget_mb`.
+ */
+typedef struct {
+    WidgetBase base;         /* base.kind = WIDGET_VIDEO */
+
+    char  *path;
+    float  start;            /* in-point within the source, seconds        */
+    float  speed;            /* 1 = natural; 2 = twice as fast             */
+    bool   loop;             /* repeat instead of holding the last frame   */
+
+    int    frame_w, frame_h; /* one frame; base.tex holds them stacked     */
+    int    frame_count;
+    float  src_fps;
+
+    int    request_w, request_h;  /* 0 = the source's own size             */
+} VideoWidget;
+
+/* ------------------------------------------------------------------------- */
+/* Meshes                                                                     */
+/* ------------------------------------------------------------------------- */
+
+/* One triangle, as indices into the vertex array. */
+typedef struct {
+    int v[3];
+} MeshTri;
+
+/*
+ * A triangle mesh.
+ *
+ * This is the one widget that is not a texture. Everything else in the project
+ * is rasterized once and composited many times; a mesh has to be transformed,
+ * projected and filled every frame, because its silhouette changes with every
+ * degree of rotation.
+ *
+ * Vertices are stored in the mesh's own space, centred on the origin and scaled
+ * so the longest axis spans 1.0. That normalisation is what lets `size` mean
+ * the same thing whatever model is loaded — an OBJ exported in metres and one
+ * exported in millimetres both arrive as unit cubes.
+ */
+typedef struct {
+    WidgetBase base;         /* base.kind = WIDGET_MESH */
+
+    float   *verts;          /* 3 floats each, model space */
+    float   *norms;          /* 3 floats each; NULL when the mesh has none */
+    float   *uvs;            /* 2 floats each; NULL when the mesh has none */
+    size_t   vert_count;
+    MeshTri *tris;
+    size_t   tri_count;
+
+    /*
+     * Smooth (Gouraud) shading, interpolating per-vertex normals.
+     *
+     * Defaults per shape rather than globally: averaging face normals across a
+     * cube's corner rounds it visibly, while a sphere without it is a heap of
+     * visible facets. The right answer depends on whether the surface is meant
+     * to be curved, which only the shape knows.
+     */
+    bool     smooth;
+
+    Texture  tex;            /* optional surface texture; pixels NULL if none */
+    char    *tex_path;
+
+    /*
+     * Where this mesh's triangles live inside the renderer's shared staging
+     * buffer. Each mesh owns a disjoint region, because the host writes the
+     * next mesh's triangles while the previous one's DMA may still be in
+     * flight — a single shared region would be overwritten underneath it.
+     */
+    size_t   tri_base;
+
+    char    *path;           /* NULL for a procedural primitive */
+    char    *shape;          /* "box" | "sphere" | "torus" | "cylinder" | "plane" */
+
+    float    size;           /* the unit mesh is scaled to this, in pixels */
+    Color    color;
+    float    ambient;        /* 0..1 floor, so faces turned away are not black */
+    bool     cull;           /* drop back-facing triangles (true for closed shapes) */
+    bool     wire;           /* draw edges rather than filled faces */
+} MeshWidget;
+
 /* A raster image (PNG/JPG), loaded with stb_image. */
 typedef struct {
     WidgetBase base;         /* must be the first field! */
@@ -500,7 +662,8 @@ typedef enum {
     PROP_ROTATION,   /* degrees in the JSON, radians inside */
     PROP_W, PROP_H,
     PROP_TINT,
-    PROP_TRIM
+    PROP_TRIM,
+    PROP_Z, PROP_RX, PROP_RY    /* 2.5D: depth and the out-of-plane rotations */
 } AnimProp;
 
 /* Per-event easing — see anim.h. */
@@ -509,6 +672,19 @@ typedef struct {
     int        time_ms;      /* start, measured from the scene's start        */
     int        duration_ms;  /* duration; 0 → instantaneous                   */
     ActionType action;
+    /*
+     * A name for this event, and a start time expressed against another.
+     *
+     * Timelines are edited by inserting and retiming, and absolute
+     * milliseconds make every later event wrong the moment an earlier one
+     * changes length. A named event that others hang off survives the edit.
+     *
+     * `time_expr` is resolved after the whole scene is read — an event may
+     * reference one written later — and is NULL from then on.
+     */
+    char      *label;
+    char      *time_expr;
+
     char      *target_id;    /* the widget id exactly as written in the JSON  */
     int        target_index; /* resolved SCENE-LOCAL index; -1 if not found        */
     int        target_group; /* resolved group index, or -1 — targets are either  */
@@ -601,6 +777,11 @@ typedef struct {
     /* Destination size for this frame, before `scale` is applied. */
     float w, h;
 
+    /* 2.5D state: depth, the two out-of-plane rotations (radians), and the
+     * camera's focal length — carried per widget so the compositor needs
+     * nothing but the runtime record. 0 focal = no projection. */
+    float z, rx, ry, focal;
+
     /* Tint strength 0..1, and the colour to blend toward. */
     float tint;
     Color tint_color;
@@ -682,8 +863,41 @@ typedef struct {
  * verbose and impossible to keep in sync. A camera push replaces what would
  * otherwise be a `scale` on every layer in the scene.
  */
+/*
+ * A camera in the scene's 3D space.
+ *
+ * World space is the canvas: the origin sits at the centre of the frame, x runs
+ * right, y runs *down* (as everywhere else in this project) and z runs away
+ * from the viewer. Keeping y down rather than flipping to a maths convention
+ * means a 3D position and a 2D one mean the same thing, which is what lets a
+ * mesh and a text layer be placed against each other.
+ *
+ * The default — eye at (0, 0, -focal) looking at the origin — reproduces the
+ * fixed viewpoint exactly, so a scene that never mentions a camera position
+ * renders as it always did.
+ */
+typedef struct {
+    bool  moving;               /* any of the tracks below were given */
+    Track px, py, pz;           /* eye */
+    Track tx, ty, tz;           /* what it looks at */
+    Track roll;                 /* degrees about the view axis */
+} Camera3D;
+
 typedef struct {
     bool  present;
+
+    Camera3D eye;
+
+    /*
+     * Focal length in pixels: how strong the perspective is.
+     *
+     * 0 disables projection entirely (the historical behaviour). A useful
+     * value is around twice the canvas width — smaller exaggerates depth, and
+     * anything smaller than the scene's own z range puts objects behind the
+     * viewer.
+     */
+    float focal;
+
     Track zoom;        /* 1 = neutral                                   */
     Track x, y;        /* pan, in pixels; positive x moves content left */
     Track rotation;    /* roll, degrees                                 */
@@ -704,10 +918,34 @@ typedef struct {
     GroupDef      *groups;        /* scene-local, like everything else here    */
     size_t         group_count, group_cap;
 
+    /*
+     * Named instants: `"labels": { "beat1": 1200 }` in milliseconds.
+     * Audio cues live here too — a marker is just a label whose value the
+     * author took from a waveform.
+     */
+    char         **label_names;
+    int           *label_times;
+    size_t         label_count, label_cap;
+
     Camera         camera;
 
     Color          bg_color;
     bool           has_bg;
+
+    /*
+     * A point light, in world units.
+     *
+     * Without one, meshes are lit from the camera: every surface facing the
+     * viewer is bright and nothing is ever in shadow. That is the right default
+     * for a single object on a title card — it can never hide its own subject —
+     * and quite wrong for a scene that is *about* where the light comes from,
+     * where the whole point is that half of each body is dark.
+     *
+     * Absent by default, so every existing project keeps the camera-mounted
+     * shading it was authored against.
+     */
+    bool           has_light;
+    float          light[3];
 
     /*
      * The scene's own effects — applied *before* the transition, so a clip's
@@ -804,6 +1042,12 @@ typedef struct {
 
     PathWidget    *paths;
     size_t         path_count, path_cap;
+
+    VideoWidget   *videos;
+    size_t         video_count, video_cap;
+
+    MeshWidget    *meshes;
+    size_t         mesh_count, mesh_cap;
 
     /* Post-processing stack — applied to the whole frame, in order. */
     struct Effect *effects;

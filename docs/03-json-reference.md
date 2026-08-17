@@ -221,6 +221,88 @@ about their own midpoints, off to one side. See `anim/lines.json`.
 
 ---
 
+## Depth — perspective-projected layers
+
+Any object may sit at a depth and turn out of the screen plane. It stays a flat
+quad — this is not a mesh renderer — but the quad is placed in space and
+projected, which is enough for a carousel, a receding tunnel, parallax, or a
+card that turns to face away.
+
+```json
+"camera": { "perspective": 1500 },
+"objects": [
+  { "id": "card", "type": "rect", "w": 210, "h": 300, "x": "center", "y": "center",
+    "anchor": "center",
+    "z_depth":  [ {"t":0,"v":-300}, {"t":3,"v":900} ],
+    "rotate_y": [ {"t":0,"v":0},    {"t":3,"v":360} ] }
+]
+```
+
+| Key | Type | Meaning |
+|---|---|---|
+| `camera.perspective` | float | focal length in pixels; **0 (default) = no projection** |
+| `z_depth` / `z` | float or track | depth; positive is away from the viewer |
+| `rotate_x`, `rotate_y` | float or track | degrees out of the screen plane |
+
+All three are also `animate` properties (`z`, `rotate_x`, `rotate_y`).
+
+**Focal length** controls how strong the perspective is. Around twice the canvas
+width is a natural look; smaller exaggerates depth. Anything smaller than the
+scene's z range puts objects at or behind the viewer, where they are clipped.
+
+**Depth sorting** happens automatically: when any object in a scene has a
+non-zero `z`, that scene's layers are drawn farthest-first each frame, so nearer
+ones occlude. The sort is stable, so layers at equal depth keep their authored
+z-order. A scene with no depth skips the sort entirely.
+
+**The projection is anchored at the canvas centre**, not each object's own
+centre. That is the difference between a camera and a per-object trick: a layer
+moving away both shrinks *and* drifts toward the middle of the frame, which is
+what makes parallax work.
+
+### Shading and backfaces
+
+A flat quad carries no lighting of its own, so a card in mid-turn reads as a
+shape that merely got narrower. Two keys fix that:
+
+| Key | Type | Meaning |
+|---|---|---|
+| `shading` | float 0..1 | darkens the layer as it turns away; 0 (default) is off |
+| `backface` | `show` \| `hide` \| `dim` | what to do when the far side faces you |
+
+```json
+{ "type": "rect", "rotate_y": [...], "shading": 0.75, "backface": "hide" }
+```
+
+Both derive from the quad's normal after rotation, whose z component is simply
+`cos(ry)·cos(rx)` — its sign says which side you are looking at, its magnitude
+how square-on the surface is.
+
+**They answer different questions**, which is easy to conflate: `shading` is
+about *angle*, `backface` is about *side*. At exactly 180° a layer's back is
+square-on, so `shading` leaves it at full brightness — only `backface` can tell
+you that you are looking at the reverse.
+
+`hide` is what a carousel wants: the cards on the far side of the ring face away
+and should not be seen through the near ones.
+
+### Two things worth knowing
+
+**A quad seen exactly edge-on disappears.** At `rotate_y` 90° or 270° there is
+nothing to draw. That is the geometry, not a bug.
+
+**Cross-backend agreement is looser here.** The affine path matches CPU and GPU
+to within one ulp; the perspective path divides, which amplifies that rounding.
+Measured on a frame of `anim/space3d.json`: 7 differing pixels out of 921,600,
+max RGB delta 4 — against 0 or 1 for the same scene without depth. Still
+invisible, but a regression test across backends needs a tolerance here.
+
+**Existing projects are untouched.** With no `perspective` and no depth, the
+compositor takes exactly the affine route it always did — verified
+bit-identical, not merely equivalent.
+
+---
+
 ## `camera`
 
 A whole-scene transform, given per scene (or at the root in flat mode).
@@ -239,14 +321,79 @@ A whole-scene transform, given per scene (or at the root in flat mode).
 | `x`, `y` | track | pan in pixels; the content moves the opposite way |
 | `rotation` | track | roll, degrees |
 | `shake` | track | amplitude in pixels; 0 is still |
+| `perspective` / `focal` | float | focal length in pixels; enables depth (see above) |
 
 Composed onto every object exactly as a group is, with the canvas centre as the
 pivot, and applied after groups — so a camera move layers on top of a scene's
 own hierarchy instead of being overwritten by it.
 
+### Moving the camera through the scene
+
+The keys above move the *picture*. These move the *viewpoint*, which is a
+different thing: they change what is in front of what, so nearer objects slide
+across farther ones and the geometry turns as you pass it. Only meshes see this
+— projected layers are flat cards and stay square to the lens.
+
+```json
+"camera": {
+  "perspective": 1500,
+  "px": [ {"t":0,"v":-900}, {"t":3,"v":0}, {"t":6,"v":900,"ease":"cubicinout"} ],
+  "py": -400,
+  "tx": 0, "ty": 0, "tz": 0
+}
+```
+
+| Key | Type | Meaning |
+|---|---|---|
+| `px`, `py`, `pz` | track | where the eye is, in world units |
+| `tx`, `ty`, `tz` | track | what it looks at |
+| `roll` | track | spin about the view axis, degrees |
+
+The world is the canvas: x runs right, y runs **down**, and z runs away from the
+viewer, so the units are the same pixels an object's `x`/`y` are given in.
+
+**Naming any one of these switches the camera on.** Leave them all out and the
+eye sits at `(0, 0, -perspective)` looking at the origin, which is the fixed
+viewpoint every earlier project was authored against — and reaches it through
+the same arithmetic, so those projects render byte-for-byte as before. Name even
+one and the rest take their defaults from that same position, so `"px": 400` is
+a step to the right and nothing else.
+
+A degenerate pair — eye and target at the same point, or looking straight down
+the up axis — falls back to a sane basis rather than producing NaNs that would
+poison every vertex in the scene.
+
 **Shake is a hash of the timestamp, not a random number.** A frame has to stay
 a pure function of time, or `--range` and the two backends would each produce a
 different judder.
+
+---
+
+## `light`
+
+A point light for the scene, in world units. Meshes only; flat layers are not
+shaded.
+
+```json
+"light": { "x": 0, "y": 0, "z": 0 }
+```
+
+Without it, meshes are lit from the camera: whatever faces the viewer is bright
+and nothing is ever in shadow. That is the right default for a single object on
+a title card, where the subject can never hide itself, and quite wrong for a
+scene that is *about* where the light comes from — a solar system, where half of
+each body must be dark, or a product turning under a fixed key light.
+
+`ambient` sets the floor, so a body's night side is not pure black; a light
+source itself takes `"ambient": 1.0`, which is how the Sun in
+`anim/solar.json` stays bright while lighting everything else.
+
+**Two-sided geometry is lit two-sided.** A surface with `cull` off is being
+shown from both faces and so has no outward direction for light to fall on;
+clamping at zero there would black out the whole thing whenever the light
+happened to be on the far side. Those surfaces use the magnitude of the term
+instead. It is the reason a ring lit by a star in its own plane is visible at
+all rather than arithmetically, uselessly correct.
 
 ---
 
@@ -529,6 +676,185 @@ horizontally, which a curve cannot be. Doing it properly needs either
 per-frame re-rasterization or arc-length encoded into the texture; until then,
 animate a path's `opacity` instead. See `anim/paths.json`.
 
+### `type: "video"`
+
+A clip, decoded to frames when the project loads.
+
+```json
+{ "type": "video", "path": "clip.mp4", "width": 480,
+  "x": "center", "y": 40, "anchor": "top",
+  "start": 2.0, "speed": 1.0, "loop": false }
+```
+
+| Key | Type | Default |
+|---|---|---|
+| `path` / `src` | string | required, relative to the JSON |
+| `width`, `height` | int | the source's own size; one alone keeps the aspect |
+| `start` | float | 0 — in-point within the source, seconds |
+| `speed` | float | 1 — 2 is twice as fast |
+| `loop` | bool | false — otherwise the last frame holds |
+
+**How it works, and what that costs.** Every frame is decoded up front and
+stacked into one texture; the compositor is handed a slice of it. That keeps the
+pipeline's central assumption intact — a texture is uploaded once, never per
+frame — and with it everything that depends on the assumption: a frame stays a
+pure function of time, `--range` renders the same pixels as a full run
+(*verified: 0 differing bytes*), and both backends work unchanged.
+
+The cost is memory, so **frames are decoded at the size they will be shown at**,
+not the source's: a 640×360 frame is 0.9 MB where 1080p is 8.3 MB. There is a
+512 MB budget per clip; beyond it the clip is truncated, with a warning. A
+four-second 480×270 clip is about 59 MB.
+
+`speed` is applied by the decoder, so the frames arrive already retimed rather
+than being picked — and picked frames inherit the rounding.
+
+**Shadow and glow are not supported on video** and are ignored with a warning.
+The padding would wrap the whole stacked strip rather than each frame, so every
+frame after the first would be read from the wrong offset.
+
+### `type: "mesh"`
+
+A triangle mesh — an OBJ file, or a named primitive.
+
+```json
+{ "type": "mesh", "shape": "torus", "size": 240, "x": "center", "y": "center",
+  "anchor": "center", "color": "#D2A8FF",
+  "rotate_x": [ {"t":0,"v":0}, {"t":4,"v":360} ] }
+
+{ "type": "mesh", "path": "assets/model.obj", "size": 300, "ambient": 0.2 }
+```
+
+| Key | Type | Default |
+|---|---|---|
+| `path` / `src` | string | an OBJ file, relative to the JSON |
+| `shape` | `box` \| `sphere` \| `torus` \| `cylinder` \| `plane` \| `ring` | `box` when no path |
+| `size` | float | 300 — the mesh's longest axis, in pixels |
+| `color` | colour | `#7EE787` |
+| `ambient` | float 0..1 | 0.25 — the floor for faces turned away |
+| `cull` | bool | true for closed shapes, false for `plane` |
+| `smooth` | bool | true for curved primitives and imported models |
+| `texture` | string | an image to wrap onto the surface, relative to the JSON |
+
+Position, rotation, depth, `scale`, `opacity` and `blend` all work as on any
+other object. `rotate_x` / `rotate_y` / `rotation` turn the model in space.
+
+**This is the one widget that is not a texture.** Everything else is rasterized
+once and composited many times; a mesh is transformed, projected and filled
+every frame, because its silhouette changes with every degree of rotation.
+
+**Imported models are normalised** into a unit cube centred on the origin before
+anything else happens. Without that, `size` would mean something different for
+every file — an OBJ in millimetres and one in metres differ by a thousand — and
+models authored far from the origin would rotate about a point outside
+themselves.
+
+**Meshes occlude each other properly.** They share one depth buffer per scene,
+so two solids that pass through one another meet along the right curve instead
+of one being drawn wholly on top of the other. Ordinary layers are still painted
+back to front; only meshes are depth-tested.
+
+### `smooth` — flat facets or a curved surface
+
+Flat shading gives every triangle one colour, taken from the face's own normal.
+Smooth shading interpolates the *vertices'* normals across the face, so a
+sphere reads as a sphere rather than as a heap of visible facets.
+
+The default follows the shape because the right answer does: averaging normals
+across a cube's corner rounds its edges into something soft and wrong, while a
+sphere without it is unmistakably faceted. So `sphere`, `torus`, `cylinder` and
+imported models smooth by default; `box` and `plane` do not. `"smooth": false`
+or `true` overrides.
+
+A model that arrives without normals gets them derived from its faces, weighted
+by area so a sliver triangle does not skew the surface as much as a large one.
+
+### `ring` — a flat annulus
+
+A disc with a hole, lying in the XZ plane: a planetary ring, a halo, an orbit
+marker. Its UVs run *radially* — u from the inner edge to the outer, v around
+the circumference — because ring textures are radial strips, one row of pixels
+repeated all the way round. A square plane's corner-to-corner UVs would smear
+that strip across the disc instead.
+
+Like `plane` it is two-sided: `cull` defaults to false, and its lighting uses
+the magnitude of the light term rather than clamping at zero (see `light`).
+
+### `texture` — wrapping an image onto the surface
+
+```json
+{ "type": "mesh", "shape": "sphere", "texture": "assets/earth.png" }
+```
+
+The image is multiplied by `color`, so leave the colour white to see the texture
+untouched and tint it otherwise. Lighting still applies.
+
+**Transparent texels are not surface.** A texture with an alpha channel cuts the
+shape out: fully transparent pixels are rejected before the depth buffer is
+written, so the hole in a ring lets whatever is behind it through instead of
+being an invisible disc that occludes. Partially transparent texels blend
+normally.
+
+A sphere's UVs are laid out for equirectangular maps — u is longitude, v is
+latitude with v = 0 at the top — so a planet or globe texture can be used as
+downloaded. Sampling is
+perspective-correct — interpolating UVs directly across a steeply angled face is
+the classic swimming-texture artefact — and coordinates outside 0..1 wrap, so
+tiled UVs behave as expected.
+
+Every primitive carries UVs: the box and cylinder give each face the whole
+image, the sphere and torus wrap it around their parameterisation, and the
+plane maps it corner to corner.
+
+### File formats
+
+**OBJ** — `v`, `vt`, `vn` and `f`. A face may reference any combination of the
+three (`f 1/2/3`, `f 1//3`, `f 1`); distinct combinations become distinct
+vertices, which is what lets a cube keep hard edges. Polygons are triangulated
+as a fan. Faces referencing undefined vertices are dropped with a warning rather
+than read out of bounds.
+
+**glTF 2.0** — both `.gltf` (with an external `.bin` or an embedded base64
+buffer) and `.glb`. Positions, normals, texture coordinates, indices and the
+whole node hierarchy's transforms are read, along with the material's base
+colour texture when it is a file next to the model.
+
+**Two conventions are converted on the way in**, and both are invisible until
+they bite. glTF is Y-up with +Z toward the viewer, while this renderer's world
+is Y-down with +Z going away, so models are given a half turn about X —
+otherwise every import arrives upside down, and since a lone model still looks
+like a model, it reads as the artist's choice rather than as a bug. And glTF
+calls a face front-facing when its normal points at the viewer, where this
+renderer keeps the opposite (see `smooth` above for why y-down inverts the
+test), so triangle winding is reversed as well. Without that, an imported model
+with `cull` at its default vanishes completely.
+
+Deliberately not read: animation, skinning, morph targets and the rest of the
+PBR material model. A file using them still imports — in its bind pose, with
+flat colour — and says so, rather than silently producing something that looks
+almost right. Non-triangle primitives are counted and reported; sparse accessors
+are refused rather than read as their dense base, which would be wrong geometry
+presented as correct.
+
+**Shading is flat, lit from the camera.** It is the cheapest thing that makes a
+solid read as a solid — without it every face of a cube is the same colour and
+the shape collapses into a silhouette. `ambient` sets how dark a face turned
+fully away becomes.
+
+#### What this is not
+
+There is no z-buffer. The rasterizer loops over *triangles inside each pixel*
+rather than pixels inside each triangle, so the depth test is a local variable
+and needs no shared buffer or atomics — which is what lets one implementation
+serve both backends. The cost is **O(triangles) per pixel**, so this suits
+models of hundreds to a few thousand faces, not scanned assets.
+
+There is also no texturing, no per-vertex normals (so no smooth shading), and no
+scene lighting.
+
+Cross-backend agreement is looser than for 2D: measured at 3 differing bytes in
+23 million, max delta 10.
+
 ### `type: "image"`
 
 | Key | Type | Default |
@@ -544,6 +870,49 @@ produces `object-fit: cover`:
 ```json
 { "type": "image", "path": "photo.jpg", "height": 1920, "y": 0 }
 ```
+
+### Shadow and glow
+
+```json
+"shadow": { "dx": 0, "dy": 10, "blur": 22, "color": "#00000099" }
+"glow":   { "blur": 34, "color": "#7EE787AA" }
+```
+
+Both keys drive the same thing — a blurred, tinted copy of the object's own
+alpha, drawn underneath. A glow is a shadow with no offset and a bright colour,
+so the defaults differ and nothing else does.
+
+| Key | Type | Default (shadow / glow) |
+|---|---|---|
+| `dx`, `dy` | float | 0, 8 / 0, 0 |
+| `blur` | float | 16 / 24 — capped at 128 |
+| `color` | colour | `#00000096` / `#FFFFFF8C` |
+
+Works on every object type, including text and code blocks (where the shadow
+belongs to the panel, not the glyphs).
+
+Applied to the **texture**, not by the compositor, so it costs nothing per frame
+— the same reasoning as gradients. The texture grows to make room and the
+object's position is pulled back by the same amount, so the content does not
+move. The blur is three box passes, which is O(1) per pixel: a 40-pixel blur
+costs the same as a 4-pixel one.
+
+### Blend modes
+
+```json
+"blend": "add"     // or "screen", or "normal" (the default)
+```
+
+| Mode | Formula | Use |
+|---|---|---|
+| `normal` | source-over | everything ordinary |
+| `add` | `src + dst` | particles, glows, anything that should read as *light* |
+| `screen` | `1-(1-src)(1-dst)` | the gentler version — saturates instead of clipping |
+
+Additive is what makes a mass of particles look like light rather than paint:
+overlapping sprites brighten toward white instead of each hiding the one behind
+it. With three overlapping coloured discs, `normal` muddies them, `add` gives
+red+green→yellow and all three→white.
 
 ### Gradients (`rect` / `circle`)
 
@@ -584,10 +953,25 @@ clipped.
 
 ---
 
+## `labels`
+
+Named instants for a scene, in milliseconds:
+
+```json
+"labels": { "beat": 1500, "drop": 3200 }
+```
+
+Any event's `time` may refer to one. An audio marker is just a label whose value
+came off a waveform — there is no separate mechanism for it.
+
+---
+
 ## `timeline[]`
 
 | Key | Type | Default |
 |---|---|---|
+| `id` / `label` | string | names this event so others can hang off it |
+| `time` | number or string | seconds, or an expression (see below) |
 | `time_ms` | int | 0 |
 | `duration_ms` | int | 0 → instant |
 | `action` | string | — |
@@ -603,6 +987,26 @@ clipped.
 below. `emit` is generated by an `emitter` block and is not written by hand.
 
 `move_x`/`move_y` use `value` on that axis; plain `move` uses `value_x`/`value_y`.
+
+### Relative event times
+
+```json
+{ "id": "intro", "action": "fade_in", "target": "t", "time_ms": 0, "duration_ms": 600 },
+{ "action": "fade_in", "target": "b", "time": "intro.end + 150" },
+{ "action": "fade_in", "target": "c", "time": "beat + 100" }
+```
+
+`time` accepts `<name>.start`, `<name>.end`, a `labels` entry, or a plain
+number — plus any number of signed terms. **Numbers are milliseconds.**
+
+Absolute times make every later event wrong the moment an earlier one changes
+length; a named event that others hang off survives the edit.
+
+Resolved iteratively, so an event may hang off another that is itself relative.
+A cycle or an unknown name warns and leaves the event at its default time.
+
+Resolution happens before a scene's duration is derived from its last event, so
+an auto-length scene measures the real times rather than a row of zeros.
 
 ### `animate` — a track on any property
 
@@ -807,6 +1211,34 @@ glyphs and not the transparent space around them.
   "tint": "#FFD166",
   "tint_amount": [ { "t": 0, "v": 0 }, { "t": 0.8, "v": 1 }, { "t": 1.6, "v": 0 } ] }
 ```
+
+### Bindings — a position relative to another object
+
+A value starting with `=` is resolved against other objects, after every size
+and position is known:
+
+```json
+{ "id": "label", "type": "text", "content": "220", "anchor": "bottom",
+  "x": "=bar1.cx", "y": "=bar1.top - 14" }
+```
+
+| Edge | Meaning |
+|---|---|
+| `left` `right` `top` `bottom` | the object's box |
+| `cx` `cy` | its centre |
+| `w` `h` | its size |
+
+Grammar: a term, then any number of signed terms — `=bar3.right + 24`. It is
+deliberately the same shape as an event's `time`, so there is one thing to
+learn rather than two.
+
+The value becomes the object's **anchor point**, exactly as a layout expression
+does. So `"anchor": "bottom"` with `"x": "=bar.cx"` centres the label on the
+bar, which is what writing that means.
+
+Layout expressions answer "where on the canvas"; bindings answer "where
+relative to that". Chains work (`a → b → c`), and a cycle or an unknown name
+warns and leaves the object at its default rather than failing the parse.
 
 ### Relative times
 

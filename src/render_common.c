@@ -75,11 +75,36 @@ void vr_evaluate_scene(const EditorContext *ctx, const Scene *scene,
          * an absolute value; otherwise the object's static field is used.
          * Timeline events are layered on top *afterwards*.
          */
-        /* The anchor offset applies to both paths — static and track alike. */
+        /*
+         * Three offsets apply to both paths — static position and track alike:
+         *
+         *   anchor_off_*  where the object's origin sits inside its box
+         *   repeat_dx/dy  the displacement a `repeat` block gave this copy
+         *   tex_pad       the margin a shadow added around the texture
+         *
+         * They belong here rather than folded into `b->x` during layout,
+         * because `b->x` is only read when there is no track — and a plain
+         * `"x": 240` is stored as a track with a constant, so anything folded
+         * in earlier would be silently skipped for most objects.
+         */
+        /*
+         * The shadow's margin has to be undone by however much the anchor did
+         * NOT already account for it.
+         *
+         * `anchor_off` is computed from the *padded* size, so an object
+         * anchored at its centre is already right — the padding is symmetric,
+         * so the padded centre and the content centre coincide. Only a
+         * top-left anchor needs the full margin removed, and a bottom-right
+         * one needs it added back. Subtracting the whole margin regardless
+         * pushed every centred object up and to the left by the blur radius.
+         */
+        float pad_x = (float)b->tex_pad * (1.0f - 2.0f * b->anchor_x);
+        float pad_y = (float)b->tex_pad * (1.0f - 2.0f * b->anchor_y);
+
         rt[i].x        = (b->has_track_x ? track_sample(&b->tr_x, t_sec) : b->x)
-                         - b->anchor_off_x;
+                         - b->anchor_off_x + b->repeat_dx - pad_x;
         rt[i].y        = (b->has_track_y ? track_sample(&b->tr_y, t_sec) : b->y)
-                         - b->anchor_off_y;
+                         - b->anchor_off_y + b->repeat_dy - pad_y;
         rt[i].scale    = b->has_track_scale ? track_sample(&b->tr_scale, t_sec) : 1.0f;
         rt[i].visible  = true;
 
@@ -127,6 +152,12 @@ void vr_evaluate_scene(const EditorContext *ctx, const Scene *scene,
         if (b->has_track_h) {
             rt[i].y += b->anchor_off_y - b->anchor_y * rt[i].h;
         }
+
+        /* 2.5D. Untracked these are zero, which turns the projection off. */
+        rt[i].z     = b->has_track_z  ? track_sample(&b->tr_z,  t_sec) : 0.0f;
+        rt[i].rx    = b->has_track_rx ? track_sample(&b->tr_rx, t_sec) * (float)(M_PI / 180.0) : 0.0f;
+        rt[i].ry    = b->has_track_ry ? track_sample(&b->tr_ry, t_sec) * (float)(M_PI / 180.0) : 0.0f;
+        rt[i].focal = scene->camera.present ? scene->camera.focal : 0.0f;
 
         rt[i].tint       = b->has_track_tint ? track_sample(&b->tr_tint, t_sec) : 0.0f;
         rt[i].tint_color = b->tint_color;
@@ -304,6 +335,9 @@ void vr_evaluate_scene(const EditorContext *ctx, const Scene *scene,
                     case PROP_H:        r->h        = v; break;
                     case PROP_TINT:     r->tint     = v; break;
                     case PROP_TRIM:     r->reveal   = v; break;
+                    case PROP_Z:        r->z        = v; break;
+                    case PROP_RX:       r->rx       = v * (float)(M_PI / 180.0); break;
+                    case PROP_RY:       r->ry       = v * (float)(M_PI / 180.0); break;
                     case PROP_NONE:
                     default:            break;
                 }
@@ -553,6 +587,103 @@ void vr_select_scenes(const EditorContext *ctx, int time_ms,
 /* Compositing geometry                                                       */
 /* ------------------------------------------------------------------------- */
 
+/*
+ * Builds the perspective form of the transform.
+ *
+ * The layer is a flat quad, so the map from texture coordinates to the screen
+ * is a homography. Deriving it rather than projecting per pixel is what keeps
+ * the pixel loop cheap: three multiply-adds and one divide, against a full
+ * rotate-and-project.
+ *
+ *   P(u,v) = o + u·e1 + v·e2          a point on the quad, in camera space
+ *   screen = C + f·(P.x, P.y)/(f + P.z)
+ *
+ * which in homogeneous form is
+ *
+ *        [ f·e1.x  f·e2.x  f·o.x ]
+ *   H =  [ f·e1.y  f·e2.y  f·o.y ]
+ *        [   e1.z    e2.z  f+o.z ]
+ *
+ * and the pixel loop uses H⁻¹. Returns false if the quad is degenerate or
+ * entirely behind the viewer.
+ */
+static bool build_homography(float focal, float sx, float sy,
+                             float rx, float ry, float rz,
+                             float tex_w, float tex_h, float z,
+                             float off_x, float off_y,
+                             CompositeParams *out, float corners[4][2])
+{
+    float cx_ = cosf(rx), sx_ = sinf(rx);
+    float cy_ = cosf(ry), sy_ = sinf(ry);
+    float cz_ = cosf(rz), sz_ = sinf(rz);
+
+    /* R = Rz · Ry · Rx, applied to the quad's two in-plane basis vectors. */
+    float r00 =  cz_ * cy_;
+    float r01 =  cz_ * sy_ * sx_ - sz_ * cx_;
+    float r10 =  sz_ * cy_;
+    float r11 =  sz_ * sy_ * sx_ + cz_ * cx_;
+    float r20 = -sy_;
+    float r21 =  cy_ * sx_;
+
+    /* One texel step in u and in v, after scaling into destination pixels. */
+    float e1x = r00 * sx, e1y = r10 * sx, e1z = r20 * sx;
+    float e2x = r01 * sy, e2y = r11 * sy, e2z = r21 * sy;
+
+    /*
+     * The quad's (0,0) texel, in camera space — relative to the *canvas*
+     * centre, not the object's own.
+     *
+     * That distinction is the difference between a camera and a per-object
+     * trick: with the object's own centre as origin, a layer moving away
+     * shrinks in place. With the canvas centre as origin it also drifts toward
+     * the middle of the frame, which is what depth actually looks like and
+     * what makes parallax work.
+     */
+    float ox = -(tex_w * 0.5f) * e1x - (tex_h * 0.5f) * e2x + off_x;
+    float oy = -(tex_w * 0.5f) * e1y - (tex_h * 0.5f) * e2y + off_y;
+    float oz = -(tex_w * 0.5f) * e1z - (tex_h * 0.5f) * e2z + z;
+
+    float f = focal;
+    float h[9] = {
+        f * e1x, f * e2x, f * ox,
+        f * e1y, f * e2y, f * oy,
+        e1z,     e2z,     f + oz,
+    };
+
+    float det = h[0] * (h[4] * h[8] - h[5] * h[7])
+              - h[1] * (h[3] * h[8] - h[5] * h[6])
+              + h[2] * (h[3] * h[7] - h[4] * h[6]);
+    if (fabsf(det) < 1e-9f) {
+        return false;      /* edge-on, or scaled to nothing */
+    }
+    float id = 1.0f / det;
+
+    out->hinv[0] =  (h[4] * h[8] - h[5] * h[7]) * id;
+    out->hinv[1] = -(h[1] * h[8] - h[2] * h[7]) * id;
+    out->hinv[2] =  (h[1] * h[5] - h[2] * h[4]) * id;
+    out->hinv[3] = -(h[3] * h[8] - h[5] * h[6]) * id;
+    out->hinv[4] =  (h[0] * h[8] - h[2] * h[6]) * id;
+    out->hinv[5] = -(h[0] * h[5] - h[2] * h[3]) * id;
+    out->hinv[6] =  (h[3] * h[7] - h[4] * h[6]) * id;
+    out->hinv[7] = -(h[0] * h[7] - h[1] * h[6]) * id;
+    out->hinv[8] =  (h[0] * h[4] - h[1] * h[3]) * id;
+
+    /* The four projected corners give the bounding box to iterate over. */
+    const float uv[4][2] = { {0,0}, {tex_w,0}, {0,tex_h}, {tex_w,tex_h} };
+    for (int i = 0; i < 4; i++) {
+        float U = uv[i][0], V = uv[i][1];
+        float X = h[0] * U + h[1] * V + h[2];
+        float Y = h[3] * U + h[4] * V + h[5];
+        float W = h[6] * U + h[7] * V + h[8];
+        if (W <= 1e-6f) {
+            return false;  /* a corner is at or behind the viewer */
+        }
+        corners[i][0] = X / W;
+        corners[i][1] = Y / W;
+    }
+    return true;
+}
+
 bool vr_composite_setup(int fb_w, int fb_h, int tex_w, int tex_h,
                         const WidgetBase *b, const WidgetRuntime *rt,
                         CompositeParams *out)
@@ -593,22 +724,87 @@ bool vr_composite_setup(int fb_w, int fb_h, int tex_w, int tex_h,
     out->cx    = cx;
     out->cy    = cy;
 
-    /* t = S⁻¹ · R(-θ) · d  →  see the comment on CompositeParams. */
-    out->inv_a =  cs / sx;
-    out->inv_b =  sn / sx;
-    out->inv_c = -sn / sy;
-    out->inv_d =  cs / sy;
+    int x0, y0, x1, y1;
 
-    /* The bounding box of the rotated rectangle. */
-    float abs_cs   = fabsf(cs);
-    float abs_sn   = fabsf(sn);
-    float half_bbw = (abs_cs * dst_w + abs_sn * dst_h) * 0.5f;
-    float half_bbh = (abs_sn * dst_w + abs_cs * dst_h) * 0.5f;
+    /*
+     * Perspective only when the layer actually uses it. The affine branch below
+     * is the original code, untouched — the homography reduces to it
+     * algebraically but not bit-for-bit, and there is no reason to move every
+     * existing project by a rounding step.
+     */
+    out->persp = (rt->focal > 0.0f) &&
+                 (rt->z != 0.0f || rt->rx != 0.0f || rt->ry != 0.0f);
 
-    int x0 = (int)floorf(cx - half_bbw);
-    int y0 = (int)floorf(cy - half_bbh);
-    int x1 = (int)ceilf(cx + half_bbw) + 1;
-    int y1 = (int)ceilf(cy + half_bbh) + 1;
+    out->shade = 1.0f;
+
+    if (out->persp) {
+        /*
+         * The quad's normal after rotation. For R = Rz·Ry·Rx applied to
+         * (0,0,1) the z component is simply cos(ry)·cos(rx) — positive when the
+         * front faces the viewer, negative when the back does, and its
+         * magnitude is how square-on the surface is.
+         */
+        float nz = cosf(rt->ry) * cosf(rt->rx);
+
+        if (b->backface == 1 && nz < 0.0f) {
+            return false;                     /* hidden: cull it entirely */
+        }
+
+        float facing = fabsf(nz);
+        if (b->shading > 0.0f) {
+            out->shade = 1.0f - b->shading * (1.0f - facing);
+        }
+        if (b->backface == 2 && nz < 0.0f) {
+            out->shade *= 0.45f;              /* dimmed: still drawn, clearly behind */
+        }
+
+        /* Everything is expressed against the canvas centre, so that is where
+         * the projection is anchored and where the bounding box is measured
+         * from. */
+        float ccx = (float)fb_w * 0.5f;
+        float ccy = (float)fb_h * 0.5f;
+
+        float corners[4][2];
+        if (!build_homography(rt->focal, sx, sy, rt->rx, rt->ry, rt->rotation,
+                              (float)tex_w, (float)tex_h, rt->z,
+                              cx - ccx, cy - ccy, out, corners)) {
+            return false;
+        }
+        out->cx = ccx;
+        out->cy = ccy;
+        cx = ccx;
+        cy = ccy;
+
+        float minx = corners[0][0], maxx = corners[0][0];
+        float miny = corners[0][1], maxy = corners[0][1];
+        for (int i = 1; i < 4; i++) {
+            if (corners[i][0] < minx) minx = corners[i][0];
+            if (corners[i][0] > maxx) maxx = corners[i][0];
+            if (corners[i][1] < miny) miny = corners[i][1];
+            if (corners[i][1] > maxy) maxy = corners[i][1];
+        }
+        x0 = (int)floorf(cx + minx);
+        y0 = (int)floorf(cy + miny);
+        x1 = (int)ceilf(cx + maxx) + 1;
+        y1 = (int)ceilf(cy + maxy) + 1;
+    } else {
+        /* t = S⁻¹ · R(-θ) · d  →  see the comment on CompositeParams. */
+        out->inv_a =  cs / sx;
+        out->inv_b =  sn / sx;
+        out->inv_c = -sn / sy;
+        out->inv_d =  cs / sy;
+
+        /* The bounding box of the rotated rectangle. */
+        float abs_cs   = fabsf(cs);
+        float abs_sn   = fabsf(sn);
+        float half_bbw = (abs_cs * dst_w + abs_sn * dst_h) * 0.5f;
+        float half_bbh = (abs_sn * dst_w + abs_cs * dst_h) * 0.5f;
+
+        x0 = (int)floorf(cx - half_bbw);
+        y0 = (int)floorf(cy - half_bbh);
+        x1 = (int)ceilf(cx + half_bbw) + 1;
+        y1 = (int)ceilf(cy + half_bbh) + 1;
+    }
 
     /* Clip to the screen — no work spent on what would not be drawn anyway. */
     if (x0 < 0) x0 = 0;
@@ -626,6 +822,7 @@ bool vr_composite_setup(int fb_w, int fb_h, int tex_w, int tex_h,
     out->bb_h  = y1 - y0;
     out->alpha = rt->opacity;
 
+    out->blend       = b->blend;
     out->mask_shape  = b->mask_shape;
     out->mask_invert = b->mask_invert ? 1 : 0;
     for (int m = 0; m < 4; m++) {
@@ -687,6 +884,459 @@ bool vr_highlight_setup(const CompositeParams *geom, const WidgetBase *b,
     out->b *= out->alpha;
 
     return out->last_line >= out->first_line;
+}
+
+bool vr_video_slice(const WidgetBase *b, int local_ms, size_t *out_offset)
+{
+    if (b->kind != WIDGET_VIDEO) {
+        return false;
+    }
+
+    const VideoWidget *v = (const VideoWidget *)b;
+    if (v->frame_count <= 0 || v->frame_h <= 0) {
+        return false;
+    }
+
+    /*
+     * The clip's own time base, not the film's. `speed` is already folded into
+     * src_fps by the decoder, so this is a plain multiply — and because it
+     * depends only on `local_ms`, a clip stays a pure function of time like
+     * everything else.
+     */
+    long idx = (long)((float)local_ms * 0.001f * v->src_fps);
+
+    if (idx < 0) {
+        idx = 0;
+    }
+    if (idx >= v->frame_count) {
+        /* Past the end: loop, or hold the last frame. Holding is the safer
+         * default — a clip that vanishes mid-scene reads as a bug. */
+        idx = v->loop ? (idx % v->frame_count) : (v->frame_count - 1);
+    }
+
+    *out_offset = (size_t)idx * (size_t)v->frame_w * (size_t)v->frame_h * 4u;
+    return true;
+}
+
+bool vr_depth_order(const Scene *scene, const WidgetRuntime *rt, int *order)
+{
+    bool any = false;
+    for (size_t i = 0; i < scene->widget_count; i++) {
+        if (rt[i].z != 0.0f) {
+            any = true;
+            break;
+        }
+    }
+    if (!any) {
+        return false;
+    }
+
+    for (size_t i = 0; i < scene->widget_count; i++) {
+        order[i] = (int)i;
+    }
+
+    /*
+     * Insertion sort, descending by z — farthest drawn first.
+     *
+     * Stable, which matters: layers at equal depth must keep their authored
+     * z-order rather than being shuffled by the sort. It is also O(n) on the
+     * common case where depths barely change between frames, which is exactly
+     * what an animated scene does.
+     */
+    for (size_t i = 1; i < scene->widget_count; i++) {
+        int   cur = order[i];
+        float zc  = rt[cur].z;
+        size_t j  = i;
+        while (j > 0 && rt[order[j - 1]].z < zc) {
+            order[j] = order[j - 1];
+            j--;
+        }
+        order[j] = cur;
+    }
+    return true;
+}
+
+static int b_blend_of(const MeshWidget *m) { return m->base.blend; }
+
+int vr_mesh_project(const MeshWidget *m, const WidgetRuntime *rt,
+                    int fb_w, int fb_h, const float view[12],
+                    const float *light, ScreenTri *out, MeshParams *mp)
+{
+    if (m->tri_count == 0 || m->vert_count == 0) {
+        return 0;
+    }
+
+    /* R = Rz · Ry · Rx, the same convention the 2.5D layers use. */
+    float cx_ = cosf(rt->rx), sx_ = sinf(rt->rx);
+    float cy_ = cosf(rt->ry), sy_ = sinf(rt->ry);
+    float cz_ = cosf(rt->rotation), sz_ = sinf(rt->rotation);
+
+    float r00 = cz_ * cy_, r01 = cz_ * sy_ * sx_ - sz_ * cx_, r02 = cz_ * sy_ * cx_ + sz_ * sx_;
+    float r10 = sz_ * cy_, r11 = sz_ * sy_ * sx_ + cz_ * cx_, r12 = sz_ * sy_ * cx_ - cz_ * sx_;
+    float r20 = -sy_,      r21 = cy_ * sx_,                   r22 = cy_ * cx_;
+
+    float scale = m->size * rt->scale * 0.5f;   /* the unit mesh spans -1..1 */
+    float ccx   = (float)fb_w * 0.5f;
+    float ccy   = (float)fb_h * 0.5f;
+
+    /* World → view. With no camera tracks this is a translation of `focal`
+     * along z, which is exactly the fixed viewpoint. */
+    const float *V = view;
+
+    /* The object's centre, relative to the canvas centre — the same anchoring
+     * the projected layers use, so a mesh and a card agree about where "far
+     * away" is. */
+    float ox = rt->x + rt->w * 0.5f - ccx;
+    float oy = rt->y + rt->h * 0.5f - ccy;
+
+    /*
+     * Focal length 0 means the scene has no camera perspective. A mesh still
+     * has to be projected — it is a solid, not a flat card — so it falls back
+     * to a long lens, which is very nearly orthographic and never divides by
+     * something near zero.
+     */
+    float f = (rt->focal > 0.0f) ? rt->focal : (float)fb_w * 8.0f;
+
+    const float inv255 = 1.0f / 255.0f;
+    float base_r = m->color.r * inv255;
+    float base_g = m->color.g * inv255;
+    float base_b = m->color.b * inv255;
+    float amb    = vr_clampf(m->ambient, 0.0f, 1.0f);
+
+    /*
+     * Smooth shading replaces the flat term rather than compounding it. Leaving
+     * the face's own `lit` in the vertex colour and then multiplying by the
+     * interpolated one shades everything twice and — because the flat term is
+     * constant per face — the facet edges stay perfectly visible, which defeats
+     * the entire point of interpolating.
+     */
+    bool smooth = (m->smooth && m->norms != NULL);
+
+    /*
+     * A surface that is not culled is being shown from both sides, so it has no
+     * "outward" direction for the light to fall on — and Lambert's clamp, which
+     * exists to stop a face being lit from behind, instead makes the whole thing
+     * black whenever the light happens to be on the other side. A planetary ring
+     * lit by a star in its own plane is exactly that case: physically edge-on,
+     * arithmetically zero, and simply absent from the picture.
+     *
+     * So two-sided geometry takes the magnitude of the dot product. It is what
+     * the surface means: whichever face you are looking at is the lit one.
+     */
+    bool two_sided = !m->cull;
+
+    /*
+     * The light is moved into view space once, here, rather than moving every
+     * surface point back into world space. Both give the same dot product —
+     * the view transform is rigid — and this way the per-vertex cost stays what
+     * it was.
+     */
+    float Lv[3] = { 0.0f, 0.0f, 0.0f };
+    if (light != NULL) {
+        Lv[0] = view[0]*light[0] + view[1]*light[1] + view[2]*light[2]  + view[3];
+        Lv[1] = view[4]*light[0] + view[5]*light[1] + view[6]*light[2]  + view[7];
+        Lv[2] = view[8]*light[0] + view[9]*light[1] + view[10]*light[2] + view[11];
+    }
+
+    float minx = 1e30f, miny = 1e30f, maxx = -1e30f, maxy = -1e30f;
+    int   n = 0;
+
+    for (size_t t = 0; t < m->tri_count; t++) {
+        const MeshTri *tri = &m->tris[t];
+
+        float sxp[3], syp[3], szp[3];
+        float wx[3], wy[3], wz[3];
+        float vlit[3], vu[3], vv[3];
+        bool  behind = false;
+
+        for (int k = 0; k < 3; k++) {
+            const float *v = &m->verts[(size_t)tri->v[k] * 3];
+
+            /* model → rotated → scaled → world */
+            float Wx = (r00 * v[0] + r01 * v[1] + r02 * v[2]) * scale + ox;
+            float Wy = (r10 * v[0] + r11 * v[1] + r12 * v[2]) * scale + oy;
+            float Wz = (r20 * v[0] + r21 * v[1] + r22 * v[2]) * scale + rt->z;
+
+            /* world → view */
+            float X = V[0]*Wx + V[1]*Wy + V[2]*Wz  + V[3];
+            float Y = V[4]*Wx + V[5]*Wy + V[6]*Wz  + V[7];
+            float Z = V[8]*Wx + V[9]*Wy + V[10]*Wz + V[11];
+
+            wx[k] = X; wy[k] = Y; wz[k] = Z;
+
+            /* Per-vertex shading and texture coordinates, carried through the
+             * same loop so the vertex is touched once. */
+            if (m->norms != NULL) {
+                const float *nv = &m->norms[(size_t)tri->v[k] * 3];
+                float NX = r00*nv[0] + r01*nv[1] + r02*nv[2];
+                float NY = r10*nv[0] + r11*nv[1] + r12*nv[2];
+                float NZ = r20*nv[0] + r21*nv[1] + r22*nv[2];
+                float len2 = NX*NX + NY*NY + NZ*NZ;
+                float lam;
+
+                if (light != NULL) {
+                    /* Vertex normals point outward, so no sign correction is
+                     * needed here — unlike the face normals below. Clamped at
+                     * zero, which is what draws the terminator: past ninety
+                     * degrees the surface simply faces away from the light. */
+                    float VNx = V[0]*NX + V[1]*NY + V[2]*NZ;
+                    float VNy = V[4]*NX + V[5]*NY + V[6]*NZ;
+                    float VNz = V[8]*NX + V[9]*NY + V[10]*NZ;
+                    float lx = Lv[0] - X, ly = Lv[1] - Y, lz = Lv[2] - Z;
+                    float ll = sqrtf(lx*lx + ly*ly + lz*lz);
+                    float nl = sqrtf(VNx*VNx + VNy*VNy + VNz*VNz);
+                    float d = (ll > 1e-9f && nl > 1e-9f)
+                        ? (VNx*lx + VNy*ly + VNz*lz) / (ll * nl) : 1.0f;
+                    if (two_sided) d = fabsf(d);
+                    lam = (d > 0.0f) ? d : 0.0f;
+                } else {
+                    float VZ = V[8]*NX + V[9]*NY + V[10]*NZ;   /* rotation only */
+                    lam = (len2 > 1e-12f) ? fabsf(VZ) / sqrtf(len2) : 1.0f;
+                }
+                vlit[k] = amb + (1.0f - amb) * lam;
+            } else {
+                vlit[k] = 1.0f;
+            }
+            if (m->uvs != NULL) {
+                vu[k] = m->uvs[(size_t)tri->v[k] * 2];
+                vv[k] = m->uvs[(size_t)tri->v[k] * 2 + 1];
+            } else {
+                vu[k] = 0.0f; vv[k] = 0.0f;
+            }
+
+            /*
+             * Z is already the distance in front of the eye — the view matrix
+             * translated the eye to the origin. The old fixed viewpoint reached
+             * the same number as `focal + world z`, which is why this is not a
+             * behaviour change for a scene with no camera movement.
+             */
+            if (Z <= 1e-3f) {
+                behind = true;      /* at or behind the viewer */
+                break;
+            }
+            float s = f / Z;
+            sxp[k] = ccx + X * s;
+            syp[k] = ccy + Y * s;
+            szp[k] = Z;
+        }
+        if (behind) {
+            continue;
+        }
+
+        /* Signed area in screen space: its sign is the winding, which is how a
+         * back face is recognised after projection. */
+        float area = (sxp[1] - sxp[0]) * (syp[2] - syp[0])
+                   - (sxp[2] - sxp[0]) * (syp[1] - syp[0]);
+
+        if (fabsf(area) < 1e-6f) {
+            continue;               /* edge-on: nothing to fill */
+        }
+        if (m->cull && area < 0.0f) {
+            continue;
+        }
+
+        /*
+         * The rasterizer accepts one winding only, so a front face that
+         * projected the other way round is reversed here rather than
+         * complicating the pixel loop with a sign test.
+         */
+        int i0 = 0, i1 = 1, i2 = 2;
+        if (area < 0.0f) {
+            i1 = 2; i2 = 1;
+        }
+
+        /*
+         * Flat shading from the face's own normal.
+         *
+         * The light sits at the camera, so the term is just how much the face
+         * turns away from the viewer. It is the cheapest thing that makes a
+         * solid read as a solid — without it every face of a cube is the same
+         * colour and the shape disappears into a silhouette.
+         */
+        float ax = wx[1] - wx[0], ay = wy[1] - wy[0], az = wz[1] - wz[0];
+        float bx = wx[2] - wx[0], by = wy[2] - wy[0], bz = wz[2] - wz[0];
+        float nx = ay * bz - az * by;
+        float ny = az * bx - ax * bz;
+        float nz = ax * by - ay * bx;
+
+        float len = sqrtf(nx * nx + ny * ny + nz * nz);
+        float lam;
+
+        if (light != NULL) {
+            /*
+             * Negated: this renderer keeps the face whose cross product points
+             * *away* from the viewer (y-down flips the projected winding), so
+             * the outward normal — the one the light actually strikes — is the
+             * other one. Without the sign every lit body would come out
+             * inside-out, bright exactly where it should be dark.
+             */
+            float cx_w = (wx[0] + wx[1] + wx[2]) * (1.0f / 3.0f);
+            float cy_w = (wy[0] + wy[1] + wy[2]) * (1.0f / 3.0f);
+            float cz_w = (wz[0] + wz[1] + wz[2]) * (1.0f / 3.0f);
+            float lx = Lv[0] - cx_w, ly = Lv[1] - cy_w, lz = Lv[2] - cz_w;
+            float ll = sqrtf(lx*lx + ly*ly + lz*lz);
+            float d = (ll > 1e-9f && len > 1e-9f)
+                ? -(nx*lx + ny*ly + nz*lz) / (ll * len) : 1.0f;
+            if (two_sided) d = fabsf(d);
+            lam = (d > 0.0f) ? d : 0.0f;
+        } else {
+            lam = (len > 1e-9f) ? fabsf(nz) / len : 1.0f;
+        }
+        float lit = smooth ? 1.0f : (amb + (1.0f - amb) * lam);
+
+        ScreenTri *o = &out[n++];
+        o->x0 = sxp[i0]; o->y0 = syp[i0]; o->z0 = szp[i0];
+        o->x1 = sxp[i1]; o->y1 = syp[i1]; o->z1 = szp[i1];
+        o->x2 = sxp[i2]; o->y2 = syp[i2]; o->z2 = szp[i2];
+        o->r = base_r * lit;
+        o->g = base_g * lit;
+        o->b = base_b * lit;
+
+        o->l0 = vlit[i0]; o->l1 = vlit[i1]; o->l2 = vlit[i2];
+
+        /*
+         * u/z and 1/z, not u and v directly: those interpolate linearly in
+         * screen space where u does not, which is the difference between a
+         * texture that lies flat on a tilted face and one that visibly swims.
+         */
+        float iz0 = 1.0f / szp[i0];
+        float iz1 = 1.0f / szp[i1];
+        float iz2 = 1.0f / szp[i2];
+
+        o->u0 = vu[i0] * iz0; o->v0 = vv[i0] * iz0; o->w0 = iz0;
+        o->u1 = vu[i1] * iz1; o->v1 = vv[i1] * iz1; o->w1 = iz1;
+        o->u2 = vu[i2] * iz2; o->v2 = vv[i2] * iz2; o->w2 = iz2;
+
+        for (int k = 0; k < 3; k++) {
+            if (sxp[k] < minx) minx = sxp[k];
+            if (sxp[k] > maxx) maxx = sxp[k];
+            if (syp[k] < miny) miny = syp[k];
+            if (syp[k] > maxy) maxy = syp[k];
+        }
+    }
+
+    if (getenv("VR_MESH_DEBUG")) {
+        /* View-space depth range, which is what the z-buffer compares — the
+         * quickest way to tell a culling problem from an ordering one. */
+        float zlo = 1e30f, zhi = -1e30f;
+        for (int q = 0; q < n; q++) {
+            float zz[3] = { out[q].z0, out[q].z1, out[q].z2 };
+            for (int k = 0; k < 3; k++) {
+                if (zz[k] < zlo) zlo = zz[k];
+                if (zz[k] > zhi) zhi = zz[k];
+            }
+        }
+        fprintf(stderr, "[mesh] id=%s viewz %.1f..%.1f\n",
+                m->base.id ? m->base.id : "?", (double)zlo, (double)zhi);
+        fprintf(stderr, "[mesh] tris=%zu kept=%d  bbox x %.0f..%.0f y %.0f..%.0f  "
+                        "size=%.0f scale=%.2f focal=%.0f ox=%.0f oy=%.0f z=%.0f\n",
+                m->tri_count, n, (double)minx, (double)maxx, (double)miny, (double)maxy,
+                (double)m->size, (double)rt->scale, (double)f,
+                (double)ox, (double)oy, (double)rt->z);
+    }
+    if (n == 0) {
+        return 0;
+    }
+
+    int x0 = (int)floorf(minx), y0 = (int)floorf(miny);
+    int x1 = (int)ceilf(maxx) + 1, y1 = (int)ceilf(maxy) + 1;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > fb_w) x1 = fb_w;
+    if (y1 > fb_h) y1 = fb_h;
+    if (x1 <= x0 || y1 <= y0) {
+        return 0;
+    }
+
+    mp->fb_w = fb_w;  mp->fb_h = fb_h;
+    mp->bb_x = x0;    mp->bb_y = y0;
+    mp->bb_w = x1 - x0;
+    mp->bb_h = y1 - y0;
+    mp->tri_count = n;
+    mp->alpha  = rt->opacity;
+    mp->blend  = b_blend_of(m);
+    mp->smooth = smooth ? 1 : 0;
+    mp->tex_w  = (m->tex.pixels != NULL) ? m->tex.width  : 0;
+    mp->tex_h  = (m->tex.pixels != NULL) ? m->tex.height : 0;
+    return n;
+}
+
+void vr_camera_view(const Scene *scene, float t_sec, float focal, float view[12])
+{
+    const Camera3D *c = &scene->camera.eye;
+
+    /* The fixed viewpoint: back along -z by the focal length, looking at the
+     * origin. Chosen so that the moving and non-moving cases share one code
+     * path and agree exactly where they overlap. */
+    float ex = 0.0f, ey = 0.0f, ez = -focal;
+    float tx = 0.0f, ty = 0.0f, tz = 0.0f;
+    float roll = 0.0f;
+
+    if (c->moving) {
+        ex = track_sample(&c->px, t_sec);
+        ey = track_sample(&c->py, t_sec);
+        ez = track_sample(&c->pz, t_sec);
+        tx = track_sample(&c->tx, t_sec);
+        ty = track_sample(&c->ty, t_sec);
+        tz = track_sample(&c->tz, t_sec);
+        roll = track_sample(&c->roll, t_sec) * (float)(M_PI / 180.0);
+    }
+
+    /* Forward. A degenerate eye/target pair falls back to looking down +z
+     * rather than producing NaNs that would poison every vertex. */
+    float fx = tx - ex, fy = ty - ey, fz = tz - ez;
+    float fl = sqrtf(fx * fx + fy * fy + fz * fz);
+    if (fl < 1e-6f) {
+        fx = 0.0f; fy = 0.0f; fz = 1.0f; fl = 1.0f;
+    }
+    fx /= fl; fy /= fl; fz /= fl;
+
+    /*
+     * Up is (0,-1,0) because y runs down: "up" on screen is negative y. If the
+     * camera looks straight up or down that is parallel to the forward axis and
+     * the cross product collapses, so a different reference is used there.
+     */
+    float ux = 0.0f, uy = -1.0f, uz = 0.0f;
+    if (fabsf(fy) > 0.999f) {
+        ux = 0.0f; uy = 0.0f; uz = 1.0f;
+    }
+
+    /*
+     * right = forward x up, then down = forward x right.
+     *
+     * The order matters and is easy to get backwards: with the default view
+     * (forward +z, up (0,-1,0)) this gives right = (1,0,0) and down = (0,1,0),
+     * i.e. the identity — screen x to the right and screen y down, exactly the
+     * axes every existing scene was authored against. Taking up x forward
+     * instead negates both and silently mirrors the whole world.
+     */
+    float rx = fy * uz - fz * uy;
+    float ry = fz * ux - fx * uz;
+    float rz = fx * uy - fy * ux;
+    float rl = sqrtf(rx * rx + ry * ry + rz * rz);
+    if (rl < 1e-6f) {
+        rx = 1.0f; ry = 0.0f; rz = 0.0f; rl = 1.0f;
+    }
+    rx /= rl; ry /= rl; rz /= rl;
+
+    float vx = fy * rz - fz * ry;
+    float vy = fz * rx - fx * rz;
+    float vz = fx * ry - fy * rx;
+
+    /* Roll spins the basis about the view axis. */
+    if (roll != 0.0f) {
+        float cs = cosf(roll), sn = sinf(roll);
+        float nrx = rx * cs + vx * sn, nry = ry * cs + vy * sn, nrz = rz * cs + vz * sn;
+        float nvx = vx * cs - rx * sn, nvy = vy * cs - ry * sn, nvz = vz * cs - rz * sn;
+        rx = nrx; ry = nry; rz = nrz;
+        vx = nvx; vy = nvy; vz = nvz;
+    }
+
+    /* Rows of the view rotation, then the translation that puts the eye at the
+     * origin. A world point p becomes (R·p + T). */
+    view[0] = rx; view[1] = ry; view[2]  = rz; view[3]  = -(rx * ex + ry * ey + rz * ez);
+    view[4] = vx; view[5] = vy; view[6]  = vz; view[7]  = -(vx * ex + vy * ey + vz * ez);
+    view[8] = fx; view[9] = fy; view[10] = fz; view[11] = -(fx * ex + fy * ey + fz * ez);
 }
 
 /* ------------------------------------------------------------------------- */

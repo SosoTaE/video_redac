@@ -651,6 +651,27 @@ typedef struct {
     float cx, cy;
 
     /*
+     * Perspective. When false the affine `inv_*` matrix below is used and this
+     * struct behaves exactly as it always has; when true, `hinv` replaces it.
+     *
+     * Two paths rather than one general one, deliberately: the homography
+     * reduces to the affine case algebraically but not bit-for-bit, and every
+     * existing project would shift by a rounding step for no reason.
+     */
+    int   persp;
+    float hinv[9];    /* inverse homography, row-major */
+
+    /*
+     * Angle shading: how square-on the quad is to the viewer, 1 = face on.
+     *
+     * A flat quad carries no lighting of its own, so a card turning in space
+     * reads as a shape that merely narrows — the eye expects it to darken as it
+     * turns away. One multiply per pixel buys that, and `shade` is 1 whenever
+     * the feature is off, so the multiply costs nothing to skip.
+     */
+    float shade;
+
+    /*
      * Inverse 2x2 matrix: from frame space into texture space.
      *
      * The forward transform is  d = R(θ) · S · t  (scale first, then rotate).
@@ -672,6 +693,17 @@ typedef struct {
      */
     float tint_amount;
     float tint_r, tint_g, tint_b;
+
+    /*
+     * How the layer is combined with what is already there.
+     * 0 = source-over (normal), 1 = additive, 2 = screen.
+     *
+     * Additive is what makes a mass of particles or a glow read as *light*:
+     * overlapping sprites brighten toward white instead of each hiding the one
+     * behind it. Screen is its gentler cousin — it saturates rather than
+     * clipping, so a bright background does not blow out.
+     */
+    int   blend;
 
     /*
      * Clip mask in texture space, as fractions of the texture.
@@ -823,13 +855,36 @@ VR_PIX void vr_px_composite(uchar4 *VR_RESTRICT fb,
     float dx = (float)gx + 0.5f - p->cx;
     float dy = (float)gy + 0.5f - p->cy;
 
-    /* Backward projection into texture space (from the centre). */
-    float tx = p->inv_a * dx + p->inv_b * dy;
-    float ty = p->inv_c * dx + p->inv_d * dy;
+    float u, v;
 
-    /* Switch from centre-relative to top-left-relative coordinates. */
-    float u = tx + (float)p->tex_w * 0.5f;
-    float v = ty + (float)p->tex_h * 0.5f;
+    if (p->persp) {
+        /*
+         * Backward mapping through the inverse homography.
+         *
+         * A flat quad in space projects to the screen by a homography, so the
+         * way back is another one — the same "for every destination pixel, ask
+         * where it came from" as the affine case, with a divide added.
+         */
+        float hx = p->hinv[0] * dx + p->hinv[1] * dy + p->hinv[2];
+        float hy = p->hinv[3] * dx + p->hinv[4] * dy + p->hinv[5];
+        float hw = p->hinv[6] * dx + p->hinv[7] * dy + p->hinv[8];
+
+        /* w <= 0 is the part of the plane at or behind the viewer; there is no
+         * meaningful texel there, and dividing would fold it back into view. */
+        if (hw <= 1e-6f) {
+            return;
+        }
+        u = hx / hw;
+        v = hy / hw;
+    } else {
+        /* Backward projection into texture space (from the centre). */
+        float tx = p->inv_a * dx + p->inv_b * dy;
+        float ty = p->inv_c * dx + p->inv_d * dy;
+
+        /* Switch from centre-relative to top-left-relative coordinates. */
+        u = tx + (float)p->tex_w * 0.5f;
+        v = ty + (float)p->tex_h * 0.5f;
+    }
 
     if (u < 0.0f || u >= (float)p->tex_w || v < 0.0f || v >= (float)p->tex_h) {
         return; /* the texture does not cover this pixel */
@@ -891,6 +946,14 @@ VR_PIX void vr_px_composite(uchar4 *VR_RESTRICT fb,
         src.z += (p->tint_b * src.w - src.z) * t;
     }
 
+    /* Angle shading, before the fade — it darkens the surface, not the
+     * coverage, so alpha is deliberately left alone. */
+    if (p->shade < 1.0f) {
+        src.x *= p->shade;
+        src.y *= p->shade;
+        src.z *= p->shade;
+    }
+
     src.x *= p->alpha;
     src.y *= p->alpha;
     src.z *= p->alpha;
@@ -903,15 +966,290 @@ VR_PIX void vr_px_composite(uchar4 *VR_RESTRICT fb,
     size_t idx = (size_t)gy * p->fb_w + gx;
     uchar4 d   = fb[idx];
 
-    const float inv     = 1.0f / 255.0f;
-    float       inv_src = 1.0f - src.w;
+    const float inv = 1.0f / 255.0f;
+    float dr = (float)d.x * inv, dg = (float)d.y * inv;
+    float db = (float)d.z * inv, da = (float)d.w * inv;
 
-    float r = src.x + (float)d.x * inv * inv_src;
-    float g = src.y + (float)d.y * inv * inv_src;
-    float b = src.z + (float)d.z * inv * inv_src;
-    float a = src.w + (float)d.w * inv * inv_src;
+    float r, g, b, a;
+
+    if (p->blend == 1) {
+        /* Additive: the source is already premultiplied, so it adds directly. */
+        r = src.x + dr;
+        g = src.y + dg;
+        b = src.z + db;
+        a = src.w + da;
+    } else if (p->blend == 2) {
+        /* Screen: 1-(1-s)(1-d), which approaches 1 instead of exceeding it. */
+        r = 1.0f - (1.0f - vr_sat(src.x)) * (1.0f - dr);
+        g = 1.0f - (1.0f - vr_sat(src.y)) * (1.0f - dg);
+        b = 1.0f - (1.0f - vr_sat(src.z)) * (1.0f - db);
+        a = src.w + da * (1.0f - src.w);
+    } else {
+        float inv_src = 1.0f - src.w;
+        r = src.x + dr * inv_src;
+        g = src.y + dg * inv_src;
+        b = src.z + db * inv_src;
+        a = src.w + da * inv_src;
+    }
 
     fb[idx] = make_uchar4(vr_u8(r), vr_u8(g), vr_u8(b), vr_u8(a));
+}
+
+/* ------------------------------------------------------------------------- */
+/* Mesh rasterization                                                         */
+/* ------------------------------------------------------------------------- */
+
+/*
+ * One triangle, already transformed and projected by the host.
+ *
+ * Screen x/y in pixels, `z` the camera-space depth used for the depth test, and
+ * a flat colour the host derived from the face normal. Keeping the shading on
+ * the host means the pixel loop does no lighting maths at all — it only decides
+ * which triangle is nearest.
+ */
+typedef struct {
+    float x0, y0, z0;
+    float x1, y1, z1;
+    float x2, y2, z2;
+
+    /* Flat colour, used when the mesh has neither normals nor a texture. */
+    float r, g, b;
+
+    /*
+     * Per-vertex shading terms, for smooth (Gouraud) shading. Interpolating a
+     * scalar rather than a normal keeps the pixel loop to one multiply-add per
+     * vertex — the lighting itself was already resolved on the host.
+     */
+    float l0, l1, l2;
+
+    /* Texture coordinates, already divided by view z so the interpolation is
+     * perspective-correct; `wz` carries the reciprocals to undo it. */
+    float u0, v0, u1, v1, u2, v2;
+    float w0, w1, w2;
+} ScreenTri;
+
+typedef struct {
+    int   fb_w, fb_h;
+    int   bb_x, bb_y, bb_w, bb_h;   /* the mesh's screen bounding box */
+    int   tri_count;
+    float alpha;                    /* the widget's fade */
+    int   blend;                    /* as in CompositeParams */
+
+    int   smooth;                   /* interpolate l0..l2 rather than use r,g,b flat */
+    int   tex_w, tex_h;             /* 0 = untextured */
+} MeshParams;
+
+/*
+ * Rasterizes one pixel of a mesh.
+ *
+ * The loop is over *triangles inside one pixel*, not pixels inside one
+ * triangle. That inversion is what lets a single implementation serve both
+ * backends: there is no shared depth buffer to race over, because the depth
+ * test is a local variable — each pixel independently finds its own nearest
+ * face. A z-buffer with atomics would be faster for heavy meshes but would need
+ * two different implementations, and the whole architecture here is built on
+ * not having those.
+ *
+ * The cost is O(triangles) per pixel, so this suits models of hundreds to a few
+ * thousand faces rather than scanned assets.
+ */
+VR_PIX void vr_px_mesh(uchar4 *VR_RESTRICT fb, float *VR_RESTRICT depth,
+                       const ScreenTri *VR_RESTRICT tris,
+                       const uchar4 *VR_RESTRICT tex,
+                       const MeshParams *p, int i, int j)
+{
+    int gx = p->bb_x + i;
+    int gy = p->bb_y + j;
+
+    if (gx < 0 || gx >= p->fb_w || gy < 0 || gy >= p->fb_h) {
+        return;
+    }
+
+    size_t idx = (size_t)gy * p->fb_w + gx;
+
+    float px = (float)gx + 0.5f;
+    float py = (float)gy + 0.5f;
+
+    /*
+     * Start from whatever earlier meshes left in the depth buffer, so a nearer
+     * surface from *another* mesh correctly hides this one. That is the whole
+     * point of the shared buffer: without it each mesh only occludes itself and
+     * two interpenetrating solids draw in the order they happen to be listed.
+     *
+     * No atomics are needed even on the GPU: one thread owns one pixel for the
+     * whole of a mesh's rasterization, and mesh launches are ordered on the
+     * stream — so nothing else can touch this entry while it is being decided.
+     */
+    float best_z = (depth != NULL) ? depth[idx] : 1e30f;
+    float cr = 0.0f, cg = 0.0f, cb = 0.0f;
+    float cov = 1.0f;          /* the texture's own alpha at the winning pixel */
+    bool  hit = false;
+
+    for (int t = 0; t < p->tri_count; t++) {
+        const ScreenTri *tr = &tris[t];
+
+        /* Edge functions. Their signs together say whether the point is inside;
+         * the sum is twice the signed area, which also normalises them. */
+        float e0 = (tr->x1 - tr->x0) * (py - tr->y0) - (tr->y1 - tr->y0) * (px - tr->x0);
+        float e1 = (tr->x2 - tr->x1) * (py - tr->y1) - (tr->y2 - tr->y1) * (px - tr->x1);
+        float e2 = (tr->x0 - tr->x2) * (py - tr->y2) - (tr->y0 - tr->y2) * (px - tr->x2);
+
+        /* The sum is twice the signed area — a constant for the triangle,
+         * whatever the point — so it also sets the scale for the test below. */
+        float area = e0 + e1 + e2;
+        if (area <= 1e-9f) {
+            continue;
+        }
+
+        /*
+         * One winding only: the host has already discarded back faces when the
+         * mesh asked for culling, so anything arriving here is front-facing.
+         *
+         * The tolerance is what closes the seam along a shared edge. Two
+         * triangles meeting on a diagonal compute that edge from opposite ends,
+         * and the two expressions are exact negations only in real arithmetic —
+         * in floats both can land a hair below zero, so neither claims the
+         * pixel and a one-pixel crack opens down the middle of a flat face. A
+         * relative epsilon lets both claim it instead; the second then loses the
+         * depth test to the first, which costs nothing because on a shared edge
+         * they agree about depth and colour anyway.
+         */
+        float eps = 1e-6f * area;
+        if (e0 < -eps || e1 < -eps || e2 < -eps) {
+            continue;
+        }
+
+        /* Barycentric depth. Interpolating camera-space z linearly in screen
+         * space is not strictly correct under perspective, but across a single
+         * triangle of a modest mesh the error is far below one depth step. */
+        float inv = 1.0f / area;
+        float z = (e1 * tr->z0 + e2 * tr->z1 + e0 * tr->z2) * inv;
+
+        if (z >= best_z) {
+            continue;
+        }
+
+        /* Barycentric weights. e1 belongs to vertex 0, e2 to vertex 1 and e0 to
+         * vertex 2 — the edge opposite each. */
+        float b0 = e1 * inv, b1 = e2 * inv, b2 = e0 * inv;
+
+        float shade = 1.0f;
+        if (p->smooth) {
+            shade = b0 * tr->l0 + b1 * tr->l1 + b2 * tr->l2;
+            if (shade < 0.0f) shade = 0.0f;
+        }
+
+        /*
+         * The surface colour before texturing. Under flat shading the host has
+         * already folded the lighting into tr->r and `shade` is 1; under smooth
+         * shading tr->r is the raw colour and `shade` carries the light. Either
+         * way this is "the lit mesh colour", which is what a texture modulates.
+         */
+        float tr_r = tr->r * shade;
+        float tr_g = tr->g * shade;
+        float tr_b = tr->b * shade;
+        float ta = 1.0f;
+
+        if (p->tex_w > 0 && tex != NULL) {
+            /*
+             * Perspective-correct texturing: u/z and 1/z interpolate linearly
+             * in screen space, u does not. Interpolating u directly is the
+             * classic swimming-texture artefact on a steeply angled face.
+             */
+            float w = b0 * tr->w0 + b1 * tr->w1 + b2 * tr->w2;
+            if (w > 1e-9f) {
+                float uu = (b0 * tr->u0 + b1 * tr->u1 + b2 * tr->u2) / w;
+                float vv = (b0 * tr->v0 + b1 * tr->v1 + b2 * tr->v2) / w;
+
+                /* Wrap, so tiled UVs outside 0..1 behave as expected. */
+                uu = uu - floorf(uu);
+                vv = vv - floorf(vv);
+
+                int tx = vr_clampi((int)(uu * (float)p->tex_w), 0, p->tex_w - 1);
+                int ty = vr_clampi((int)(vv * (float)p->tex_h), 0, p->tex_h - 1);
+                uchar4 tc = tex[(size_t)ty * p->tex_w + tx];
+
+                /*
+                 * Texture times mesh colour, so a white mesh shows the texture
+                 * untouched and a coloured one tints it — and the lighting,
+                 * already in cr/cg/cb, survives either way. Multiplying the
+                 * texel by `shade` alone would light the flat-shaded case not
+                 * at all, leaving a textured cube perfectly evenly lit.
+                 */
+                const float i255 = 1.0f / 255.0f;
+                tr_r *= tc.x * i255;
+                tr_g *= tc.y * i255;
+                tr_b *= tc.z * i255;
+                ta    = tc.w * i255;
+            }
+        }
+
+        /*
+         * A transparent texel is not a surface.
+         *
+         * The test has to sit here, after sampling and before the depth is
+         * committed, or the hole in a planetary ring would still write depth
+         * and hide whatever is behind it — an invisible disc that occludes.
+         * Rejecting the fragment instead lets the triangle behind win the
+         * pixel, which is the whole point of an alpha-cut surface.
+         */
+        if (ta <= (1.0f / 255.0f)) {
+            continue;
+        }
+
+        best_z = z;
+        hit = true;
+        cov = ta;
+        cr = tr_r;
+        cg = tr_g;
+        cb = tr_b;
+    }
+
+    if (!hit) {
+        return;
+    }
+
+    if (depth != NULL) {
+        depth[idx] = best_z;
+    }
+
+    float a = vr_sat(p->alpha);
+    if (a <= 0.0f) {
+        return;
+    }
+
+    /*
+     * Coverage and colour part company once a texture has an alpha channel.
+     * Textures here are premultiplied, so cr/cg/cb already carry the texel's
+     * alpha and must not be scaled by it again; only the *coverage* — what the
+     * fragment hides of the background — takes it. Multiplying both would
+     * darken every semi-transparent pixel twice.
+     */
+    float ea = a * cov;
+
+    uchar4 d = fb[idx];
+
+    const float inv255 = 1.0f / 255.0f;
+    float dr = (float)d.x * inv255, dg = (float)d.y * inv255;
+    float db = (float)d.z * inv255, da = (float)d.w * inv255;
+
+    /* Premultiplied source, matching every other layer in the pipeline. */
+    float sr = cr * a, sg = cg * a, sb = cb * a;
+    float r, g, b, outa;
+
+    if (p->blend == 1) {
+        r = sr + dr; g = sg + dg; b = sb + db; outa = ea + da;
+    } else if (p->blend == 2) {
+        r = 1.0f - (1.0f - vr_sat(sr)) * (1.0f - dr);
+        g = 1.0f - (1.0f - vr_sat(sg)) * (1.0f - dg);
+        b = 1.0f - (1.0f - vr_sat(sb)) * (1.0f - db);
+        outa = ea + da * (1.0f - ea);
+    } else {
+        float ia = 1.0f - ea;
+        r = sr + dr * ia; g = sg + dg * ia; b = sb + db * ia; outa = ea + da * ia;
+    }
+
+    fb[idx] = make_uchar4(vr_u8(r), vr_u8(g), vr_u8(b), vr_u8(outa));
 }
 
 #endif /* VIDEO_REDAC_PIXEL_OPS_H */

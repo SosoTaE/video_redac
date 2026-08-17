@@ -1,0 +1,1 @@
+{"project": {"width": 960, "height": 540, "fps": 30, "bg_color": "#101018"}, "scenes": [{"id": "s", "duration_ms": 300, "camera": {"perspective": 1600.0}, "objects": [{"id": "mic", "type": "mesh", "path": "../assets/microphone/scene.gltf", "x": 480, "y": 270, "anchor": "center", "size": 420, "color": "#FFFFFF", "ambient": 0.3, "cull": false}], "timeline": []}]}

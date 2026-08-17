@@ -14,7 +14,11 @@
  */
 
 #include "media_loader.h"
+#include "mesh.h"
 
+#include "audio.h"   /* vr_shell_quote() */
+
+#include <ctype.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1299,6 +1303,545 @@ bool media_load_image_rgba(const char *path, Texture *out)
 /* Filling the cache                                                          */
 /* ------------------------------------------------------------------------- */
 
+/* ------------------------------------------------------------------------- */
+/* Video                                                                      */
+/* ------------------------------------------------------------------------- */
+
+/* Asks ffprobe for the stream's size and frame rate. */
+static bool probe_video(const char *path, int *w, int *h, float *fps)
+{
+    char quoted[2048];
+    if (!vr_shell_quote(path, quoted, sizeof quoted)) {
+        return false;
+    }
+
+    char cmd[2400];
+    int n = snprintf(cmd, sizeof cmd,
+                     "ffprobe -v error -select_streams v:0 "
+                     "-show_entries stream=width,height,r_frame_rate "
+                     "-of default=nw=1:nk=1 %s 2>/dev/null", quoted);
+    if (n < 0 || (size_t)n >= sizeof cmd) {
+        return false;
+    }
+
+    FILE *fp = popen(cmd, "r");
+    if (fp == NULL) {
+        return false;
+    }
+
+    char line[128];
+    int  got = 0;
+    *w = *h = 0;
+    *fps = 30.0f;
+
+    while (fgets(line, sizeof line, fp) != NULL) {
+        if (got == 0)      *w = atoi(line);
+        else if (got == 1) *h = atoi(line);
+        else if (got == 2) {
+            /* r_frame_rate is a rational, "30000/1001". */
+            int num = 0, den = 1;
+            if (sscanf(line, "%d/%d", &num, &den) == 2 && den != 0) {
+                *fps = (float)num / (float)den;
+            }
+        }
+        got++;
+    }
+    pclose(fp);
+
+    return (*w > 0 && *h > 0);
+}
+
+bool media_load_video_widget(VideoWidget *w, int budget_mb)
+{
+    memset(&w->base.tex, 0, sizeof w->base.tex);
+
+    if (w->path == NULL) {
+        return false;
+    }
+
+    int   sw = 0, sh = 0;
+    float fps = 30.0f;
+    if (!probe_video(w->path, &sw, &sh, &fps)) {
+        fprintf(stderr, "error: could not read video '%s' (is it a video?).\n", w->path);
+        return false;
+    }
+
+    /*
+     * Decode at the size it will be shown at, not the source's.
+     *
+     * This is the whole memory story: a 1080p frame is 8.3 MB, a 640x360 one is
+     * 0.9 MB. A clip that appears as a small inset should not cost nine times
+     * what it needs to.
+     */
+    int dw = (w->request_w > 0) ? w->request_w : sw;
+    int dh = (w->request_h > 0) ? w->request_h : sh;
+    if (w->request_w > 0 && w->request_h <= 0) {
+        dh = (int)lrintf((float)w->request_w * (float)sh / (float)sw);
+    } else if (w->request_h > 0 && w->request_w <= 0) {
+        dw = (int)lrintf((float)w->request_h * (float)sw / (float)sh);
+    }
+    dw &= ~1; dh &= ~1;               /* even dimensions keep swscale happy */
+    if (dw < 2) dw = 2;
+    if (dh < 2) dh = 2;
+
+    size_t frame_bytes = (size_t)dw * dh * 4;
+    size_t budget      = (size_t)budget_mb * 1024u * 1024u;
+    size_t max_frames  = (frame_bytes > 0) ? (budget / frame_bytes) : 0;
+    if (max_frames < 1) {
+        max_frames = 1;
+    }
+
+    char quoted[2048];
+    if (!vr_shell_quote(w->path, quoted, sizeof quoted)) {
+        return false;
+    }
+
+    /*
+     * `-ss` before `-i` so ffmpeg seeks rather than decoding and discarding,
+     * and `setpts` for speed so the frames arrive already retimed — the
+     * alternative is picking frames ourselves and inheriting the rounding.
+     */
+    char cmd[4096];
+    int  n = snprintf(cmd, sizeof cmd,
+                      "ffmpeg -v error -ss %.3f -i %s "
+                      "-vf \"scale=%d:%d,setpts=PTS/%.4f\" "
+                      "-f rawvideo -pix_fmt rgba -",
+                      (double)w->start, quoted, dw, dh, (double)w->speed);
+    if (n < 0 || (size_t)n >= sizeof cmd) {
+        return false;
+    }
+
+    FILE *pipe = popen(cmd, "r");
+    if (pipe == NULL) {
+        fprintf(stderr, "error: could not start ffmpeg to decode '%s'.\n", w->path);
+        return false;
+    }
+
+    uint8_t *buf   = NULL;
+    size_t   count = 0;
+    size_t   cap   = 0;
+    bool     ok    = true;
+
+    while (count < max_frames) {
+        if (count == cap) {
+            size_t new_cap = (cap == 0) ? 16 : cap * 2;
+            if (new_cap > max_frames) {
+                new_cap = max_frames;
+            }
+            uint8_t *grown = (uint8_t *)realloc(buf, new_cap * frame_bytes);
+            if (grown == NULL) {
+                ok = false;
+                break;
+            }
+            buf = grown;
+            cap = new_cap;
+        }
+
+        size_t got = fread(buf + count * frame_bytes, 1, frame_bytes, pipe);
+        if (got < frame_bytes) {
+            break;      /* end of stream, or a partial trailing frame */
+        }
+        count++;
+    }
+
+    int status = pclose(pipe);
+    if (status != 0 && count == 0) {
+        fprintf(stderr, "error: decoding '%s' failed (ffmpeg exit %d).\n", w->path, status);
+        free(buf);
+        return false;
+    }
+    if (!ok || count == 0) {
+        fprintf(stderr, "error: no frames decoded from '%s'.\n", w->path);
+        free(buf);
+        return false;
+    }
+    if (count == max_frames) {
+        fprintf(stderr, "warning: '%s' truncated at %zu frames (%d MB budget).\n",
+                w->path, count, budget_mb);
+    }
+
+    /*
+     * RGBA from ffmpeg is *straight* alpha, while every texture in this
+     * pipeline is premultiplied. Video is opaque in practice, but converting
+     * unconditionally keeps the invariant true rather than true-by-luck.
+     */
+    for (size_t i = 0; i < count * (size_t)dw * dh; i++) {
+        uint8_t *px = buf + i * 4;
+        if (px[3] != 255) {
+            px[0] = (uint8_t)((px[0] * px[3] + 127) / 255);
+            px[1] = (uint8_t)((px[1] * px[3] + 127) / 255);
+            px[2] = (uint8_t)((px[2] * px[3] + 127) / 255);
+        }
+    }
+
+    w->frame_w     = dw;
+    w->frame_h     = dh;
+    w->frame_count = (int)count;
+    w->src_fps     = fps * w->speed;
+
+    /* One texture, frames stacked top to bottom. The compositor is handed a
+     * pointer into it rather than a separate texture per frame. */
+    w->base.tex.pixels        = buf;
+    w->base.tex.width         = dw;
+    w->base.tex.height        = dh * (int)count;
+    w->base.tex.stride        = (size_t)dw * 4;
+    w->base.tex.premultiplied = true;
+
+    fprintf(stderr, "video: %s — %d frames %dx%d @ %.2f fps (%.1f MiB)\n",
+            w->path, w->frame_count, dw, dh, (double)w->src_fps,
+            (double)(count * frame_bytes) / (1024.0 * 1024.0));
+    return true;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Drop shadow and glow                                                       */
+/* ------------------------------------------------------------------------- */
+
+/*
+ * A separable box blur, run three times.
+ *
+ * Three box passes converge on a Gaussian closely enough that the difference is
+ * invisible at any blur radius a shadow uses, and each pass is O(1) per pixel
+ * thanks to the running sum — so a 40-pixel blur costs the same per pixel as a
+ * 4-pixel one. A true Gaussian would be O(radius).
+ */
+static void blur_alpha(float *buf, float *tmp, int w, int h, int radius)
+{
+    if (radius < 1) {
+        return;
+    }
+
+    for (int pass = 0; pass < 3; pass++) {
+        /* --- horizontal --- */
+        for (int y = 0; y < h; y++) {
+            const float *in  = buf + (size_t)y * w;
+            float       *out = tmp + (size_t)y * w;
+
+            float sum = 0.0f;
+            int   n   = 0;
+            for (int x = 0; x <= radius && x < w; x++) {
+                sum += in[x];
+                n++;
+            }
+            for (int x = 0; x < w; x++) {
+                out[x] = sum / (float)n;
+                int add = x + radius + 1;
+                int sub = x - radius;
+                if (add < w) { sum += in[add]; n++; }
+                if (sub >= 0) { sum -= in[sub]; n--; }
+            }
+        }
+        /* --- vertical --- */
+        for (int x = 0; x < w; x++) {
+            float sum = 0.0f;
+            int   n   = 0;
+            for (int y = 0; y <= radius && y < h; y++) {
+                sum += tmp[(size_t)y * w + x];
+                n++;
+            }
+            for (int y = 0; y < h; y++) {
+                buf[(size_t)y * w + x] = sum / (float)n;
+                int add = y + radius + 1;
+                int sub = y - radius;
+                if (add < h) { sum += tmp[(size_t)add * w + x]; n++; }
+                if (sub >= 0) { sum -= tmp[(size_t)sub * w + x]; n--; }
+            }
+        }
+    }
+}
+
+/*
+ * Grows a texture by `pad` on every side and draws a blurred, tinted copy of
+ * its own alpha underneath, offset by (dx, dy).
+ *
+ * The padding is symmetric even though the offset is not, so that the content
+ * stays centred in its texture — anchoring and rotation both work from the
+ * texture's centre, and an asymmetric pad would shift a centred object.
+ *
+ * `draw_shadow` false pads without drawing anything, which is how a code
+ * block's glyph layer is kept the same size as its panel.
+ */
+static bool texture_pad_shadow(Texture *t, const WidgetBase *b, int pad, bool draw_shadow)
+{
+    if (t->pixels == NULL || pad <= 0) {
+        return true;
+    }
+
+    int nw = t->width + 2 * pad;
+    int nh = t->height + 2 * pad;
+
+    uint8_t *dst = (uint8_t *)calloc((size_t)nw * nh, 4);
+    if (dst == NULL) {
+        return false;
+    }
+
+    if (draw_shadow) {
+        float *a   = (float *)calloc((size_t)nw * nh, sizeof(float));
+        float *tmp = (float *)calloc((size_t)nw * nh, sizeof(float));
+        if (a == NULL || tmp == NULL) {
+            free(a); free(tmp); free(dst);
+            return false;
+        }
+
+        /* The source alpha, placed where the shadow should fall. */
+        int ox = pad + (int)lrintf(b->shadow_dx);
+        int oy = pad + (int)lrintf(b->shadow_dy);
+
+        for (int y = 0; y < t->height; y++) {
+            int ty = y + oy;
+            if (ty < 0 || ty >= nh) {
+                continue;
+            }
+            for (int x = 0; x < t->width; x++) {
+                int tx = x + ox;
+                if (tx < 0 || tx >= nw) {
+                    continue;
+                }
+                a[(size_t)ty * nw + tx] =
+                    (float)t->pixels[((size_t)y * t->width + x) * 4 + 3] / 255.0f;
+            }
+        }
+
+        blur_alpha(a, tmp, nw, nh, (int)lrintf(b->shadow_blur / 3.0f));
+        free(tmp);
+
+        const float cr = b->shadow_color.r / 255.0f;
+        const float cg = b->shadow_color.g / 255.0f;
+        const float cb = b->shadow_color.b / 255.0f;
+        const float ca = b->shadow_color.a / 255.0f;
+
+        for (size_t i = 0; i < (size_t)nw * nh; i++) {
+            float sa = a[i] * ca;
+            if (sa <= 0.0f) {
+                continue;
+            }
+            if (sa > 1.0f) sa = 1.0f;
+            /* Premultiplied, like every other texture in the pipeline. */
+            dst[i * 4 + 0] = (uint8_t)(cr * sa * 255.0f + 0.5f);
+            dst[i * 4 + 1] = (uint8_t)(cg * sa * 255.0f + 0.5f);
+            dst[i * 4 + 2] = (uint8_t)(cb * sa * 255.0f + 0.5f);
+            dst[i * 4 + 3] = (uint8_t)(sa * 255.0f + 0.5f);
+        }
+        free(a);
+    }
+
+    /* The original content, source-over on top of the shadow. */
+    for (int y = 0; y < t->height; y++) {
+        for (int x = 0; x < t->width; x++) {
+            const uint8_t *sp = t->pixels + ((size_t)y * t->width + x) * 4;
+            uint8_t       *dp = dst + ((size_t)(y + pad) * nw + (x + pad)) * 4;
+
+            float sa = sp[3] / 255.0f;
+            float ia = 1.0f - sa;
+            for (int c = 0; c < 4; c++) {
+                float v = sp[c] / 255.0f + (dp[c] / 255.0f) * ia;
+                if (v > 1.0f) v = 1.0f;
+                dp[c] = (uint8_t)(v * 255.0f + 0.5f);
+            }
+        }
+    }
+
+    free(t->pixels);
+    t->pixels = dst;
+    t->width  = nw;
+    t->height = nh;
+    t->stride = (size_t)nw * 4;
+    return true;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Bindings — positions expressed against other objects                       */
+/* ------------------------------------------------------------------------- */
+
+/*
+ * One edge of an object's box, in canvas pixels.
+ *
+ * Reads the *resolved* geometry, so this only makes sense once layout has run
+ * — which is exactly why bindings are a second pass rather than something the
+ * parser could do.
+ */
+static bool object_edge(const EditorContext *ctx, const char *id, const char *edge,
+                        float *out)
+{
+    for (size_t i = 0; i < ctx->widget_count; i++) {
+        const WidgetBase *b = ctx->widgets[i];
+        if (b->id == NULL || strcmp(b->id, id) != 0) {
+            continue;
+        }
+
+        /*
+         * Refuse while the referenced object's own binding is still pending.
+         *
+         * Without this a cycle "resolves" against whatever default position the
+         * other object happens to hold, producing a plausible-looking wrong
+         * answer instead of the warning the author needs. Size is exempt: `w`
+         * and `h` never depend on a binding.
+         */
+        bool needs_x = (strcmp(edge, "left") == 0 || strcmp(edge, "right") == 0 ||
+                        strcmp(edge, "cx") == 0);
+        bool needs_y = (strcmp(edge, "top") == 0 || strcmp(edge, "bottom") == 0 ||
+                        strcmp(edge, "cy") == 0);
+        if ((needs_x && b->x_bind != NULL) || (needs_y && b->y_bind != NULL)) {
+            return false;
+        }
+
+        float left = b->x - b->anchor_off_x;
+        float top  = b->y - b->anchor_off_y;
+
+        if      (strcmp(edge, "left")   == 0) *out = left;
+        else if (strcmp(edge, "right")  == 0) *out = left + b->base_w;
+        else if (strcmp(edge, "top")    == 0) *out = top;
+        else if (strcmp(edge, "bottom") == 0) *out = top + b->base_h;
+        else if (strcmp(edge, "cx")     == 0) *out = left + b->base_w * 0.5f;
+        else if (strcmp(edge, "cy")     == 0) *out = top  + b->base_h * 0.5f;
+        else if (strcmp(edge, "w")      == 0) *out = b->base_w;
+        else if (strcmp(edge, "h")      == 0) *out = b->base_h;
+        else return false;
+        return true;
+    }
+    return false;
+}
+
+/*
+ * Evaluates `=other.bottom + 24`.
+ *
+ * Same tiny grammar as an event's `time`: a term, then any number of signed
+ * terms. A term is either a number or `object.edge`. Keeping the two grammars
+ * identical is deliberate — one shape to learn, not two.
+ */
+static bool eval_binding(const EditorContext *ctx, const char *expr, float *out)
+{
+    const char *p = expr;
+    if (*p == '=') {
+        p++;
+    }
+
+    float total = 0.0f;
+    float sign  = 1.0f;
+    bool  first = true;
+
+    while (*p != '\0') {
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '\0') break;
+
+        if (!first) {
+            if (*p == '+')      { sign =  1.0f; p++; }
+            else if (*p == '-') { sign = -1.0f; p++; }
+            else return false;
+            while (*p == ' ' || *p == '\t') p++;
+        }
+
+        if (isdigit((unsigned char)*p) || *p == '.') {
+            char *end = NULL;
+            double v = strtod(p, &end);
+            if (end == p) return false;
+            total += sign * (float)v;
+            p = end;
+        } else if (isalpha((unsigned char)*p) || *p == '_') {
+            const char *start = p;
+            while (isalnum((unsigned char)*p) || *p == '_' || *p == '-') p++;
+
+            char id[128];
+            size_t n = (size_t)(p - start);
+            if (n >= sizeof id) return false;
+            memcpy(id, start, n);
+            id[n] = '\0';
+
+            if (*p != '.') return false;
+            p++;
+
+            const char *estart = p;
+            while (isalpha((unsigned char)*p)) p++;
+
+            char edge[24];
+            size_t m = (size_t)(p - estart);
+            if (m == 0 || m >= sizeof edge) return false;
+            memcpy(edge, estart, m);
+            edge[m] = '\0';
+
+            float v = 0.0f;
+            if (!object_edge(ctx, id, edge, &v)) {
+                return false;
+            }
+            total += sign * v;
+        } else {
+            return false;
+        }
+
+        sign  = 1.0f;
+        first = false;
+    }
+
+    *out = total;
+    return true;
+}
+
+/*
+ * Resolves every binding, repeatedly.
+ *
+ * An object may be bound to one that is itself bound, so a single pass is not
+ * enough; and a cycle must not loop forever. Bounded by the object count, which
+ * is the longest a legitimate chain can be.
+ */
+static void resolve_bindings(EditorContext *ctx)
+{
+    bool any = false;
+    for (size_t i = 0; i < ctx->widget_count && !any; i++) {
+        any = (ctx->widgets[i]->x_bind != NULL || ctx->widgets[i]->y_bind != NULL);
+    }
+    if (!any) {
+        return;
+    }
+
+    for (size_t pass = 0; pass <= ctx->widget_count; pass++) {
+        bool progress = false;
+
+        for (size_t i = 0; i < ctx->widget_count; i++) {
+            WidgetBase *b = ctx->widgets[i];
+            float v;
+
+            /*
+             * The value becomes the object's *anchor point*, not its left edge
+             * — exactly what a layout expression does. So `"anchor": "bottom"`
+             * with `"x": "=bar.cx"` centres the label on the bar, which is what
+             * anyone writing that means.
+             */
+            if (b->x_bind != NULL && eval_binding(ctx, b->x_bind, &v)) {
+                b->x = v;
+                free(b->x_bind);
+                b->x_bind = NULL;
+                b->auto_center_x = false;
+                progress = true;
+            }
+            if (b->y_bind != NULL && eval_binding(ctx, b->y_bind, &v)) {
+                b->y = v;
+                free(b->y_bind);
+                b->y_bind = NULL;
+                progress = true;
+            }
+        }
+        if (!progress) {
+            break;
+        }
+    }
+
+    for (size_t i = 0; i < ctx->widget_count; i++) {
+        WidgetBase *b = ctx->widgets[i];
+        if (b->x_bind != NULL) {
+            fprintf(stderr, "warning: '%s' — cannot resolve x binding \"%s\".\n",
+                    b->id ? b->id : "(null)", b->x_bind);
+            free(b->x_bind);
+            b->x_bind = NULL;
+        }
+        if (b->y_bind != NULL) {
+            fprintf(stderr, "warning: '%s' — cannot resolve y binding \"%s\".\n",
+                    b->id ? b->id : "(null)", b->y_bind);
+            free(b->y_bind);
+            b->y_bind = NULL;
+        }
+    }
+}
+
 bool media_prepare_textures(EditorContext *ctx)
 {
     if (ctx == NULL) {
@@ -1332,6 +1875,24 @@ bool media_prepare_textures(EditorContext *ctx)
             case WIDGET_PATH:
                 ok = media_render_path_widget((PathWidget *)b);
                 break;
+            case WIDGET_MESH: {
+                /* A mesh's geometry came from the parser; only an optional
+                 * surface texture is loaded here, where stb_image already is. */
+                MeshWidget *mw = (MeshWidget *)b;
+                ok = true;
+                if (mw->tex_path != NULL) {
+                    if (!media_load_image_rgba(mw->tex_path, &mw->tex)) {
+                        fprintf(stderr, "warning: mesh '%s' — cannot load texture '%s'.\n",
+                                b->id ? b->id : "(null)", mw->tex_path);
+                    }
+                }
+                break;
+            }
+            case WIDGET_VIDEO:
+                /* 512 MB per clip: generous for an inset, still far short of
+                 * decoding a feature film into RAM by accident. */
+                ok = media_load_video_widget((VideoWidget *)b, 512);
+                break;
             default:
                 fprintf(stderr, "warning: '%s' — unknown type, skipped.\n",
                         b->id ? b->id : "(null)");
@@ -1344,9 +1905,70 @@ bool media_prepare_textures(EditorContext *ctx)
             return false;
         }
 
+        /*
+         * --- shadow / glow -------------------------------------------------
+         *
+         * Done here rather than inside each rasterizer: one place, and it acts
+         * on plain RGBA, so it works identically for text, shapes, lines,
+         * paths and images.
+         */
+        /*
+         * A clip's texture is every frame stacked, and the slice the compositor
+         * receives assumes they are packed with no margin. Padding the strip
+         * would put the margin around the *whole* stack, so every frame after
+         * the first would be read from the wrong offset — which showed up as a
+         * sliver of the neighbouring frame beside the picture.
+         *
+         * Padding each frame instead would mean re-blurring 120 images and
+         * carrying the margin in memory, for an effect a video rarely needs.
+         * Refusing, loudly, is the better trade.
+         */
+        if (b->shadow_on && b->kind == WIDGET_VIDEO) {
+            fprintf(stderr, "warning: '%s' — shadow/glow is not supported on video; ignored.\n",
+                    b->id ? b->id : "(null)");
+            b->shadow_on = false;
+        }
+
+        if (b->shadow_on) {
+            int pad = (int)lrintf(b->shadow_blur) +
+                      (int)lrintf(fabsf(b->shadow_dx) > fabsf(b->shadow_dy)
+                                      ? fabsf(b->shadow_dx) : fabsf(b->shadow_dy)) + 2;
+
+            /* A code block's shadow belongs to its panel, not to the glyphs —
+             * but both layers must stay the same size or they would no longer
+             * line up, so the glyph layer is padded without a shadow. */
+            bool code = (b->kind == WIDGET_CODE);
+            CodeWidget *cw = code ? (CodeWidget *)b : NULL;
+
+            if (code && cw->plate.pixels != NULL) {
+                if (!texture_pad_shadow(&cw->plate, b, pad, true) ||
+                    !texture_pad_shadow(&b->tex, b, pad, false)) {
+                    return false;
+                }
+            } else if (!texture_pad_shadow(&b->tex, b, pad, true)) {
+                return false;
+            }
+
+            b->tex_pad = pad;
+        }
+
         /* --- base size (scale = 1) ----------------------------------------- */
         b->base_w = (float)b->tex.width;
         b->base_h = (float)b->tex.height;
+
+        /* A mesh's extent is its own `size`, not a texture's. Giving it a box
+         * keeps layout, anchoring and the validator working unchanged. */
+        if (b->kind == WIDGET_MESH) {
+            const MeshWidget *mw = (const MeshWidget *)b;
+            b->base_w = b->base_h = mw->size;
+        }
+
+        /* A clip's texture holds every frame stacked, so its height is the
+         * whole strip; the object is one frame tall. */
+        if (b->kind == WIDGET_VIDEO) {
+            const VideoWidget *vw = (const VideoWidget *)b;
+            b->base_h = (float)vw->frame_h;
+        }
 
         if (b->kind == WIDGET_IMAGE) {
             const ImageWidget *iw = (const ImageWidget *)b;
@@ -1402,15 +2024,23 @@ bool media_prepare_textures(EditorContext *ctx)
             }
         }
 
-        /* A `repeat` displacement lands on top of the resolved position, so
-         * that "the twelfth copy, 240 px out" still honours "center". */
-        b->x += b->repeat_dx;
-        b->y += b->repeat_dy;
+        /*
+         * `repeat_dx` and `tex_pad` are NOT applied here.
+         *
+         * `b->x` is only consulted when the object has no x track — and a plain
+         * `"x": 240` counts as a track whose constant is 240, so an adjustment
+         * made here would be skipped for most objects. They are applied in
+         * vr_evaluate_scene instead, alongside `anchor_off_*`, which has always
+         * had to solve exactly this problem.
+         */
 
         /* auto-center already yields a final coordinate — anchoring skips it. */
         b->anchor_off_x = b->auto_center_x ? 0.0f : b->anchor_x * b->base_w;
         b->anchor_off_y = b->anchor_y * b->base_h;
     }
+
+    /* Bindings last: they read other objects' final geometry. */
+    resolve_bindings(ctx);
 
     return true;
 }

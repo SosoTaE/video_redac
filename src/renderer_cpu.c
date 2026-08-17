@@ -71,6 +71,10 @@
  * is not just enough, it is the honest amount.
  */
 typedef struct {
+    ScreenTri *tris;     /* projected mesh triangles, rebuilt each frame       */
+    size_t     tri_cap;
+    float     *depth;    /* shared per-pixel depth for meshes; NULL if none     */
+
     uchar4  *frame;      /* RGBA compositing target                            */
     uchar4  *fx;         /* ping-pong buffer for the effects; NULL if unused   */
     uchar4  *scene[2];   /* the two scenes during a transition; NULL if unused */
@@ -113,6 +117,21 @@ bool renderer_init(EditorContext *ctx)
         free(res->nv12);
         free(res);
         return false;
+    }
+
+    /* Mesh staging, sized to the largest mesh in the project. */
+    size_t max_tris = 0;
+    for (size_t mi = 0; mi < ctx->mesh_count; mi++) {
+        ctx->meshes[mi].tri_base = max_tris;
+        max_tris += ctx->meshes[mi].tri_count;
+    }
+    if (max_tris > 0) {
+        res->tris = (ScreenTri *)malloc(max_tris * sizeof(ScreenTri));
+        res->depth = (float *)malloc((size_t)res->width * res->height * sizeof(float));
+        if (res->tris == NULL || res->depth == NULL) {
+            goto fail;
+        }
+        res->tri_cap = max_tris;
     }
 
     /* The ping-pong buffer only if effects exist at all. */
@@ -169,6 +188,8 @@ void renderer_shutdown(EditorContext *ctx)
 
     CpuResources *res = (CpuResources *)ctx->gpu;
     if (res != NULL) {
+        free(res->tris);
+        free(res->depth);
         free(res->frame);
         free(res->fx);
         free(res->scene[0]);
@@ -352,7 +373,8 @@ static void scene_effects(CpuResources *res, const Scene *scene, uchar4 *buffer,
 /* ------------------------------------------------------------------------- */
 
 static void render_scene_into(const EditorContext *ctx, CpuResources *res,
-                              const Scene *scene, const WidgetRuntime *rt, uchar4 *target)
+                              const Scene *scene, const WidgetRuntime *rt, uchar4 *target,
+                              int local_ms)
 {
     /* 1. Background — a scene may have its own. */
     Color  bgc = scene->has_bg ? scene->bg_color : ctx->config.bg_color;
@@ -360,12 +382,65 @@ static void render_scene_into(const EditorContext *ctx, CpuResources *res,
 
     clear_background(target, res->width, res->height, bg);
 
-    /* 2. Widgets — back to front (painter's algorithm). */
-    for (size_t i = 0; i < scene->widget_count; i++) {
+    /* The depth buffer belongs to the scene, not to a mesh — see the GPU side. */
+    float view[12];
+    vr_camera_view(scene, (float)local_ms * 0.001f,
+                   scene->camera.present && scene->camera.focal > 0.0f
+                       ? scene->camera.focal : (float)res->width * 8.0f,
+                   view);
+
+    if (res->depth != NULL) {
+        size_t npx = (size_t)res->width * res->height;
+        #pragma omp parallel for schedule(static)
+        for (long k2 = 0; k2 < (long)npx; k2++) {
+            res->depth[k2] = 1e30f;
+        }
+    }
+
+    /*
+     * 2. Widgets — back to front (painter's algorithm).
+     *
+     * With depth in play the authored order is not the drawing order any more,
+     * so the indices are sorted farthest-first. A scene with no depth skips the
+     * sort entirely and iterates as it always did.
+     */
+    int *order = NULL;
+    if (scene->widget_count > 0) {
+        order = ARENA_NEW(&((EditorContext *)ctx)->frame_arena, int, scene->widget_count);
+        if (order != NULL && !vr_depth_order(scene, rt, order)) {
+            order = NULL;
+        }
+    }
+
+    for (size_t k = 0; k < scene->widget_count; k++) {
+        size_t i = order ? (size_t)order[k] : k;
+
         const WidgetBase    *b = ctx->widgets[scene->first_widget + i];
         const WidgetRuntime *r = &rt[i];
 
         if (!r->visible) {
+            continue;
+        }
+
+        /* 2a'. A mesh is not a texture: project it, then rasterize. */
+        if (b->kind == WIDGET_MESH) {
+            const MeshWidget *mw = (const MeshWidget *)b;
+            if (res->tris != NULL && mw->tri_base + mw->tri_count <= res->tri_cap) {
+                ScreenTri *slice = res->tris + mw->tri_base;
+                MeshParams mp;
+                int nt = vr_mesh_project(mw, r, res->width, res->height, view,
+                                         scene->has_light ? scene->light : NULL,
+                                         slice, &mp);
+                if (nt > 0) {
+                    #pragma omp parallel for schedule(static)
+                    for (int my = 0; my < mp.bb_h; my++) {
+                        for (int mx = 0; mx < mp.bb_w; mx++) {
+                            vr_px_mesh(target, res->depth, slice,
+                                       (const uchar4 *)mw->tex.pixels, &mp, mx, my);
+                        }
+                    }
+                }
+            }
             continue;
         }
 
@@ -407,8 +482,23 @@ static void render_scene_into(const EditorContext *ctx, CpuResources *res,
             cut = g->h_cutoff;
         }
 
-        /* 2c. The layer itself. */
-        composite_layer(res, target, &b->tex, b, r, cut);
+        /*
+         * 2c. The layer itself.
+         *
+         * A clip's texture holds every frame stacked, so what is composited is
+         * a slice of it. Building a local Texture that points into the stack
+         * keeps the compositor unaware that video exists at all.
+         */
+        Texture layer = b->tex;
+        size_t  voff  = 0;
+        if (vr_video_slice(b, local_ms, &voff)) {
+            layer.height = (int)((const VideoWidget *)b)->frame_h;
+            if (layer.pixels != NULL) {
+                layer.pixels = (uint8_t *)layer.pixels + voff;
+            }
+        }
+
+        composite_layer(res, target, &layer, b, r, cut);
     }
 }
 
@@ -439,11 +529,11 @@ static void render_one_frame(EditorContext *ctx, CpuResources *res,
         vr_evaluate_scene(ctx, A, rtA, time_ms - A->start_ms);
         vr_evaluate_scene(ctx, B, rtB, time_ms - B->start_ms);
 
-        render_scene_into(ctx, res, A, rtA, res->scene[0]);
+        render_scene_into(ctx, res, A, rtA, res->scene[0], time_ms - A->start_ms);
         scene_effects(res, A, res->scene[0],
                       (float)(time_ms - A->start_ms) * 0.001f, frame);
 
-        render_scene_into(ctx, res, B, rtB, res->scene[1]);
+        render_scene_into(ctx, res, B, rtB, res->scene[1], time_ms - B->start_ms);
         scene_effects(res, B, res->scene[1],
                       (float)(time_ms - B->start_ms) * 0.001f, frame);
 
@@ -474,7 +564,7 @@ static void render_one_frame(EditorContext *ctx, CpuResources *res,
             return;
         }
         vr_evaluate_scene(ctx, A, rt, time_ms - A->start_ms);
-        render_scene_into(ctx, res, A, rt, base);
+        render_scene_into(ctx, res, A, rt, base, time_ms - A->start_ms);
         scene_effects(res, A, base, (float)(time_ms - A->start_ms) * 0.001f, frame);
     }
 

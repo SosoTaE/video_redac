@@ -56,6 +56,12 @@ bool media_render_line_widget(LineWidget *w);
 /* Rasterizes a polyline/bezier path into its own bounding box. */
 bool media_render_path_widget(PathWidget *w);
 
+/*
+ * Decodes a clip into frames stacked vertically in one texture.
+ * `budget_mb` caps how much is kept; beyond it the clip is truncated.
+ */
+bool media_load_video_widget(VideoWidget *w, int budget_mb);
+
 /* PNG/JPG → premultiplied RGBA8 (stb_image). */
 bool media_load_image_rgba(const char *path, Texture *out);
 

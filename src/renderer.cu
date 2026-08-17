@@ -88,6 +88,10 @@ static void gpu_assert(cudaError_t code, const char *file, int line, bool abort_
 /* One "slot" = one frame in flight. */
 struct FrameSlot {
     uchar4      *d_frame;   /* RGBA frame buffer in VRAM (the compositing target) */
+    float       *d_depth;   /* shared per-pixel depth for meshes; NULL if none    */
+    ScreenTri   *d_tris;    /* projected mesh triangles, re-uploaded each frame   */
+    ScreenTri   *h_tris;    /* pinned staging for that upload                     */
+    size_t       tri_cap;   /* how many fit                                       */
     uchar4      *d_fx;      /* ping-pong buffer for the effects                   */
     uchar4      *d_scene[2];/* two scenes during a transition; NULL if only one  */
     uint8_t     *d_nv12;    /* the same frame as NV12 — only this goes to the host */
@@ -243,6 +247,32 @@ __global__ void k_highlight(uchar4 *__restrict__ fb, const uchar4 *__restrict__ 
 }
 
 /* ------------------------------------------------------------------------- */
+/* Mesh rasterizer                                                            */
+/* ------------------------------------------------------------------------- */
+
+__global__ void k_mesh(uchar4 *__restrict__ fb, float *__restrict__ depth,
+                       const ScreenTri *__restrict__ tris,
+                       const uchar4 *__restrict__ tex, MeshParams p)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (i >= p.bb_w || j >= p.bb_h) {
+        return;
+    }
+    vr_px_mesh(fb, depth, tris, tex, &p, i, j);
+}
+
+/* Resets the shared depth buffer at the start of a scene. */
+__global__ void k_depth_clear(float *__restrict__ depth, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        depth[i] = 1e30f;
+    }
+}
+
+/* ------------------------------------------------------------------------- */
 /* Texture compositor                                                         */
 /* ------------------------------------------------------------------------- */
 
@@ -307,6 +337,15 @@ static bool upload_textures(EditorContext *ctx, RenderResources *res)
             }
         }
 
+        /* A mesh's surface texture is its own, not base.tex — that one stays
+         * empty because a mesh is rasterized rather than composited. */
+        if (b->kind == WIDGET_MESH) {
+            MeshWidget *mw = (MeshWidget *)b;
+            if (!upload_one_texture(&mw->tex, res)) {
+                return false;
+            }
+        }
+
         /*
          * The typewriter cutoff buffer: VR_PIPELINE_DEPTH sets in a single
          * allocation. Each slot owns its own share, so writing frame i cannot
@@ -365,6 +404,26 @@ bool renderer_init(EditorContext *ctx)
 
         CUDA_TRY(cudaMalloc((void **)&slot->d_frame, res->frame_bytes));
         CUDA_TRY(cudaMalloc((void **)&slot->d_nv12, res->nv12_bytes));
+        /*
+         * Mesh staging, sized to the largest mesh in the project. One
+         * allocation per slot rather than per frame: the triangle data changes
+         * every frame but its size never does.
+         */
+        size_t max_tris = 0;
+        for (size_t mi = 0; mi < ctx->mesh_count; mi++) {
+            ctx->meshes[mi].tri_base = max_tris;
+            max_tris += ctx->meshes[mi].tri_count;
+        }
+        if (max_tris > 0) {
+            /* One depth buffer per slot, shared by every mesh in the scene —
+             * that sharing is what makes two solids interpenetrate correctly. */
+            CUDA_TRY(cudaMalloc(&slot->d_depth,
+                                (size_t)ctx->config.width * ctx->config.height * sizeof(float)));
+            CUDA_TRY(cudaMalloc(&slot->d_tris, max_tris * sizeof(ScreenTri)));
+            CUDA_TRY(cudaMallocHost(&slot->h_tris, max_tris * sizeof(ScreenTri)));
+            slot->tri_cap = max_tris;
+        }
+
         /* The ping-pong buffer only if any effects exist at all. */
         bool any_fx = ctx->effect_count > 0;
         for (size_t si = 0; si < ctx->scene_count && !any_fx; si++) {
@@ -430,6 +489,14 @@ void renderer_shutdown(EditorContext *ctx)
             if (cw->plate.d_pixels != NULL) {
                 cudaFree(cw->plate.d_pixels);
                 cw->plate.d_pixels = NULL;
+            }
+        }
+
+        if (b->kind == WIDGET_MESH) {
+            MeshWidget *mw = (MeshWidget *)b;
+            if (mw->tex.d_pixels != NULL) {
+                cudaFree(mw->tex.d_pixels);
+                mw->tex.d_pixels = NULL;
             }
         }
     }
@@ -576,7 +643,8 @@ static uchar4 *apply_effect_list(const Effect *list, size_t count, RenderResourc
 
 /* Renders one scene into the given buffer. */
 static void render_scene_into(const EditorContext *ctx, RenderResources *res, int slot_idx,
-                              const Scene *scene, const WidgetRuntime *rt, uchar4 *target)
+                              const Scene *scene, const WidgetRuntime *rt, uchar4 *target,
+                              int local_ms)
 {
     FrameSlot   *slot   = &res->slot[slot_idx];
     cudaStream_t stream = slot->stream;
@@ -592,12 +660,70 @@ static void render_scene_into(const EditorContext *ctx, RenderResources *res, in
     k_clear_background<<<grid, block, 0, stream>>>(target, res->width, res->height, bg);
     CUDA_CHECK_KERNEL();
 
-    /* 2. Widgets — back to front (painter's algorithm). */
-    for (size_t i = 0; i < scene->widget_count; i++) {
+    /* The depth buffer belongs to the scene, not to a mesh: clearing it here is
+     * what lets several meshes occlude one another correctly. */
+    float view[12];
+    vr_camera_view(scene, (float)local_ms * 0.001f,
+                   scene->camera.present && scene->camera.focal > 0.0f
+                       ? scene->camera.focal : (float)res->width * 8.0f,
+                   view);
+
+    if (slot->d_depth != NULL) {
+        int npx = res->width * res->height;
+        k_depth_clear<<<(npx + 255) / 256, 256, 0, stream>>>(slot->d_depth, npx);
+        CUDA_CHECK_KERNEL();
+    }
+
+    /*
+     * 2. Widgets — back to front (painter's algorithm).
+     *
+     * With depth in play the authored order is not the drawing order any more,
+     * so the indices are sorted farthest-first. A scene with no depth skips the
+     * sort entirely and iterates as it always did.
+     */
+    int *order = NULL;
+    if (scene->widget_count > 0) {
+        order = ARENA_NEW(&((EditorContext *)ctx)->frame_arena, int, scene->widget_count);
+        if (order != NULL && !vr_depth_order(scene, rt, order)) {
+            order = NULL;
+        }
+    }
+
+    for (size_t k = 0; k < scene->widget_count; k++) {
+        size_t i = order ? (size_t)order[k] : k;
+
         const WidgetBase    *b = ctx->widgets[scene->first_widget + i];
         const WidgetRuntime *r = &rt[i];
 
         if (!r->visible) {
+            continue;
+        }
+
+        /* 2a'. A mesh is not a texture: project it, upload, rasterize. */
+        if (b->kind == WIDGET_MESH) {
+            const MeshWidget *mw = (const MeshWidget *)b;
+            if (slot->h_tris != NULL && mw->tri_base + mw->tri_count <= slot->tri_cap) {
+                /* This mesh's own slice of the staging buffer — see tri_base. */
+                ScreenTri *h_slice = slot->h_tris + mw->tri_base;
+                ScreenTri *d_slice = slot->d_tris + mw->tri_base;
+
+                MeshParams mp;
+                int nt = vr_mesh_project(mw, r, res->width, res->height, view,
+                                         scene->has_light ? scene->light : NULL,
+                                         h_slice, &mp);
+                if (nt > 0) {
+                    gpuErrchk(cudaMemcpyAsync(d_slice, h_slice,
+                                              (size_t)nt * sizeof(ScreenTri),
+                                              cudaMemcpyHostToDevice, stream));
+                    const dim3 mblock(16, 16);
+                    dim3       mgrid((mp.bb_w + mblock.x - 1) / mblock.x,
+                                     (mp.bb_h + mblock.y - 1) / mblock.y);
+                    const uchar4 *mtex = (const uchar4 *)mw->tex.d_pixels;
+                    k_mesh<<<mgrid, mblock, 0, stream>>>(target, slot->d_depth,
+                                                         d_slice, mtex, mp);
+                    CUDA_CHECK_KERNEL();
+                }
+            }
             continue;
         }
 
@@ -639,8 +765,23 @@ static void render_scene_into(const EditorContext *ctx, RenderResources *res, in
             d_cut = d_slice;
         }
 
-        /* 2c. The layer itself. */
-        composite_layer(res, stream, target, &b->tex, b, r, d_cut);
+        /*
+         * 2c. The layer itself.
+         *
+         * A clip's texture holds every frame stacked, so what is composited is
+         * a slice of it. Building a local Texture that points into the stack
+         * keeps the compositor unaware that video exists at all.
+         */
+        Texture layer = b->tex;
+        size_t  voff  = 0;
+        if (vr_video_slice(b, local_ms, &voff)) {
+            layer.height = (int)((const VideoWidget *)b)->frame_h;
+            if (layer.d_pixels != NULL) {
+                layer.d_pixels = (uint8_t *)layer.d_pixels + voff;
+            }
+        }
+
+        composite_layer(res, stream, target, &layer, b, r, d_cut);
     }
 
 }
@@ -703,11 +844,13 @@ static void render_one_frame(EditorContext *ctx, RenderResources *res, int slot_
         vr_evaluate_scene(ctx, A, rtA, time_ms - A->start_ms);
         vr_evaluate_scene(ctx, B, rtB, time_ms - B->start_ms);
 
-        render_scene_into(ctx, res, slot_idx, A, rtA, slot->d_scene[0]);
+        render_scene_into(ctx, res, slot_idx, A, rtA, slot->d_scene[0],
+                          time_ms - A->start_ms);
         scene_effects(ctx, res, slot_idx, A, slot->d_scene[0],
                       (float)(time_ms - A->start_ms) * 0.001f, frame);
 
-        render_scene_into(ctx, res, slot_idx, B, rtB, slot->d_scene[1]);
+        render_scene_into(ctx, res, slot_idx, B, rtB, slot->d_scene[1],
+                          time_ms - B->start_ms);
         scene_effects(ctx, res, slot_idx, B, slot->d_scene[1],
                       (float)(time_ms - B->start_ms) * 0.001f, frame);
 
@@ -736,7 +879,7 @@ static void render_one_frame(EditorContext *ctx, RenderResources *res, int slot_
             return;
         }
         vr_evaluate_scene(ctx, A, rt, time_ms - A->start_ms);
-        render_scene_into(ctx, res, slot_idx, A, rt, base);
+        render_scene_into(ctx, res, slot_idx, A, rt, base, time_ms - A->start_ms);
         scene_effects(ctx, res, slot_idx, A, base,
                       (float)(time_ms - A->start_ms) * 0.001f, frame);
     }

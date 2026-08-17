@@ -198,6 +198,7 @@ The two backends agree far more closely than floating point requires:
 | `showcase.json` | 93,312,000 | 42 (0.00005 %) | 1 |
 | `effects_demo.json` | 20,736,000 | 13 (0.0001 %) | 1 |
 | `anim/binsearch.json` | 93,312,000 | 0 | — |
+| `anim/space3d.json` (perspective) | 921,600 / frame | 7 | 4 |
 | `scene.json` | 93,312,000 | 0 | — |
 
 Worst-case PSNR 106 dB. Two of the four projects are bit-identical across
@@ -209,7 +210,45 @@ which after the `×255 + 0.5` conversion occasionally lands on the other side of
 rounding boundary — hence a handful of ±1 bytes.
 
 **Consequence for tests:** regression tests must compare GPU against GPU, or CPU
-against CPU. A cross-backend test needs a tolerance of ±1, never `cmp`.
+against CPU. A cross-backend test needs a tolerance, never `cmp`.
+
+±1 covers the affine compositor. The **perspective** path divides, which
+amplifies the same rounding: measured at 7 differing pixels a frame with a max
+delta of 4. Still invisible, but a tolerance of ±1 would fail there.
+
+**Meshes** divide twice — once to project and once more per pixel for
+perspective-correct texturing — so they diverge the most, though still only at
+the last bit. Measured over the first 0.4 s of three projects:
+
+| Project | bytes | differing | share |
+|---|---|---|---|
+| a glTF import, untextured surfaces | 9,331,882 | 12 | 0.0001 % |
+| `anim/world3d.json` (textured ground, 10 meshes) | 74,650,719 | 1,885 | 0.0025 % |
+| two solids, depth-tested | 6,998,977 | 0 | — |
+
+The textured project is the outlier, and for a reason worth knowing: a texture
+turns a one-bit difference in the interpolated coordinate into a jump to the
+*neighbouring texel*, which on a checker is a large colour step rather than a
+small one. Sampling is nearest-neighbour, so there is nothing to smooth it. The
+lesson is not that the mesh path is less accurate — it is that a discontinuous
+function amplifies whatever rounding it is handed.
+
+### Header dependencies must cover both compilers
+
+`pixel_ops.h` is compiled twice, once by gcc and once by nvcc. For a while only
+the gcc half generated `.d` files, so editing that header rebuilt
+`renderer_cpu.o` and left `renderer.o` stale.
+
+That failure mode is worth naming because of how it presents. The two backends
+are supposed to agree bit-for-bit, so a stale object does not look like a build
+problem — it looks like a bug in the code you just wrote, in whichever backend
+happens to be the stale one. It cost a real debugging session: a fix to the
+rasterizer's fill rule appeared to have no effect at all, and the next suspect
+was the fix rather than the build.
+
+`NVCCFLAGS` now carries `-MMD -MP` too, and `DEPS` covers every object rather
+than only the C ones. If you add a third compilation path, give it the same
+treatment.
 
 ### Sanitizers now cover the whole pipeline
 

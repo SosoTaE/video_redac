@@ -14,6 +14,8 @@
 #include <ctype.h>
 #include <math.h>
 #include <stdarg.h>
+
+#include <fontconfig/fontconfig.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,6 +27,7 @@
 #include "effects.h"
 #include "layout.h"
 #include "media_loader.h"
+#include "mesh.h"
 #include "renderer.h"
 
 #ifndef M_PI
@@ -886,7 +889,44 @@ static void parse_widget_base(WidgetBase *base, const cJSON *obj, WidgetKind kin
     base->group_name  = dup_string(json_str(obj, "group", NULL));
     base->group_index = -1;   /* resolved once the widget index exists */
 
+    /*
+     * A shadow and a glow are the same thing with different defaults: a glow is
+     * centred and bright, a shadow offset and dark. Whichever key is present
+     * fills the same fields.
+     */
+    const cJSON *sh = cJSON_GetObjectItemCaseSensitive(obj, "shadow");
+    const cJSON *gl = cJSON_GetObjectItemCaseSensitive(obj, "glow");
+
+    if (cJSON_IsObject(sh) || cJSON_IsObject(gl)) {
+        const cJSON *src = cJSON_IsObject(sh) ? sh : gl;
+        bool is_glow = !cJSON_IsObject(sh);
+
+        base->shadow_on    = true;
+        base->shadow_dx    = json_float(src, "dx", 0.0f);
+        base->shadow_dy    = json_float(src, "dy", is_glow ? 0.0f : 8.0f);
+        base->shadow_blur  = json_float(src, "blur", is_glow ? 24.0f : 16.0f);
+        base->shadow_color = json_color(src, "color",
+                                        is_glow ? (Color){ 255, 255, 255, 140 }
+                                                : (Color){ 0, 0, 0, 150 });
+
+        if (base->shadow_blur < 0.0f)   base->shadow_blur = 0.0f;
+        if (base->shadow_blur > 128.0f) base->shadow_blur = 128.0f;
+    }
+
+    const char *bl = json_str(obj, "blend", NULL);
+    if (bl != NULL) {
+        if (strcmp(bl, "add") == 0 || strcmp(bl, "additive") == 0) {
+            base->blend = 1;
+        } else if (strcmp(bl, "screen") == 0) {
+            base->blend = 2;
+        } else if (strcmp(bl, "normal") != 0) {
+            fprintf(stderr, "warning: unknown blend '%s' — using normal.\n", bl);
+        }
+    }
+
     /* An explicit z overrides array order, which is otherwise the draw order. */
+    base->seq = (size_t)z;
+
     if (json_has(obj, "z")) {
         base->z_order = json_int(obj, "z", z);
     }
@@ -977,6 +1017,33 @@ static void parse_widget_base(WidgetBase *base, const cJSON *obj, WidgetKind kin
     base->has_track_w = parse_track_ex(cJSON_GetObjectItemCaseSensitive(obj, "w"), &base->tr_w, 0.0f, eases);
     base->has_track_h = parse_track_ex(cJSON_GetObjectItemCaseSensitive(obj, "h"), &base->tr_h, 0.0f, eases);
 
+    /*
+     * 2.5D. `z` is depth (positive away from the viewer); rotate_x / rotate_y
+     * turn the layer out of the screen plane. All three default to zero, which
+     * leaves compositing on its original affine path.
+     */
+    base->has_track_z  = parse_track_ex(cJSON_GetObjectItemCaseSensitive(obj, "z_depth"),
+                                        &base->tr_z, 0.0f, eases) ||
+                         json_has(obj, "z_depth");
+    base->has_track_rx = json_has(obj, "rotate_x");
+    base->has_track_ry = json_has(obj, "rotate_y");
+    parse_track_ex(cJSON_GetObjectItemCaseSensitive(obj, "z_depth"),  &base->tr_z,  0.0f, eases);
+    parse_track_ex(cJSON_GetObjectItemCaseSensitive(obj, "rotate_x"), &base->tr_rx, 0.0f, eases);
+    parse_track_ex(cJSON_GetObjectItemCaseSensitive(obj, "rotate_y"), &base->tr_ry, 0.0f, eases);
+
+    base->shading = json_float(obj, "shading", 0.0f);
+    if (base->shading < 0.0f) base->shading = 0.0f;
+    if (base->shading > 1.0f) base->shading = 1.0f;
+
+    const char *bf = json_str(obj, "backface", NULL);
+    if (bf != NULL) {
+        if (strcmp(bf, "hide") == 0)      base->backface = 1;
+        else if (strcmp(bf, "dim") == 0)  base->backface = 2;
+        else if (strcmp(bf, "show") != 0) {
+            fprintf(stderr, "warning: unknown backface '%s' — using show.\n", bf);
+        }
+    }
+
     base->has_track_trim = json_has(obj, "trim");
     parse_track_ex(cJSON_GetObjectItemCaseSensitive(obj, "trim"), &base->tr_trim, 1.0f, eases);
 
@@ -999,8 +1066,23 @@ static void parse_widget_base(WidgetBase *base, const cJSON *obj, WidgetKind kin
      * has_track_x here would make the renderer read the track instead (whose
      * constant is 0 at parse time), ignoring the computed position.
      */
-    base->has_track_x        = json_has(obj, "x") && base->x_expr == NULL;
-    base->has_track_y        = json_has(obj, "y") && base->y_expr == NULL;
+    /*
+     * A leading '=' marks a binding rather than a layout expression. It is kept
+     * as text until every object has a size — the same reason x_expr is.
+     */
+    if (base->x_expr != NULL && base->x_expr[0] == '=') {
+        base->x_bind = base->x_expr;
+        base->x_expr = NULL;
+    }
+    if (base->y_expr != NULL && base->y_expr[0] == '=') {
+        base->y_bind = base->y_expr;
+        base->y_expr = NULL;
+    }
+
+    base->has_track_x        = json_has(obj, "x") && base->x_expr == NULL
+                                                  && base->x_bind == NULL;
+    base->has_track_y        = json_has(obj, "y") && base->y_expr == NULL
+                                                  && base->y_bind == NULL;
     base->has_track_opacity  = json_has(obj, "opacity");
     base->has_track_scale    = json_has(obj, "scale");
     base->has_track_rotation = json_has(obj, "rotation");
@@ -1499,6 +1581,101 @@ static bool parse_path_object(EditorContext *ctx, const cJSON *obj, int z, const
     return true;
 }
 
+/*
+ * A video clip. Decoding happens later, in media_prepare_textures — the parser
+ * only records what was asked for.
+ */
+static bool parse_video_object(EditorContext *ctx, const cJSON *obj, int z,
+                               const char *json_path, const EaseTable *eases)
+{
+    VideoWidget *w = (VideoWidget *)array_push((void **)&ctx->videos, &ctx->video_count,
+                                               &ctx->video_cap, sizeof(VideoWidget));
+    if (w == NULL) {
+        return false;
+    }
+
+    parse_widget_base(&w->base, obj, WIDGET_VIDEO, z, eases);
+
+    const char *src = json_str(obj, "path", json_str(obj, "src", NULL));
+    w->path  = (src != NULL) ? resolve_relative_path(json_path, src) : NULL;
+    w->start = json_float(obj, "start", 0.0f);
+    w->speed = json_float(obj, "speed", 1.0f);
+    w->loop  = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(obj, "loop"));
+
+    if (w->speed < 0.01f) {
+        w->speed = 0.01f;
+    }
+    if (w->start < 0.0f) {
+        w->start = 0.0f;
+    }
+
+    w->request_w = json_int(obj, "width",  json_int(obj, "w", 0));
+    w->request_h = json_int(obj, "height", json_int(obj, "h", 0));
+
+    if (w->path == NULL) {
+        fprintf(stderr, "warning: video '%s' has no path.\n",
+                w->base.id ? w->base.id : "(unnamed)");
+    }
+    return true;
+}
+
+/*
+ * A mesh: either an OBJ on disk, or a named primitive.
+ *
+ * Geometry is loaded here rather than in media_prepare_textures because a mesh
+ * has no texture to rasterize — the vertices *are* the asset.
+ */
+static bool parse_mesh_object(EditorContext *ctx, const cJSON *obj, int z,
+                              const char *base_file, const EaseTable *eases)
+{
+    MeshWidget *w = (MeshWidget *)array_push((void **)&ctx->meshes, &ctx->mesh_count,
+                                             &ctx->mesh_cap, sizeof(MeshWidget));
+    if (w == NULL) {
+        return false;
+    }
+
+    parse_widget_base(&w->base, obj, WIDGET_MESH, z, eases);
+
+    const char *src = json_str(obj, "path", json_str(obj, "src", NULL));
+    w->path  = (src != NULL) ? resolve_relative_path(base_file, src) : NULL;
+    w->shape = dup_string(json_str(obj, "shape", (src == NULL) ? "box" : NULL));
+
+    w->size    = json_float(obj, "size", 300.0f);
+    w->color   = json_color(obj, "color", (Color){ 0x7E, 0xE7, 0x87, 255 });
+    w->ambient = json_float(obj, "ambient", 0.25f);
+
+    /* Closed shapes want culling; an open one (a plane) would lose half of
+     * itself, so the default follows the primitive rather than being fixed. */
+    /* Smooth shading suits curved primitives and looks wrong on a cube, whose
+     * corner-averaged normals would round it. So the default follows the shape
+     * and an explicit "smooth" overrides. */
+    bool curved = (w->shape != NULL &&
+                   (strcmp(w->shape, "sphere") == 0 || strcmp(w->shape, "torus") == 0 ||
+                    strcmp(w->shape, "cylinder") == 0));
+    const cJSON *sm = cJSON_GetObjectItemCaseSensitive(obj, "smooth");
+    w->smooth = cJSON_IsBool(sm) ? cJSON_IsTrue(sm) : (curved || w->path != NULL);
+
+    const char *tp = json_str(obj, "texture", NULL);
+    w->tex_path = (tp != NULL) ? resolve_relative_path(base_file, tp) : NULL;
+
+    bool open_shape = (w->shape != NULL &&
+                       (strcmp(w->shape, "plane") == 0 ||
+                        strcmp(w->shape, "ring") == 0));
+    const cJSON *cu = cJSON_GetObjectItemCaseSensitive(obj, "cull");
+    w->cull = cJSON_IsBool(cu) ? cJSON_IsTrue(cu) : !open_shape;
+
+    if (w->size < 1.0f) {
+        w->size = 1.0f;
+    }
+
+    if (!mesh_load(w)) {
+        /* An unreadable mesh leaves an empty widget rather than failing the
+         * parse — one bad asset should not cost the whole render. */
+        return true;
+    }
+    return true;
+}
+
 static bool parse_image_object(EditorContext *ctx, const cJSON *obj, int z,
                                const char *base_file, const EaseTable *eases)
 {
@@ -1705,7 +1882,21 @@ static bool parse_timeline_event(const EditorContext *ctx, Scene *scene, const c
 
     const char *action_name = json_str(obj, "action", NULL);
 
-    e->time_ms      = json_int(obj, "time_ms", 0);
+    e->label     = dup_string(json_str(obj, "id", json_str(obj, "label", NULL)));
+    e->time_expr = NULL;
+
+    /*
+     * "time" may be a number of seconds or an expression against another
+     * event. The expression cannot be evaluated yet — it may name an event
+     * further down the array — so it is kept until the scene is complete.
+     */
+    const cJSON *tv = cJSON_GetObjectItemCaseSensitive(obj, "time");
+    if (cJSON_IsString(tv) && tv->valuestring != NULL) {
+        e->time_expr = dup_string(tv->valuestring);
+    }
+
+    e->time_ms      = json_int(obj, "time_ms",
+                               cJSON_IsNumber(tv) ? (int)(tv->valuedouble * 1000.0) : 0);
     e->duration_ms  = json_int(obj, "duration_ms", 0);
     e->action       = action_from_string(action_name);
     e->target_id    = dup_string(json_str(obj, "target", ""));
@@ -1794,6 +1985,9 @@ static bool parse_timeline_event(const EditorContext *ctx, Scene *scene, const c
             { "h", PROP_H }, { "height", PROP_H },
             { "tint", PROP_TINT }, { "tint_amount", PROP_TINT },
             { "trim", PROP_TRIM },
+            { "z", PROP_Z }, { "z_depth", PROP_Z },
+            { "rotate_x", PROP_RX }, { "rx", PROP_RX },
+            { "rotate_y", PROP_RY }, { "ry", PROP_RY },
         };
 
         const char *pname = json_str(obj, "property", json_str(obj, "prop", NULL));
@@ -2064,7 +2258,8 @@ static int compare_by_z(const void *a, const void *b)
 static bool ctx_build_widget_index(EditorContext *ctx)
 {
     size_t total = ctx->text_count + ctx->code_count + ctx->image_count + ctx->shape_count +
-                       ctx->line_count + ctx->path_count;
+                       ctx->line_count + ctx->path_count +
+                       ctx->video_count + ctx->mesh_count;
     if (total == 0) {
         ctx->widgets      = NULL;
         ctx->widget_count = 0;
@@ -2095,10 +2290,57 @@ static bool ctx_build_widget_index(EditorContext *ctx)
     for (size_t i = 0; i < ctx->path_count; i++) {
         ctx->widgets[n++] = &ctx->paths[i].base;
     }
+    for (size_t i = 0; i < ctx->video_count; i++) {
+        ctx->widgets[n++] = &ctx->videos[i].base;
+    }
+    for (size_t i = 0; i < ctx->mesh_count; i++) {
+        ctx->widgets[n++] = &ctx->meshes[i].base;
+    }
     ctx->widget_count = n;
 
-    /* JSON order = drawing order (painter's algorithm). */
+    /*
+     * JSON order = drawing order (painter's algorithm).
+     *
+     * This sort is load-bearing beyond ordering: the array above is grouped by
+     * *type* (every text, then every image, ...), and sorting by z is what puts
+     * it back into parse order. A scene then finds its objects as the slice
+     * [first_widget, +widget_count), which is a count of objects parsed before
+     * it — so the slice is only correct while z increases across the whole
+     * file. Do not sort the slices individually: before this call they are not
+     * slices of anything.
+     */
     qsort(ctx->widgets, ctx->widget_count, sizeof(WidgetBase *), compare_by_z);
+
+    /*
+     * ...and because that invariant is a convention rather than a structure, it
+     * is checked. Writing `"z"` by hand is the way to break it: repeat a small
+     * z in a later scene and that object sorts into an earlier scene's slice,
+     * so the earlier scene draws a stranger's background over its own contents
+     * while its own captions vanish. Every index stays in range, nothing
+     * crashes, and the picture is quietly wrong — which is exactly the kind of
+     * failure worth spending a loop to name.
+     */
+    for (size_t si = 0; si < ctx->scene_count; si++) {
+        const Scene *sc = &ctx->scenes[si];
+        size_t end = sc->first_widget + sc->widget_count;
+
+        if (end > ctx->widget_count) {
+            continue;
+        }
+        for (size_t i = sc->first_widget; i < end; i++) {
+            const WidgetBase *b = ctx->widgets[i];
+            if (b->seq >= sc->first_widget && b->seq < end) {
+                continue;
+            }
+            fprintf(stderr,
+                    "warning: scene '%s' — object '%s' belongs to another scene. "
+                    "An explicit \"z\" must increase across the whole file, not "
+                    "restart per scene; objects will be drawn in the wrong scene.\n",
+                    sc->id ? sc->id : "(unnamed)", b->id ? b->id : "(unnamed)");
+            break;      /* one line per scene is enough to find the cause */
+        }
+    }
+
     return true;
 }
 
@@ -2165,6 +2407,182 @@ static void resolve_timeline_targets(EditorContext *ctx)
                         e->target_id ? e->target_id : "(null)");
             }
         }
+    }
+}
+
+/* ------------------------------------------------------------------------- */
+/* Relative event times                                                       */
+/* ------------------------------------------------------------------------- */
+
+/*
+ * Resolves one `time` expression against the events and labels of its scene.
+ *
+ * The grammar is deliberately tiny:
+ *
+ *     <base> ( ('+'|'-') <number> )*
+ *     <base> ::= <label> | <event>.start | <event>.end | <number>
+ *
+ * Numbers are milliseconds. Anything richer would want a real expression
+ * parser, and the point here is only to say "just after that other thing".
+ *
+ * Returns false when a referenced event is not resolved *yet* — the caller
+ * simply tries again on the next pass.
+ */
+static bool resolve_time_expr(const Scene *sc, const char *expr, int *out_ms,
+                              const bool *resolved, bool *unknown_name)
+{
+    const char *p = expr;
+    long        total = 0;
+    int         sign = 1;
+    bool        first = true;
+
+    *unknown_name = false;
+
+    while (*p != '\0') {
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '\0') break;
+
+        if (!first) {
+            if (*p == '+')      { sign =  1; p++; }
+            else if (*p == '-') { sign = -1; p++; }
+            else {
+                *unknown_name = true;
+                return false;   /* junk between terms */
+            }
+            while (*p == ' ' || *p == '\t') p++;
+        }
+
+        if (isdigit((unsigned char)*p) || *p == '.') {
+            char *end = NULL;
+            double v = strtod(p, &end);
+            if (end == p) {
+                *unknown_name = true;
+                return false;
+            }
+            total += (long)(sign * v);
+            p = end;
+        } else if (isalpha((unsigned char)*p) || *p == '_') {
+            const char *start = p;
+            while (isalnum((unsigned char)*p) || *p == '_' || *p == '-') p++;
+
+            char name[128];
+            size_t n = (size_t)(p - start);
+            if (n >= sizeof name) {
+                *unknown_name = true;
+                return false;
+            }
+            memcpy(name, start, n);
+            name[n] = '\0';
+
+            bool want_end = false;
+            if (*p == '.') {
+                p++;
+                if (strncmp(p, "end", 3) == 0)        { want_end = true;  p += 3; }
+                else if (strncmp(p, "start", 5) == 0) { want_end = false; p += 5; }
+                else {
+                    *unknown_name = true;
+                    return false;
+                }
+            }
+
+            /* A scene label first — a fixed instant, always available. */
+            bool found = false;
+            for (size_t l = 0; l < sc->label_count && !found; l++) {
+                if (strcmp(sc->label_names[l], name) == 0) {
+                    total += sign * sc->label_times[l];
+                    found = true;
+                }
+            }
+
+            if (!found) {
+                for (size_t i = 0; i < sc->event_count && !found; i++) {
+                    const TimelineEvent *ev = &sc->events[i];
+                    if (ev->label == NULL || strcmp(ev->label, name) != 0) {
+                        continue;
+                    }
+                    if (!resolved[i]) {
+                        return false;   /* not yet — try again next pass */
+                    }
+                    total += sign * (ev->time_ms + (want_end ? ev->duration_ms : 0));
+                    found = true;
+                }
+            }
+
+            if (!found) {
+                *unknown_name = true;
+                return false;
+            }
+        } else {
+            *unknown_name = true;
+            return false;
+        }
+
+        sign  = 1;
+        first = false;
+    }
+
+    *out_ms = (int)(total < 0 ? 0 : total);
+    return true;
+}
+
+/*
+ * Turns every `"time": "intro.end + 200"` into milliseconds.
+ *
+ * Iterative because an event may hang off another that is itself relative.
+ * Each pass resolves whatever it can; when a pass achieves nothing, whatever
+ * is left is either a cycle or a typo, and both get the same warning — the
+ * event stays at its default time rather than the parse failing.
+ */
+static void resolve_event_times(Scene *sc)
+{
+    {
+        if (sc->event_count == 0) {
+            return;
+        }
+
+        bool *resolved = (bool *)calloc(sc->event_count, sizeof(bool));
+        if (resolved == NULL) {
+            return;
+        }
+        for (size_t i = 0; i < sc->event_count; i++) {
+            resolved[i] = (sc->events[i].time_expr == NULL);
+        }
+
+        for (size_t pass = 0; pass < sc->event_count + 1; pass++) {
+            bool progress = false;
+
+            for (size_t i = 0; i < sc->event_count; i++) {
+                if (resolved[i]) {
+                    continue;
+                }
+                int  ms = 0;
+                bool bad = false;
+                if (resolve_time_expr(sc, sc->events[i].time_expr, &ms, resolved, &bad)) {
+                    sc->events[i].time_ms = ms;
+                    resolved[i] = true;
+                    progress = true;
+                } else if (bad) {
+                    fprintf(stderr, "warning: scene '%s' — cannot read time \"%s\".\n",
+                            sc->id ? sc->id : "(unnamed)", sc->events[i].time_expr);
+                    resolved[i] = true;   /* stop retrying a broken expression */
+                    progress = true;
+                }
+            }
+            if (!progress) {
+                break;
+            }
+        }
+
+        for (size_t i = 0; i < sc->event_count; i++) {
+            if (!resolved[i]) {
+                fprintf(stderr, "warning: scene '%s' — time \"%s\" refers to an event "
+                                "that never resolves (a cycle?).\n",
+                        sc->id ? sc->id : "(unnamed)", sc->events[i].time_expr);
+            }
+            free(sc->events[i].time_expr);
+            sc->events[i].time_expr = NULL;
+        }
+        free(resolved);
     }
 }
 
@@ -2458,9 +2876,16 @@ static bool repeat_expand(const cJSON *tmpl, const cJSON *rep, cJSON *out, Repea
         if (ncol > 0) {
             const cJSON *c = cJSON_GetArrayItem(cycle, i % ncol);
             if (cJSON_IsString(c) && c->valuestring != NULL) {
-                /* Shapes read "color", code blocks "fg"; setting the one the
-                 * template already uses avoids inventing a key it ignores. */
-                const char *key = json_has(copy, "fg") ? "fg" : "color";
+                /*
+                 * Different types name their colour differently: shapes use
+                 * "color", code blocks "fg", lines and paths "stroke". Setting
+                 * whichever the template already carries avoids adding a key
+                 * the object would ignore — which is what silently made a
+                 * `color_cycle` do nothing on a path.
+                 */
+                const char *key = json_has(copy, "fg")     ? "fg"
+                                : json_has(copy, "stroke") ? "stroke"
+                                                           : "color";
                 cJSON_DeleteItemFromObjectCaseSensitive(copy, key);
                 cJSON_AddStringToObject(copy, key, c->valuestring);
             }
@@ -2750,7 +3175,9 @@ static bool emitter_expand(const cJSON *tmpl, const cJSON *em, cJSON *out,
             if (c >= ncol) c = ncol - 1;
             const cJSON *cc = cJSON_GetArrayItem(cycle, c);
             if (cJSON_IsString(cc) && cc->valuestring != NULL) {
-                const char *key = json_has(copy, "fg") ? "fg" : "color";
+                const char *key = json_has(copy, "fg")     ? "fg"
+                                : json_has(copy, "stroke") ? "stroke"
+                                                           : "color";
                 cJSON_DeleteItemFromObjectCaseSensitive(copy, key);
                 cJSON_AddStringToObject(copy, key, cc->valuestring);
             }
@@ -2847,7 +3274,8 @@ static bool parse_scene(EditorContext *ctx, const cJSON *node, const cJSON *styl
 
     sc->id           = dup_string(json_str(node, "id", NULL));
     sc->first_widget = ctx->text_count + ctx->code_count + ctx->image_count + ctx->shape_count +
-                       ctx->line_count + ctx->path_count;
+                       ctx->line_count + ctx->path_count +
+                       ctx->video_count + ctx->mesh_count;
 
     if (json_has(node, "bg_color")) {
         sc->bg_color = json_color(node, "bg_color", ctx->config.bg_color);
@@ -2858,6 +3286,29 @@ static bool parse_scene(EditorContext *ctx, const cJSON *node, const cJSON *styl
     const cJSON *objects = cJSON_GetObjectItemCaseSensitive(node, "objects");
     if (!cJSON_IsArray(objects)) {
         objects = cJSON_GetObjectItemCaseSensitive(node, "layers"); /* videogen synonym */
+    }
+
+    /* --- labels --- */
+    const cJSON *labels = cJSON_GetObjectItemCaseSensitive(node, "labels");
+    if (cJSON_IsObject(labels)) {
+        const cJSON *lb = NULL;
+        cJSON_ArrayForEach(lb, labels) {
+            char **nm = (char **)array_push((void **)&sc->label_names, &sc->label_count,
+                                            &sc->label_cap, sizeof(char *));
+            if (nm == NULL) {
+                return false;
+            }
+            /* The times array is grown in lockstep, so one index serves both. */
+            int *tm = (int *)realloc(sc->label_times, sc->label_cap * sizeof(int));
+            if (tm == NULL) {
+                return false;
+            }
+            sc->label_times = tm;
+
+            *nm = dup_string(lb->string ? lb->string : "");
+            sc->label_times[sc->label_count - 1] =
+                cJSON_IsNumber(lb) ? (int)lb->valuedouble : 0;
+        }
     }
 
     /* --- camera --- */
@@ -2874,6 +3325,28 @@ static bool parse_scene(EditorContext *ctx, const cJSON *node, const cJSON *styl
                        &sc->camera.rotation, 0.0f, eases);
         parse_track_ex(cJSON_GetObjectItemCaseSensitive(cam, "shake"),
                        &sc->camera.shake, 0.0f, eases);
+
+        /* Focal length in pixels; 0 (the default) means no projection. */
+        sc->camera.focal = json_float(cam, "perspective", json_float(cam, "focal", 0.0f));
+
+        /*
+         * A camera that moves through the space. Any of these keys switches the
+         * view from the fixed default to a look-at built from them, so a scene
+         * that never mentions them behaves exactly as before.
+         */
+        static const char *kEye[] = { "px", "py", "pz", "tx", "ty", "tz", "roll" };
+        Track *dst[] = { &sc->camera.eye.px, &sc->camera.eye.py, &sc->camera.eye.pz,
+                         &sc->camera.eye.tx, &sc->camera.eye.ty, &sc->camera.eye.tz,
+                         &sc->camera.eye.roll };
+        const float defs[] = { 0, 0, -sc->camera.focal, 0, 0, 0, 0 };
+
+        for (size_t ci = 0; ci < sizeof kEye / sizeof kEye[0]; ci++) {
+            if (json_has(cam, kEye[ci])) {
+                sc->camera.eye.moving = true;
+            }
+            parse_track_ex(cJSON_GetObjectItemCaseSensitive(cam, kEye[ci]),
+                           dst[ci], defs[ci], eases);
+        }
     }
 
     /* --- groups --- */
@@ -2951,6 +3424,10 @@ static bool parse_scene(EditorContext *ctx, const cJSON *node, const cJSON *styl
                 ok = parse_line_object(ctx, obj, *z, eases);
             } else if (strcmp(type, "path") == 0 || strcmp(type, "polyline") == 0) {
                 ok = parse_path_object(ctx, obj, *z, eases);
+            } else if (strcmp(type, "video") == 0) {
+                ok = parse_video_object(ctx, obj, *z, filepath, eases);
+            } else if (strcmp(type, "mesh") == 0 || strcmp(type, "model") == 0) {
+                ok = parse_mesh_object(ctx, obj, *z, filepath, eases);
             } else {
                 fprintf(stderr, "warning: unknown object type '%s' — skipped.\n", type);
                 continue;
@@ -2969,7 +3446,8 @@ static bool parse_scene(EditorContext *ctx, const cJSON *node, const cJSON *styl
 
     sc->widget_count = (ctx->text_count + ctx->code_count + ctx->image_count +
                         ctx->shape_count + ctx->line_count +
-                        ctx->path_count) - sc->first_widget;
+                        ctx->path_count + ctx->video_count +
+                        ctx->mesh_count) - sc->first_widget;
 
     /*
      * --- the scene's own effects ---
@@ -2978,6 +3456,18 @@ static bool parse_scene(EditorContext *ctx, const cJSON *node, const cJSON *styl
      * *global* stack, read separately by parse_video_project_ex(). Reading it
      * a second time meant every effect was applied to the frame twice.
      */
+    /*
+     * A point light. Naming it switches meshes from camera-mounted shading to
+     * being lit from this position, which is what puts a terminator on a body.
+     */
+    const cJSON *lit = cJSON_GetObjectItemCaseSensitive(node, "light");
+    if (cJSON_IsObject(lit)) {
+        sc->has_light = true;
+        sc->light[0] = json_float(lit, "x", 0.0f);
+        sc->light[1] = json_float(lit, "y", 0.0f);
+        sc->light[2] = json_float(lit, "z", 0.0f);
+    }
+
     if (!is_root &&
         !parse_effects_into(&sc->effects, &sc->effect_count, &sc->effect_cap,
                             cJSON_GetObjectItemCaseSensitive(node, "effects"))) {
@@ -3068,6 +3558,16 @@ static bool parse_scene(EditorContext *ctx, const cJSON *node, const cJSON *styl
             }
         }
     }
+
+    /*
+     * Relative times are resolved here rather than after every scene is read,
+     * because the scene's own duration may be derived from its last event —
+     * and that has to happen with real numbers, not with unresolved
+     * expressions all reading as zero.
+     *
+     * Labels are scene-local anyway, so nothing is lost by resolving early.
+     */
+    resolve_event_times(sc);
 
     /* --- duration --- */
     if (json_has(node, "duration_ms")) {
@@ -3318,11 +3818,17 @@ static void widget_base_free(WidgetBase *b)
     track_free(&b->tr_h);
     track_free(&b->tr_tint);
     track_free(&b->tr_trim);
+    track_free(&b->tr_z);
+    track_free(&b->tr_rx);
+    track_free(&b->tr_ry);
 
     free(b->x_expr);
     free(b->y_expr);
+    free(b->x_bind);
+    free(b->y_bind);
     free(b->group_name);
     b->x_expr = b->y_expr = NULL;
+    b->x_bind = b->y_bind = NULL;
     b->group_name = NULL;
 }
 
@@ -3372,6 +3878,22 @@ void editor_context_free(EditorContext *ctx)
     }
     free(ctx->paths);
 
+    for (size_t i = 0; i < ctx->video_count; i++) {
+        widget_base_free(&ctx->videos[i].base);
+        free(ctx->videos[i].path);
+    }
+    free(ctx->videos);
+
+    for (size_t i = 0; i < ctx->mesh_count; i++) {
+        widget_base_free(&ctx->meshes[i].base);
+        mesh_free(&ctx->meshes[i]);
+        texture_free(&ctx->meshes[i].tex);
+        free(ctx->meshes[i].path);
+        free(ctx->meshes[i].shape);
+        free(ctx->meshes[i].tex_path);
+    }
+    free(ctx->meshes);
+
     for (size_t i = 0; i < ctx->shape_count; i++) {
         widget_base_free(&ctx->shapes[i].base);
     }
@@ -3400,13 +3922,24 @@ void editor_context_free(EditorContext *ctx)
         free(sc->effects);
         for (size_t e = 0; e < sc->event_count; e++) {
             free(sc->events[e].target_id);
+            free(sc->events[e].label);
+            free(sc->events[e].time_expr);
             track_free(&sc->events[e].anim_track);
         }
+        for (size_t l = 0; l < sc->label_count; l++) {
+            free(sc->label_names[l]);
+        }
+        free(sc->label_names);
+        free(sc->label_times);
         free(sc->events);
         for (size_t g = 0; g < sc->group_count; g++) {
             free(sc->groups[g].id);
         }
         free(sc->groups);
+        track_free(&sc->camera.eye.px); track_free(&sc->camera.eye.py);
+        track_free(&sc->camera.eye.pz); track_free(&sc->camera.eye.tx);
+        track_free(&sc->camera.eye.ty); track_free(&sc->camera.eye.tz);
+        track_free(&sc->camera.eye.roll);
         track_free(&sc->camera.zoom);     track_free(&sc->camera.x);
         track_free(&sc->camera.y);        track_free(&sc->camera.rotation);
         track_free(&sc->camera.shake);
@@ -3690,6 +4223,7 @@ bool vr_list_table(const char *what)
     if (strcmp(what, "properties") == 0) {
         static const char *kP[] = {
             "x", "y", "opacity", "scale", "rotation", "w", "h", "tint", "trim",
+            "z", "rotate_x", "rotate_y",
         };
         printf("[");
         for (size_t i = 0; i < sizeof kP / sizeof kP[0]; i++) {
@@ -3699,8 +4233,66 @@ bool vr_list_table(const char *what)
         return true;
     }
 
+    if (strcmp(what, "fonts") == 0) {
+        /*
+         * Installed font families, via fontconfig.
+         *
+         * This is the one class of mistake a rendered preview cannot catch.
+         * Cairo's "toy" API substitutes silently, so a scene naming a font that
+         * is not installed still renders — in some other face, looking entirely
+         * plausible. Nothing about the picture says the typography is wrong, so
+         * the only defence is knowing the list beforehand.
+         */
+        FcConfig  *cfg = FcInitLoadConfigAndFonts();
+        if (cfg == NULL) {
+            printf("[]\n");
+            return true;
+        }
+
+        FcPattern   *pat  = FcPatternCreate();
+        FcObjectSet *os   = FcObjectSetBuild(FC_FAMILY, (char *)NULL);
+        FcFontSet   *set  = FcFontList(cfg, pat, os);
+
+        printf("[");
+        int printed = 0;
+        for (int i = 0; set != NULL && i < set->nfont; i++) {
+            FcChar8 *fam = NULL;
+            if (FcPatternGetString(set->fonts[i], FC_FAMILY, 0, &fam) != FcResultMatch ||
+                fam == NULL) {
+                continue;
+            }
+
+            /* fontconfig lists a family once per style, so duplicates are
+             * common; a linear scan is fine for a few hundred names. */
+            bool seen = false;
+            for (int j = 0; j < i && !seen; j++) {
+                FcChar8 *prev = NULL;
+                if (FcPatternGetString(set->fonts[j], FC_FAMILY, 0, &prev) == FcResultMatch &&
+                    prev != NULL && strcmp((const char *)prev, (const char *)fam) == 0) {
+                    seen = true;
+                }
+            }
+            if (seen) {
+                continue;
+            }
+
+            printf("%s\"", printed ? ", " : "");
+            json_escape(stdout, (const char *)fam);
+            printf("\"");
+            printed++;
+        }
+        printf("]\n");
+
+        if (set != NULL) FcFontSetDestroy(set);
+        FcObjectSetDestroy(os);
+        FcPatternDestroy(pat);
+        FcConfigDestroy(cfg);
+        return true;
+    }
+
     if (strcmp(what, "widgets") == 0) {
-        printf("[\"text\", \"code\", \"image\", \"rect\", \"circle\", \"line\", \"path\"]\n");
+        printf("[\"text\", \"code\", \"image\", \"video\", \"mesh\", "
+               "\"rect\", \"circle\", \"line\", \"path\"]\n");
         return true;
     }
 
@@ -3738,7 +4330,8 @@ void editor_context_dump_json(const EditorContext *ctx)
     }
     printf("%s],\n", ctx->scene_count ? "\n  " : "");
 
-    static const char *kKind[] = { "text", "code", "image", "rect", "circle", "line", "path" };
+    static const char *kKind[] = { "text", "code", "image", "rect", "circle",
+                                   "line", "path", "video", "mesh" };
 
     printf("  \"objects\": [");
     for (size_t i = 0; i < ctx->widget_count; i++) {
@@ -3747,7 +4340,7 @@ void editor_context_dump_json(const EditorContext *ctx)
         json_escape(stdout, b->id ? b->id : "");
         printf("\", \"type\": \"%s\", \"x\": %.1f, \"y\": %.1f,"
                " \"w\": %.1f, \"h\": %.1f, \"z\": %d",
-               (b->kind <= WIDGET_PATH) ? kKind[b->kind] : "?",
+               (b->kind <= WIDGET_MESH) ? kKind[b->kind] : "?",
                (double)widget_left(b), (double)widget_top(b),
                (double)b->base_w, (double)b->base_h, b->z_order);
         if (b->glyphs.line_count > 0) {
@@ -3880,7 +4473,10 @@ static int check_run(const EditorContext *ctx, CheckSink *sk)
         }
 
         if (b->tex.pixels == NULL) {
-            VR_PROBLEM("'%s' — the texture was not rasterized.\n", id);
+            /* A mesh legitimately has no texture — its geometry is the asset. */
+            if (b->kind != WIDGET_MESH) {
+                VR_PROBLEM("'%s' — the texture was not rasterized.\n", id);
+            }
         }
     }
 
