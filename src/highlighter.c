@@ -1,9 +1,9 @@
 /*
- * highlighter.c — მარტივი, ალოკაციის გარეშე მომუშავე ლექსერი.
+ * highlighter.c — a simple, allocation-free lexer.
  *
- * ეს არ არის და არც უნდა იყოს სრული პარსერი: ვიდეოსთვის საკმარისია
- * "ვიზუალურად სწორი" გაფერადება. ამიტომ ვიყენებთ კლასიკურ scanner-ს
- * საკვანძო სიტყვების ცხრილებით — არავითარი AST, არავითარი grammar.
+ * This is not a full parser and is not trying to be one: "visually correct"
+ * colouring is all a video needs. Hence a classic scanner over keyword
+ * tables — no AST, no grammar.
  */
 
 #include "highlighter.h"
@@ -12,11 +12,11 @@
 #include <string.h>
 
 /* ------------------------------------------------------------------------- */
-/* ენების ლექსიკონები                                                         */
+/* Language dictionaries                                                      */
 /* ------------------------------------------------------------------------- */
 
-/* NULL-ით დასრულებული ცხრილები — ძებნა წრფივია, მაგრამ სიტყვები მოკლეა და
- * მთელი რასტერიზაცია ისედაც ერთხელ ხდება. */
+/* NULL-terminated tables — the search is linear, but the words are short and
+ * the whole rasterization happens only once anyway. */
 
 static const char *const C_KEYWORDS[] = {
     "if", "else", "for", "while", "do", "switch", "case", "default", "break",
@@ -73,16 +73,16 @@ static const char *const PY_TYPES[] = {
 };
 static const char *const PY_CONSTANTS[] = { "True", "False", "None", NULL };
 
-/* ერთი ენის სრული აღწერა. */
+/* The complete description of one language. */
 typedef struct {
     const char *const *keywords;
     const char *const *types;
     const char *const *constants;
-    const char        *line_comment;   /* "//" ან "#" */
-    bool               block_comments; /* C-სტილის ბლოკ-კომენტარები */
-    bool               preproc;        /* '#' სტრიქონის დასაწყისში = დირექტივა */
-    bool               triple_strings;  /* python-ის """ */
-    bool               raw_backtick;    /* Go-ს `raw string` */
+    const char        *line_comment;   /* "//" or "#" */
+    bool               block_comments; /* C-style block comments */
+    bool               preproc;        /* '#' at line start = a directive */
+    bool               triple_strings;  /* Python's """ */
+    bool               raw_backtick;    /* Go's `raw string` */
 } LangSpec;
 
 static LangSpec lang_spec(Language lang)
@@ -120,7 +120,7 @@ Language highlighter_language_from_name(const char *name)
         return LANG_NONE;
     }
 
-    /* რეგისტრის-იგნორირებადი შედარება მოკლე ცხრილთან. */
+    /* Case-insensitive comparison against a short table. */
     static const struct { const char *name; Language lang; } table[] = {
         { "c", LANG_C },     { "h", LANG_C },      { "cpp", LANG_C },
         { "c++", LANG_C },   { "cc", LANG_C },     { "hpp", LANG_C },
@@ -146,13 +146,13 @@ Language highlighter_language_from_name(const char *name)
 }
 
 /* ------------------------------------------------------------------------- */
-/* სიმბოლოთა კლასები                                                          */
+/* Character classes                                                          */
 /* ------------------------------------------------------------------------- */
 
 static bool is_ident_start(char c)
 {
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' ||
-           (unsigned char)c >= 0x80; /* UTF-8 — იდენტიფიკატორის ნაწილად ვთვლით */
+           (unsigned char)c >= 0x80; /* UTF-8 bytes count as identifier chars */
 }
 
 static bool is_ident_char(char c)
@@ -179,7 +179,7 @@ static bool in_word_list(const char *const *list, const char *word, size_t len)
 }
 
 /* ------------------------------------------------------------------------- */
-/* ტოკენების ჩაწერა                                                           */
+/* Emitting tokens                                                            */
 /* ------------------------------------------------------------------------- */
 
 typedef struct {
@@ -195,8 +195,8 @@ static void emit(Emitter *e, size_t start, size_t len, TokenClass cls)
     }
 
     /*
-     * ბუფერის ამოწურვისას ბოლო ტოკენს ვაგრძელებთ, ნაცვლად იმისა, რომ ტექსტი
-     * დავკარგოთ. გაფერადება დაზარალდება, ტექსტი — არასოდეს.
+     * When the buffer runs out we extend the last token rather than dropping
+     * text. Colouring degrades; text never disappears.
      */
     if (e->count >= e->max) {
         if (e->count > 0) {
@@ -206,7 +206,7 @@ static void emit(Emitter *e, size_t start, size_t len, TokenClass cls)
         return;
     }
 
-    /* მეზობელი ერთნაირი კლასის ტოკენების შერწყმა — ნაკლები cairo გამოძახება. */
+    /* Merge adjacent tokens of the same class — fewer Cairo calls. */
     if (e->count > 0) {
         Token *last = &e->out[e->count - 1];
         if (last->cls == cls && last->start + last->len == start) {
@@ -222,24 +222,24 @@ static void emit(Emitter *e, size_t start, size_t len, TokenClass cls)
 }
 
 /* ------------------------------------------------------------------------- */
-/* ლექსერი                                                                    */
+/* Lexer                                                                      */
 /* ------------------------------------------------------------------------- */
 
-/* სტრიქონული ლიტერალის დასასრულის პოვნა escape-ების გათვალისწინებით. */
+/* Finds the end of a string literal, honouring escapes. */
 static size_t scan_string(const char *line, size_t i, size_t len, char quote, bool allow_escape)
 {
-    i++; /* გამხსნელი ბრჭყალი */
+    i++; /* the opening quote */
     while (i < len) {
         if (allow_escape && line[i] == '\\' && i + 1 < len) {
-            i += 2; /* \" და \\ არ ხურავს ლიტერალს */
+            i += 2; /* \" and \\ do not close the literal */
             continue;
         }
         if (line[i] == quote) {
-            return i + 1; /* დამხურავის შემდეგ */
+            return i + 1; /* just past the closer */
         }
         i++;
     }
-    return len; /* დაუხურავი — სტრიქონის ბოლომდე */
+    return len; /* unterminated — run to the end of the line */
 }
 
 size_t highlighter_tokenize_line(const char *line, Language lang, HighlightState *state,
@@ -265,19 +265,19 @@ size_t highlighter_tokenize_line(const char *line, Language lang, HighlightState
         state = &local;
     }
 
-    /* --- გაგრძელებადი მდგომარეობები წინა სტრიქონიდან --------------------- */
+    /* --- states carried over from the previous line ---------------------- */
 
-    if (state->mode == 1) { /* ბლოკ-კომენტარის შიგნით ვართ */
+    if (state->mode == 1) { /* inside a block comment */
         const char *end = strstr(line, "*/");
         if (end == NULL) {
             emit(&e, 0, len, TOK_COMMENT);
-            return e.count; /* mode უცვლელი — კომენტარი გრძელდება */
+            return e.count; /* mode unchanged — the comment continues */
         }
         size_t stop = (size_t)(end - line) + 2;
         emit(&e, 0, stop, TOK_COMMENT);
         state->mode = 0;
         i = stop;
-    } else if (state->mode == 2) { /* სამმაგი ბრჭყალის შიგნით */
+    } else if (state->mode == 2) { /* inside a triple-quoted string */
         char triple[4] = { state->triple_quote, state->triple_quote, state->triple_quote, '\0' };
         const char *end = strstr(line, triple);
         if (end == NULL) {
@@ -290,7 +290,7 @@ size_t highlighter_tokenize_line(const char *line, Language lang, HighlightState
         i = stop;
     }
 
-    /* --- C-ის პრეპროცესორი: '#' პირველი არა-ხარე სიმბოლოა ----------------- */
+    /* --- C preprocessor: '#' is the first non-space character ------------- */
     if (spec.preproc && i == 0) {
         size_t j = 0;
         while (j < len && (line[j] == ' ' || line[j] == '\t')) {
@@ -303,11 +303,11 @@ size_t highlighter_tokenize_line(const char *line, Language lang, HighlightState
         }
     }
 
-    /* --- ძირითადი სკანერი -------------------------------------------------- */
+    /* --- the main scanner -------------------------------------------------- */
     while (i < len) {
         char c = line[i];
 
-        /* ხარეები */
+        /* whitespace */
         if (c == ' ' || c == '\t') {
             size_t start = i;
             while (i < len && (line[i] == ' ' || line[i] == '\t')) {
@@ -317,7 +317,7 @@ size_t highlighter_tokenize_line(const char *line, Language lang, HighlightState
             continue;
         }
 
-        /* სტრიქონული კომენტარი */
+        /* line comment */
         if (spec.line_comment != NULL) {
             size_t lc = strlen(spec.line_comment);
             if (i + lc <= len && strncmp(line + i, spec.line_comment, lc) == 0) {
@@ -326,12 +326,12 @@ size_t highlighter_tokenize_line(const char *line, Language lang, HighlightState
             }
         }
 
-        /* ბლოკ-კომენტარის დასაწყისი */
+        /* start of a block comment */
         if (spec.block_comments && i + 1 < len && line[i] == '/' && line[i + 1] == '*') {
             const char *end = strstr(line + i + 2, "*/");
             if (end == NULL) {
                 emit(&e, i, len - i, TOK_COMMENT);
-                state->mode = 1; /* შემდეგ სტრიქონზეც გრძელდება */
+                state->mode = 1; /* continues on the next line */
                 break;
             }
             size_t stop = (size_t)(end - line) + 2;
@@ -340,7 +340,7 @@ size_t highlighter_tokenize_line(const char *line, Language lang, HighlightState
             continue;
         }
 
-        /* python-ის სამმაგი ბრჭყალები */
+        /* Python triple quotes */
         if (spec.triple_strings && i + 2 < len &&
             (c == '"' || c == '\'') && line[i + 1] == c && line[i + 2] == c) {
             char        triple[4] = { c, c, c, '\0' };
@@ -357,7 +357,7 @@ size_t highlighter_tokenize_line(const char *line, Language lang, HighlightState
             continue;
         }
 
-        /* ჩვეულებრივი სტრიქონები და სიმბოლური ლიტერალები */
+        /* ordinary strings and character literals */
         if (c == '"' || c == '\'') {
             size_t stop = scan_string(line, i, len, c, true);
             emit(&e, i, stop - i, TOK_STRING);
@@ -365,7 +365,7 @@ size_t highlighter_tokenize_line(const char *line, Language lang, HighlightState
             continue;
         }
 
-        /* Go-ს raw string — escape-ები არ მოქმედებს */
+        /* Go raw string — escapes do not apply */
         if (spec.raw_backtick && c == '`') {
             size_t stop = scan_string(line, i, len, '`', false);
             emit(&e, i, stop - i, TOK_STRING);
@@ -373,11 +373,11 @@ size_t highlighter_tokenize_line(const char *line, Language lang, HighlightState
             continue;
         }
 
-        /* რიცხვები (მათ შორის 0x1F, 1.5e-3, 1_000, 42u) */
+        /* numbers (including 0x1F, 1.5e-3, 1_000, 42u) */
         if (is_digit(c) || (c == '.' && i + 1 < len && is_digit(line[i + 1]))) {
             size_t start = i;
             while (i < len && (is_ident_char(line[i]) || line[i] == '.')) {
-                /* მაჩვენებლის ნიშანი: 1e-5 */
+                /* exponent sign: 1e-5 */
                 if ((line[i] == 'e' || line[i] == 'E') && i + 1 < len &&
                     (line[i + 1] == '+' || line[i + 1] == '-')) {
                     i += 2;
@@ -389,7 +389,7 @@ size_t highlighter_tokenize_line(const char *line, Language lang, HighlightState
             continue;
         }
 
-        /* იდენტიფიკატორები და საკვანძო სიტყვები */
+        /* identifiers and keywords */
         if (is_ident_start(c)) {
             size_t start = i;
             while (i < len && is_ident_char(line[i])) {
@@ -406,7 +406,7 @@ size_t highlighter_tokenize_line(const char *line, Language lang, HighlightState
             } else if (in_word_list(spec.constants, word, wlen)) {
                 cls = TOK_NUMBER;
             } else {
-                /* ევრისტიკა: სახელს '(' მოსდევს → ფუნქციის გამოძახება. */
+                /* Heuristic: a name followed by '(' is a function call. */
                 size_t j = i;
                 while (j < len && (line[j] == ' ' || line[j] == '\t')) {
                     j++;
@@ -417,7 +417,7 @@ size_t highlighter_tokenize_line(const char *line, Language lang, HighlightState
             continue;
         }
 
-        /* ოპერატორები */
+        /* operators */
         if (strchr("+-*/%=<>!&|^~?:", c) != NULL) {
             size_t start = i;
             while (i < len && strchr("+-*/%=<>!&|^~?:", line[i]) != NULL) {
@@ -427,14 +427,14 @@ size_t highlighter_tokenize_line(const char *line, Language lang, HighlightState
             continue;
         }
 
-        /* პუნქტუაცია */
+        /* punctuation */
         if (strchr("(){}[];,.", c) != NULL) {
             emit(&e, i, 1, TOK_PUNCT);
             i++;
             continue;
         }
 
-        /* ყველაფერი დანარჩენი — ნეიტრალური ტექსტი (UTF-8-ის ბაიტების ჩათვლით). */
+        /* everything else — neutral text (UTF-8 bytes included). */
         emit(&e, i, 1, TOK_TEXT);
         i++;
     }
@@ -443,12 +443,12 @@ size_t highlighter_tokenize_line(const char *line, Language lang, HighlightState
 }
 
 /* ------------------------------------------------------------------------- */
-/* თემა                                                                       */
+/* Theme                                                                      */
 /* ------------------------------------------------------------------------- */
 
 Color highlighter_class_color(TokenClass cls)
 {
-    /* Catppuccin Mocha — ბნელ #1E1E2E ფონზე კარგი კონტრასტი აქვს. */
+    /* Catppuccin Mocha — good contrast on the dark #1E1E2E panel. */
     switch (cls) {
         case TOK_KEYWORD:  return (Color){ 0xCB, 0xA6, 0xF7, 0xFF }; /* mauve  */
         case TOK_TYPE:     return (Color){ 0xF9, 0xE2, 0xAF, 0xFF }; /* yellow */

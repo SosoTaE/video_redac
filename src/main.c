@@ -1,15 +1,15 @@
 /*
- * main.c — CLI-ის შესასვლელი და pipeline-ის დირიჟორი.
+ * main.c — the CLI entry point and the pipeline's conductor.
  *
- * მთელი ნაკადი აქ ერთ ეკრანზე ჩანს:
+ * The whole flow fits on one screen here:
  *
  *   parse_video_project()      video.json  → EditorContext (host)
- *   media_prepare_textures()   ტექსტი      → RGBA პიქსელები (Cairo, CPU, ერთხელ)
- *   render_video()             ტექსტურები  → VRAM → კადრები → ffmpeg/NVENC
- *   editor_context_free()      ყველაფერი უკან
+ *   media_prepare_textures()   text        → RGBA pixels (Cairo, CPU, once)
+ *   render_video()             textures    → VRAM → frames → ffmpeg/NVENC
+ *   editor_context_free()      everything back
  *
- * არავითარი გლობალური ცვლადი: `ctx` აქ იბადება და აქვე კვდება; ყველა სხვა
- * მოდული მას მხოლოდ მაჩვენებლით იღებს.
+ * No global variables: `ctx` is born and dies here; every other module only
+ * ever receives it by pointer.
  */
 
 #include <stdio.h>
@@ -24,30 +24,30 @@
 static void print_usage(const char *prog)
 {
     fprintf(stderr,
-            "video_redac — ტექსტიდან ვიდეოს რენდერერი (CUDA + NVENC)\n"
+            "video_redac — a text-to-video renderer (CUDA + NVENC)\n"
             "\n"
-            "გამოყენება:\n"
-            "  %s [video.json] [პარამეტრები]\n"
+            "Usage:\n"
+            "  %s [project.json] [options]\n"
             "\n"
-            "პარამეტრები:\n"
-            "  -o, --output FILE    გამომავალი ფაილი (default: output.mp4)\n"
-            "  -d, --dump           დაბეჭდე დაპარსული პროექტი და გააგრძელე\n"
-            "  -n, --dry-run        მხოლოდ დაპარსე და დაარასტერიზე; GPU-ს ნუ შეეხები\n"
-            "  -c, --check          შეამოწმე პროექტი და გამოდი (0 = სუფთა)\n"
-            "  -r, --range A:B      დაარენდერე მხოლოდ A-დან B წამამდე (გადასახედად)\n"
-            "  -s, --set KEY=VALUE  ცვლადის მნიშვნელობა (${KEY} JSON-ში); მრავალჯერ\n"
-            "  -h, --help           ეს დახმარება\n"
+            "Options:\n"
+            "  -o, --output FILE    output file (default: output.mp4)\n"
+            "  -d, --dump           print the parsed project and continue\n"
+            "  -n, --dry-run        parse and rasterize only; never touch the GPU\n"
+            "  -c, --check          validate the project and exit (0 = clean)\n"
+            "  -r, --range A:B      render only seconds A..B (fast preview)\n"
+            "  -s, --set KEY=VALUE  set a ${KEY} variable; repeatable\n"
+            "  -h, --help           this help\n"
             "\n"
-            "ხმა: JSON-ის ზედა დონეზე 'audio' მასივი (მზა ფაილები; TTS არ არის).\n"
-            "     ვიდეო ჯერ მუნჯად ირენდერება, მერე ffmpeg ურთავს ფონოგრამას.\n"
+            "Audio: a top-level 'audio' array of files (no speech synthesis).\n"
+            "       The video renders silently first; ffmpeg then muxes the sound.\n"
             "\n"
-            "გარემოს ცვლადები:\n"
-            "  VIDEO_REDAC_ENCODER  ffmpeg-ის ენკოდერი (default: h264_nvenc)\n",
+            "Environment:\n"
+            "  VIDEO_REDAC_ENCODER  ffmpeg encoder (default: h264_nvenc)\n",
             prog);
 }
 
 /*
- * "12:16" → [12.0, 16.0] წამი. აბრუნებს false-ს ნებისმიერ სხვა ფორმაზე.
+ * "12:16" → [12.0, 16.0] seconds. Returns false for anything else.
  */
 static bool parse_range(const char *spec, double *out_start, double *out_end)
 {
@@ -77,10 +77,10 @@ int main(int argc, char **argv)
     bool        dry_run     = false;
     bool        want_check  = false;
     double      range_start = 0.0, range_end = 0.0;
-    char      **defines     = NULL;   /* --set-ების მასივი; argv-ს მიუთითებს */
+    char      **defines     = NULL;   /* array of --set values; points into argv */
     int         define_count = 0;
 
-    /* --- 1. არგუმენტების დამუშავება ------------------------------------- */
+    /* --- 1. Argument handling -------------------------------------------- */
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
 
@@ -95,7 +95,7 @@ int main(int argc, char **argv)
             dry_run = true;
         } else if (strcmp(arg, "-s") == 0 || strcmp(arg, "--set") == 0) {
             if (i + 1 >= argc) {
-                fprintf(stderr, "შეცდომა: %s მოითხოვს KEY=VALUE-ს.\n", arg);
+                fprintf(stderr, "error: %s requires KEY=VALUE.\n", arg);
                 free(defines);
                 return EXIT_FAILURE;
             }
@@ -110,53 +110,53 @@ int main(int argc, char **argv)
             want_check = true;
         } else if (strcmp(arg, "-r") == 0 || strcmp(arg, "--range") == 0) {
             if (i + 1 >= argc) {
-                fprintf(stderr, "შეცდომა: %s მოითხოვს დიაპაზონს, მაგ: 12:16\n", arg);
+                fprintf(stderr, "error: %s requires a range, e.g. 12:16\n", arg);
                 free(defines);
                 return EXIT_FAILURE;
             }
             if (!parse_range(argv[++i], &range_start, &range_end)) {
-                fprintf(stderr, "შეცდომა: არასწორი დიაპაზონი '%s' (უნდა იყოს A:B, B > A ≥ 0).\n",
+                fprintf(stderr, "error: bad range '%s' (expected A:B with B > A >= 0).\n",
                         argv[i]);
                 free(defines);
                 return EXIT_FAILURE;
             }
         } else if (strcmp(arg, "-o") == 0 || strcmp(arg, "--output") == 0) {
             if (i + 1 >= argc) {
-                fprintf(stderr, "შეცდომა: %s მოითხოვს ფაილის სახელს.\n", arg);
+                fprintf(stderr, "error: %s requires a file name.\n", arg);
                 free(defines);
                 return EXIT_FAILURE;
             }
             output_path = argv[++i];
         } else if (arg[0] == '-') {
-            fprintf(stderr, "შეცდომა: უცნობი პარამეტრი '%s'.\n\n", arg);
+            fprintf(stderr, "error: unknown option '%s'.\n\n", arg);
             print_usage(argv[0]);
             free(defines);
             return EXIT_FAILURE;
         } else {
-            input_path = arg; /* პოზიციური არგუმენტი = შემავალი JSON */
+            input_path = arg; /* a positional argument is the input JSON */
         }
     }
 
-    /* --- 2. პროექტის დაპარსვა -------------------------------------------- */
+    /* --- 2. Parse the project -------------------------------------------- */
     EditorContext *ctx = parse_video_project_ex(input_path, defines, define_count);
     free(defines);
     if (ctx == NULL) {
-        fprintf(stderr, "შეცდომა: პროექტი '%s' ვერ ჩაიტვირთა.\n", input_path);
+        fprintf(stderr, "error: could not load project '%s'.\n", input_path);
         return EXIT_FAILURE;
     }
 
-    /* --- 3. ტექსტურების ქეშის შევსება (CPU, ერთხელ) ----------------------- */
+    /* --- 3. Fill the texture cache (CPU, once) ---------------------------- */
     if (!media_prepare_textures(ctx)) {
-        fprintf(stderr, "შეცდომა: ტექსტურების მომზადება ჩავარდა.\n");
+        fprintf(stderr, "error: preparing textures failed.\n");
         editor_context_free(ctx);
         return EXIT_FAILURE;
     }
 
     if (want_dump) {
-        editor_context_dump(ctx); /* ტექსტურების ზომებიც უკვე ცნობილია */
+        editor_context_dump(ctx); /* texture sizes are known by now too */
     }
 
-    /* --- 3b. ვალიდაცია ---------------------------------------------------- */
+    /* --- 3b. Validation --------------------------------------------------- */
     if (want_check) {
         int problems = editor_context_check(ctx);
         editor_context_free(ctx);
@@ -167,19 +167,19 @@ int main(int argc, char **argv)
     ctx->range_start_sec = range_start;
     ctx->range_end_sec   = range_end;
 
-    /* --- 4. რენდერი ------------------------------------------------------- */
+    /* --- 4. Render -------------------------------------------------------- */
     bool ok = true;
     if (dry_run) {
-        fprintf(stderr, "dry-run: %zu ობიექტი დარასტერიზდა, GPU გამოტოვებულია.\n",
+        fprintf(stderr, "dry-run: %zu objects rasterized, GPU skipped.\n",
                 ctx->widget_count);
     } else {
         ok = render_video(ctx, output_path);
     }
 
-    /* --- 5. გასუფთავება --------------------------------------------------- */
-    /* ერთი გამოძახება ათავისუფლებს host მეხსიერებას, VRAM-ს და არენას. */
+    /* --- 5. Cleanup ------------------------------------------------------- */
+    /* One call releases host memory, VRAM and the arena. */
     editor_context_free(ctx);
-    media_shutdown(); /* Cairo/fontconfig-ის გლობალური ქეშები */
+    media_shutdown(); /* Cairo/fontconfig global caches */
 
     return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

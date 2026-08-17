@@ -107,6 +107,34 @@ Pinned host memory matters: a pageable buffer would make the driver stage the
 copy through its own pinned buffer first, doubling the work and making the
 transfer effectively synchronous.
 
+## The CPU backend
+
+Same machine (20 threads), `showcase.json`, 1320 frames at 1080×1920:
+
+| Backend | Encoder | Time | fps | vs GPU |
+|---|---|---|---|---|
+| CUDA | `h264_nvenc` | 3.41 s | 387 | 1.0× |
+| CPU | `libx264 -preset medium` | 17.09 s | 77 | 5.0× slower |
+
+Five times slower — and still 1.3× real time at 60 fps, which makes it usable
+rather than merely correct.
+
+Isolating the compositing by rendering to rawvideo (300 frames, no encoder in the
+way):
+
+| Threads | fps |
+|---|---|
+| 1 | 19.5 |
+| 4 | 64.5 |
+| 20 | 130.7 |
+
+At 130 fps the run is writing ~400 MB/s of raw frames, so this understates how
+well the compositing itself parallelises. The useful conclusion is the same as on
+the GPU: **the encoder is the bottleneck on both backends.** `libx264` is simply
+a much lower ceiling than NVENC.
+
+Details: [09-backends.md](09-backends.md).
+
 ## Scaling notes
 
 - **Object count is cheap.** `binsearch.json` composites 86 objects per frame at
@@ -116,7 +144,10 @@ transfer effectively synchronous.
   throughput. 1280×720 renders at 430–590 fps.
 - **`hevc_nvenc`** has more headroom than H.264 on Blackwell if the encoder is
   the limit.
-- **Faster presets** (`p4`, `p1`) trade file size for speed.
+- **Faster presets** (`p4`, `p1`) trade file size for speed. On the CPU backend
+  the equivalent lever is `libx264`'s `-preset` (`veryfast` over `medium` is
+  worth several times the encoder's throughput).
+- **Threads** only help the CPU backend, and only up to the encoder's ceiling.
 
 ## Reproducing
 
@@ -135,4 +166,13 @@ make clean && make CPPFLAGS_EXTRA=-DVR_PIPELINE_DEPTH=1
 
 # engine utilisation during a render
 nvidia-smi --query-gpu=utilization.gpu,utilization.encoder --format=csv -l 1
+
+# CPU backend, and its thread scaling
+make clean && make CPU=1
+./video_redac showcase.json -o /tmp/cpu.mp4
+OMP_NUM_THREADS=1 VIDEO_REDAC_ENCODER=rawvideo \
+  ./video_redac showcase.json -o /tmp/t.nut --range 0:5
+
+# CPU vs GPU agreement (expect max delta 1, not 0 — see 09-backends.md)
+ffmpeg -v error -i cpu.nut -i gpu.nut -lavfi psnr -f null -
 ```

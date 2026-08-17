@@ -1,16 +1,16 @@
 /*
- * media_loader.c — CPU-ზე რასტერიზაცია Cairo-თი + სურათების ჩატვირთვა stb_image-ით.
+ * media_loader.c — CPU rasterization with Cairo + image loading with stb_image.
  *
- * რატომ CPU?
- *   ტექსტის რასტერიზაცია (hinting, kerning, ლიგატურები, ანტი-ალიასინგი) თანმიმდევრული,
- *   განშტოებებით სავსე ამოცანაა — GPU-ს SIMT მოდელისთვის ცუდად შესაფერისი. სამაგიეროდ
- *   ის ერთხელ კეთდება: 3600 კადრიან ვიდეოში სათაური ერთხელ იხატება და 3600-ჯერ
- *   მხოლოდ *იკომპოზიტება* GPU-ზე.
+ * Why the CPU?
+ *   Text rasterization (hinting, kerning, ligatures, antialiasing) is
+ *   sequential, branch-heavy work — a poor fit for a GPU's SIMT model. In
+ *   exchange it happens once: in a 3,600-frame video the title is drawn once
+ *   and merely *composited* 3,600 times on the GPU.
  *
- * ALPHA-ს კონვენცია: ყველა გამომავალი ტექსტურა PREMULTIPLIED RGBA8-ია.
- * Cairo-ს CAIRO_FORMAT_ARGB32 თავისთავად premultiplied-ია, ამიტომ აქ მხოლოდ
- * ბაიტების გადალაგება (ARGB uint32 → R,G,B,A ბაიტები) ხდება — არავითარი
- * un-premultiply, რომელიც ასოების კიდეებზე ხარისხს დააზიანებდა.
+ * ALPHA convention: every texture produced here is PREMULTIPLIED RGBA8.
+ * Cairo's CAIRO_FORMAT_ARGB32 is premultiplied already, so all that happens
+ * here is a byte reshuffle (ARGB uint32 → R,G,B,A bytes) — no un-premultiply,
+ * which would damage quality along glyph edges.
  */
 
 #include "media_loader.h"
@@ -26,14 +26,14 @@
 #include "layout.h"
 #include "stb_image.h"
 
-/* უსაფრთხოების ჭერი — დაზიანებულმა JSON-მა არ უნდა მოითხოვოს გიგაბაიტიანი surface. */
+/* A safety ceiling — a corrupt JSON must not ask for a gigabyte surface. */
 #define MAX_TEXTURE_DIM 16384
 
-/* ერთ სტრიქონზე ტოკენების ზღვარი; ზედმეტი TOK_TEXT-ად იკეცება (იხ. highlighter.c). */
+/* Token limit per line; the excess collapses into TOK_TEXT (see highlighter.c). */
 #define MAX_TOKENS_PER_LINE 256
 
 /* ------------------------------------------------------------------------- */
-/* ტექსტურის სიცოცხლის ციკლი                                                  */
+/* Texture lifetime                                                           */
 /* ------------------------------------------------------------------------- */
 
 void texture_free(Texture *t)
@@ -46,7 +46,7 @@ void texture_free(Texture *t)
     t->width  = 0;
     t->height = 0;
     t->stride = 0;
-    /* d_pixels განზრახ ხელუხლებელია — VRAM renderer_shutdown()-ის პასუხისმგებლობაა. */
+    /* d_pixels is deliberately untouched — VRAM is renderer_shutdown()'s job. */
 }
 
 void glyph_metrics_free(GlyphMetrics *m)
@@ -62,21 +62,21 @@ void glyph_metrics_free(GlyphMetrics *m)
     m->h_cutoff    = NULL;
     m->line_count  = 0;
     m->total_chars = 0;
-    /* d_cutoff-ს renderer_shutdown() ათავისუფლებს. */
+    /* d_cutoff is freed by renderer_shutdown(). */
 }
 
 void media_shutdown(void)
 {
-    /* Cairo-ს "debug" ფუნქციაა, მაგრამ სრულიად უსაფრთხო: ის მხოლოდ იმ
-     * სტატიკურ ქეშებს ცლის, რომლებიც ბიბლიოთეკამ თავად შექმნა. */
+    /* A Cairo "debug" function, but entirely safe: it only clears the static
+     * caches the library created itself. */
     cairo_debug_reset_static_data();
 }
 
-/* გამოყოფს ცარიელ (გამჭვირვალე) packed RGBA ბუფერს. */
+/* Allocates an empty (transparent) packed RGBA buffer. */
 static bool texture_alloc(Texture *t, int w, int h)
 {
     if (w <= 0 || h <= 0 || w > MAX_TEXTURE_DIM || h > MAX_TEXTURE_DIM) {
-        fprintf(stderr, "შეცდომა: ტექსტურის დაუშვებელი ზომა %dx%d.\n", w, h);
+        fprintf(stderr, "error: illegal texture size %dx%d.\n", w, h);
         return false;
     }
 
@@ -85,7 +85,7 @@ static bool texture_alloc(Texture *t, int w, int h)
 
     t->pixels = (uint8_t *)calloc(1, bytes);
     if (t->pixels == NULL) {
-        fprintf(stderr, "შეცდომა: ტექსტურისთვის %zu ბაიტი ვერ გამოიყო.\n", bytes);
+        fprintf(stderr, "error: could not allocate %zu bytes for a texture.\n", bytes);
         return false;
     }
 
@@ -97,10 +97,10 @@ static bool texture_alloc(Texture *t, int w, int h)
 }
 
 /* ------------------------------------------------------------------------- */
-/* UTF-8 დამხმარეები                                                          */
+/* UTF-8 helpers                                                              */
 /* ------------------------------------------------------------------------- */
 
-/* true, თუ ბაიტი კოდის-წერტილის დასაწყისია (და არა გაგრძელება 10xxxxxx). */
+/* true if the byte starts a code point (and is not a 10xxxxxx continuation). */
 static bool utf8_is_lead(unsigned char b)
 {
     return (b & 0xC0) != 0x80;
@@ -118,7 +118,7 @@ static size_t utf8_count(const char *s, size_t len)
 }
 
 /* ------------------------------------------------------------------------- */
-/* ფონტის სპეციფიკაციის დაშლა                                                 */
+/* Splitting the font specification                                           */
 /* ------------------------------------------------------------------------- */
 
 static int ascii_casecmp(const char *a, const char *b)
@@ -136,9 +136,9 @@ static int ascii_casecmp(const char *a, const char *b)
 /*
  * "FiraCode-Bold" → family="FiraCode", weight=BOLD.
  *
- * Cairo-ს "toy" API ოჯახს და სტილს ცალ-ცალკე იღებს, JSON-ში კი ჩვეულებრივ
- * PostScript-ისებური ერთიანი სახელი წერია. ოჯახის საბოლოო არჩევანს fontconfig
- * აკეთებს — მიახლოებითი დამთხვევა ნორმალურია.
+ * Cairo's "toy" API takes family and style separately, whereas JSON usually
+ * carries a single PostScript-like name. The final family choice is made by
+ * fontconfig — an approximate match is normal.
  */
 static void split_font_spec(const char *spec, char *family, size_t family_size,
                             cairo_font_weight_t *weight, cairo_font_slant_t *slant)
@@ -166,9 +166,9 @@ static void split_font_spec(const char *spec, char *family, size_t family_size,
             *weight = CAIRO_FONT_WEIGHT_BOLD;
             *slant  = CAIRO_FONT_SLANT_ITALIC;
         } else if (ascii_casecmp(suffix, "Regular") == 0 || ascii_casecmp(suffix, "Normal") == 0) {
-            /* default-ები უკვე სწორია */
+            /* the defaults are already right */
         } else {
-            matched = false; /* დეფისი ოჯახის სახელის ნაწილია, მაგ. "Noto-Sans" */
+            matched = false; /* the hyphen is part of the family, e.g. "Noto-Sans" */
         }
 
         if (matched) {
@@ -188,7 +188,7 @@ static void split_font_spec(const char *spec, char *family, size_t family_size,
 }
 
 /* ------------------------------------------------------------------------- */
-/* სტრიქონებად დაშლა                                                          */
+/* Splitting into lines                                                       */
 /* ------------------------------------------------------------------------- */
 
 static size_t count_lines(const char *text)
@@ -214,8 +214,8 @@ static void free_lines(char **lines, size_t count)
 }
 
 /*
- * ჭრის `text`-ს malloc-ით აღებულ სტრიქონების მასივად ('\r' მოცილებით).
- * ტაბულაცია ოთხ ხარედ იშლება — Cairo-ს toy API ტაბს არ ასწორებს.
+ * Splits `text` into a malloc'd array of lines (stripping '\r').
+ * Tabs expand to four spaces — Cairo's toy API does not align them.
  */
 static char **split_lines(const char *text, size_t *out_count)
 {
@@ -234,7 +234,7 @@ static char **split_lines(const char *text, size_t *out_count)
                 len--; /* CRLF */
             }
 
-            /* ტაბების დასათვლელად ჯერ საჭირო ზომას ვითვლით. */
+            /* Count tabs first so we know how much room to allocate. */
             size_t tabs = 0;
             for (size_t k = 0; k < len; k++) {
                 if (start[k] == '\t') {
@@ -276,16 +276,16 @@ static char **split_lines(const char *text, size_t *out_count)
 /* ------------------------------------------------------------------------- */
 
 /*
- * Cairo-ს ARGB32 ერთ პიქსელს ინახავს როგორც native-endian uint32-ს 0xAARRGGBB.
- * ბაიტებზე პირდაპირი წვდომა endian-დამოკიდებული იქნებოდა, ამიტომ ვკითხულობთ
- * uint32-ს და ველებს ცვლას ვახდენთ — ეს ყველა არქიტექტურაზე სწორია.
+ * Cairo's ARGB32 stores a pixel as a native-endian uint32 0xAARRGGBB.
+ * Indexing bytes directly would be endian-dependent, so we read the uint32 and
+ * shift the fields out — correct on every architecture.
  */
 static bool surface_to_rgba(cairo_surface_t *surface, Texture *out)
 {
     cairo_surface_flush(surface);
 
     if (cairo_surface_status(surface) != CAIRO_STATUS_SUCCESS) {
-        fprintf(stderr, "შეცდომა (cairo surface): %s\n",
+        fprintf(stderr, "error (cairo surface): %s\n",
                 cairo_status_to_string(cairo_surface_status(surface)));
         return false;
     }
@@ -317,15 +317,15 @@ static bool surface_to_rgba(cairo_surface_t *surface, Texture *out)
 }
 
 /* ------------------------------------------------------------------------- */
-/* გლიფების მეტრიკის აგება                                                    */
+/* Building the glyph metrics                                                 */
 /* ------------------------------------------------------------------------- */
 
 /*
- * ზომავს, სად მთავრდება ტოკენის ყოველი სიმბოლო.
+ * Measures where each of a token's characters ends.
  *
- * პრეფიქსების გაზომვა (და არა ცალკეული სიმბოლოების ჯამი) იმიტომაა საჭირო, რომ
- * kerning გავითვალისწინოთ — "AV" უფრო ვიწროა, ვიდრე "A" + "V" ცალკე.
- * ეს O(n²) შეპინგია, მაგრამ ერთხელ ხდება და სტრიქონები მოკლეა.
+ * Prefixes are measured (rather than summing individual characters) so that
+ * kerning is respected — "AV" is narrower than "A" + "V" measured apart.
+ * This is O(n²) shaping, but it happens once and lines are short.
  */
 static void measure_char_advances(cairo_t *cr, char *scratch, const char *s, size_t len,
                                   double base_x, float *out_x, size_t *out_count)
@@ -335,7 +335,7 @@ static void measure_char_advances(cairo_t *cr, char *scratch, const char *s, siz
 
     size_t written = 0;
     for (size_t b = 1; b <= len; b++) {
-        /* მხოლოდ კოდის-წერტილის საზღვრებზე ვჩერდებით. */
+        /* Stop only on code-point boundaries. */
         if (b < len && !utf8_is_lead((unsigned char)scratch[b])) {
             continue;
         }
@@ -353,15 +353,15 @@ static void measure_char_advances(cairo_t *cr, char *scratch, const char *s, siz
 }
 
 /* ------------------------------------------------------------------------- */
-/* ცენტრალური რასტერიზატორი                                                   */
+/* The central rasterizer                                                     */
 /* ------------------------------------------------------------------------- */
 
 /*
- * სიტყვებზე გადატანა.
+ * Word wrapping.
  *
- * ხარბი ალგორითმი: სიტყვებს რიგრიგობით ვამატებთ, სანამ ზღვარს არ გადავცდებით.
- * სიტყვა, რომელიც თავისთავად უფრო განიერია, ვიდრე ზღვარი, მთლიანად რჩება —
- * შუაში გაწყვეტა კოდსა და URL-ებს უფრო ხშირად აფუჭებს, ვიდრე შველის.
+ * A greedy algorithm: append words one by one until the limit is exceeded.
+ * A word wider than the limit on its own is left whole — breaking mid-word
+ * damages code and URLs more often than it helps.
  */
 static char **wrap_lines(char **lines, size_t *count, const char *family, int font_size,
                          cairo_font_weight_t weight, cairo_font_slant_t slant, float max_w)
@@ -386,7 +386,7 @@ static char **wrap_lines(char **lines, size_t *count, const char *family, int fo
 
         const char *word = src;
         while (ok) {
-            /* შემდეგი სიტყვის საზღვრები */
+            /* boundaries of the next word */
             while (*word == ' ') word++;
             if (*word == '\0') break;
 
@@ -394,7 +394,7 @@ static char **wrap_lines(char **lines, size_t *count, const char *family, int fo
             while (*word_end != '\0' && *word_end != ' ') word_end++;
             size_t wlen = (size_t)(word_end - word);
 
-            /* კანდიდატი: მიმდინარე + ხარე + სიტყვა */
+            /* candidate: current + space + word */
             size_t cand_len = (buf_len ? buf_len + 1 : 0) + wlen;
             char  *cand = (char *)malloc(cand_len + 1);
             if (cand == NULL) { ok = false; break; }
@@ -411,7 +411,7 @@ static char **wrap_lines(char **lines, size_t *count, const char *family, int fo
             cairo_text_extents(cr, cand, &te);
 
             if (te.x_advance > (double)max_w && buf_len > 0) {
-                /* არ ეტევა → მიმდინარე სტრიქონს ვხურავთ და სიტყვით ვიწყებთ ახალს */
+                /* does not fit → close this line and start a new one with the word */
                 if (out_n == out_cap) {
                     out_cap = out_cap ? out_cap * 2 : 8;
                     char **g = (char **)realloc(out, out_cap * sizeof(char *));
@@ -442,7 +442,7 @@ static char **wrap_lines(char **lines, size_t *count, const char *family, int fo
             if (g == NULL) { free(buf); ok = false; break; }
             out = g;
         }
-        out[out_n++] = buf;   /* ცარიელი სტრიქონიც შენარჩუნდება (აბზაცის შუალედი) */
+        out[out_n++] = buf;   /* empty lines are kept too (paragraph spacing) */
     }
 
     cairo_destroy(cr);
@@ -459,8 +459,8 @@ static char **wrap_lines(char **lines, size_t *count, const char *family, int fo
 }
 
 /*
- * ერთი სტრიქონის სტილიზებული ნაწილები.
- * `tokens == NULL` → მთელი სტრიქონი ერთი ფერისაა.
+ * The styled pieces of one line.
+ * `tokens == NULL` → the whole line is a single colour.
  */
 typedef struct {
     const char *text;
@@ -469,10 +469,10 @@ typedef struct {
 } StyledLine;
 
 /*
- * ხატავს სტრიქონებს ტექსტურაზე და (სურვილისამებრ) აგროვებს გლიფების მეტრიკას.
+ * Draws the lines onto a texture and, optionally, collects glyph metrics.
  *
- * ეს ერთი ფუნქცია ემსახურება როგორც ერთფეროვან ტექსტს, ისე გაფერადებულ კოდს —
- * განსხვავება მხოლოდ ისაა, აქვს თუ არა სტრიქონს ტოკენები.
+ * This one function serves both plain text and highlighted code — the only
+ * difference is whether a line carries tokens.
  */
 static bool raster_styled_lines(StyledLine *lines, size_t line_count, const char *font_family,
                                 int font_size, Color base_color, float line_spacing,
@@ -483,7 +483,7 @@ static bool raster_styled_lines(StyledLine *lines, size_t line_count, const char
     cairo_font_slant_t  slant;
     split_font_spec(font_family, family, sizeof family, &weight, &slant);
 
-    /* --- ეტაპი 1: გაზომვა 1x1 "სახაზავზე" -------------------------------- */
+    /* --- stage 1: measure on a 1x1 "ruler" surface ------------------------ */
     cairo_surface_t *probe    = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 1, 1);
     cairo_t         *probe_cr = cairo_create(probe);
 
@@ -531,11 +531,11 @@ static bool raster_styled_lines(StyledLine *lines, size_t line_count, const char
     if (tex_h < 1) tex_h = 1;
 
     if (tex_w > MAX_TEXTURE_DIM || tex_h > MAX_TEXTURE_DIM) {
-        fprintf(stderr, "შეცდომა: ტექსტი ძალიან დიდია (%dx%d).\n", tex_w, tex_h);
+        fprintf(stderr, "error: text too large (%dx%d).\n", tex_w, tex_h);
         return false;
     }
 
-    /* --- ეტაპი 2: მეტრიკის ბუფერების გამოყოფა ---------------------------- */
+    /* --- stage 2: allocate the metric buffers ---------------------------- */
     char  *scratch    = NULL;
     float *char_x     = NULL;
     int   *line_start = NULL;
@@ -554,15 +554,15 @@ static bool raster_styled_lines(StyledLine *lines, size_t line_count, const char
             free(scratch);
             free(char_x);
             free(line_start);
-            fprintf(stderr, "შეცდომა: გლიფების მეტრიკისთვის მეხსიერება ვერ გამოიყო.\n");
+            fprintf(stderr, "error: could not allocate the glyph metrics.\n");
             return false;
         }
     }
 
-    /* --- ეტაპი 3: ხატვა ---------------------------------------------------- */
+    /* --- stage 3: draw ----------------------------------------------------- */
     cairo_surface_t *surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, tex_w, tex_h);
     if (cairo_surface_status(surface) != CAIRO_STATUS_SUCCESS) {
-        fprintf(stderr, "შეცდომა: cairo surface ვერ შეიქმნა (%dx%d).\n", tex_w, tex_h);
+        fprintf(stderr, "error: could not create a cairo surface (%dx%d).\n", tex_w, tex_h);
         cairo_surface_destroy(surface);
         free(scratch); free(char_x); free(line_start);
         return false;
@@ -570,7 +570,7 @@ static bool raster_styled_lines(StyledLine *lines, size_t line_count, const char
 
     cairo_t *cr = cairo_create(surface);
 
-    /* გამჭვირვალე ფონი: SOURCE ოპერატორი პირდაპირ *წერს* (და არა აზავებს) ნულებს. */
+    /* Transparent background: the SOURCE operator *writes* zeros rather than blending. */
     cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
     cairo_set_source_rgba(cr, 0, 0, 0, 0);
     cairo_paint(cr);
@@ -585,11 +585,11 @@ static bool raster_styled_lines(StyledLine *lines, size_t line_count, const char
     int    total_chars = 0;
 
     for (size_t i = 0; i < line_count; i++) {
-        /* Cairo ტექსტს BASELINE-ზე ხატავს, არა ზედა კიდეზე — ამიტომ +ascent. */
+        /* Cairo draws text on the BASELINE, not the top edge — hence +ascent. */
         double y = (double)padding + fe.ascent + line_height * (double)i;
         double x = origin_x;
 
-        /* სწორება: სტრიქონს ყველაზე განიერთან შედარებით ვწევთ. */
+        /* Alignment: shift the line relative to the widest one. */
         if (align > 0.0f) {
             cairo_text_extents_t le;
             cairo_text_extents(cr, lines[i].text, &le);
@@ -598,14 +598,14 @@ static bool raster_styled_lines(StyledLine *lines, size_t line_count, const char
 
         if (metrics != NULL) {
             line_start[i]   = (int)slot;
-            char_x[slot++]  = (float)x; /* სტრიქონის მარცხენა კიდე */
+            char_x[slot++]  = (float)x; /* the line's left edge */
         }
 
         const char *text = lines[i].text;
         size_t      blen = strlen(text);
 
         if (lines[i].tokens == NULL || lines[i].token_count == 0) {
-            /* ერთფეროვანი სტრიქონი. */
+            /* single-colour line. */
             cairo_set_source_rgba(cr, base_color.r / 255.0, base_color.g / 255.0,
                                       base_color.b / 255.0, base_color.a / 255.0);
             cairo_move_to(cr, x, y);
@@ -618,14 +618,14 @@ static bool raster_styled_lines(StyledLine *lines, size_t line_count, const char
                 total_chars += (int)n;
             }
         } else {
-            /* გაფერადებული ტოკენები — თითოეული თავისი ფერით, x-ს დაგროვებით. */
+            /* Highlighted tokens — each in its own colour, accumulating x. */
             for (size_t t = 0; t < lines[i].token_count; t++) {
                 const Token *tok = &lines[i].tokens[t];
                 if (tok->len == 0 || tok->start + tok->len > blen) {
                     continue;
                 }
 
-                /* ტოკენის ტექსტი დროებით NUL-ით უნდა დავხუროთ. */
+                /* The token's text must be NUL-terminated temporarily. */
                 char   piece_buf[512];
                 char  *piece = piece_buf;
                 bool   heap  = false;
@@ -672,13 +672,13 @@ static bool raster_styled_lines(StyledLine *lines, size_t line_count, const char
     free(scratch);
 
     if (status != CAIRO_STATUS_SUCCESS) {
-        fprintf(stderr, "შეცდომა (cairo): %s\n", cairo_status_to_string(status));
+        fprintf(stderr, "error (cairo): %s\n", cairo_status_to_string(status));
         cairo_surface_destroy(surface);
         free(char_x); free(line_start);
         return false;
     }
 
-    /* --- ეტაპი 4: packed RGBA-ში გადატანა --------------------------------- */
+    /* --- stage 4: repack into packed RGBA --------------------------------- */
     bool ok = surface_to_rgba(surface, out);
     cairo_surface_destroy(surface);
 
@@ -705,7 +705,7 @@ static bool raster_styled_lines(StyledLine *lines, size_t line_count, const char
 }
 
 /* ------------------------------------------------------------------------- */
-/* საჯარო: მარტივი ტექსტი                                                     */
+/* Public: plain text                                                         */
 /* ------------------------------------------------------------------------- */
 
 bool media_render_text_rgba(const char *utf8_text, const char *font_family, int font_size,
@@ -743,7 +743,7 @@ bool media_render_text_rgba(const char *utf8_text, const char *font_family, int 
         char **wrapped = wrap_lines(lines, &line_count, family, font_size,
                                     weight, slant, max_width);
         if (wrapped == NULL) {
-            return false; /* wrap_lines-მა ორიგინალი უკვე გაათავისუფლა */
+            return false; /* wrap_lines already freed the original */
         }
         lines = wrapped;
     }
@@ -771,7 +771,7 @@ bool media_render_text_widget(TextWidget *w)
         return false;
     }
 
-    /* padding-ს ფონტის ზომას ვუკავშირებთ, რომ დიდ ასოებს კიდეები არ მოეჭრას. */
+    /* Padding scales with the font size so large glyphs are not clipped. */
     int padding = w->size / 4 + 4;
 
     return media_render_text_rgba(w->content, w->font, w->size, w->color, w->line_spacing,
@@ -780,10 +780,10 @@ bool media_render_text_widget(TextWidget *w)
 }
 
 /* ------------------------------------------------------------------------- */
-/* საჯარო: კოდის ბლოკი (გაფერადებული გლიფები + ცალკე ფირფიტა)                 */
+/* Public: code block (highlighted glyphs + a separate panel)                 */
 /* ------------------------------------------------------------------------- */
 
-/* მომრგვალებული მართკუთხედის კონტური. */
+/* Path for a rounded rectangle. */
 static void rounded_rect_path(cairo_t *cr, double x, double y, double w, double h, double r)
 {
     const double kPi = 3.14159265358979323846;
@@ -832,12 +832,13 @@ static bool raster_plate(int w, int h, Color color, int radius, Texture *out)
 }
 
 /*
- * გეომეტრიული ფიგურის რასტერიზაცია.
+ * Rasterizing a geometric shape.
  *
- * განზრახ Cairo-თი და არა ცალკე კერნელით: ასე ფიგურას უფასოდ ერგება
- * ანტი-ალიასინგი და მომრგვალებული კუთხეები, ხოლო კომპოზიტორისთვის ის
- * ჩვეულებრივი ტექსტურაა — fade, move, scale, rotate და ეფექტები უცვლელად
- * მუშაობს. ფასი ერთი ტექსტურის VRAM-ია, რაც scrim-ისთვისაც კი მისაღებია.
+ * Deliberately via Cairo rather than a dedicated kernel: the shape gets
+ * antialiasing and rounded corners for free, and to the compositor it is just
+ * another texture — fade, move, scale, rotate and effects all work unchanged.
+ * The cost is one texture's worth of VRAM, acceptable even for a full-screen
+ * scrim.
  */
 bool media_render_shape_widget(ShapeWidget *w)
 {
@@ -852,7 +853,7 @@ bool media_render_shape_widget(ShapeWidget *w)
     if (ih < 1) ih = 1;
 
     if (iw > MAX_TEXTURE_DIM || ih > MAX_TEXTURE_DIM) {
-        fprintf(stderr, "შეცდომა: ფიგურა ძალიან დიდია (%dx%d).\n", iw, ih);
+        fprintf(stderr, "error: shape too large (%dx%d).\n", iw, ih);
         return false;
     }
 
@@ -872,7 +873,7 @@ bool media_render_shape_widget(ShapeWidget *w)
                               w->color.b / 255.0, w->color.a / 255.0);
 
     if (w->base.kind == WIDGET_CIRCLE) {
-        /* ელიფსი ვწერთ ერთეულოვან წრედ + მასშტაბით, რომ w != h-იც მუშაობდეს. */
+        /* An ellipse is a unit circle plus a scale, so w != h also works. */
         cairo_save(cr);
         cairo_translate(cr, iw / 2.0, ih / 2.0);
         cairo_scale(cr, iw / 2.0, ih / 2.0);
@@ -914,7 +915,7 @@ bool media_render_code_widget(CodeWidget *w)
         return false;
     }
 
-    /* ტოკენების ერთი ბრტყელი ბუფერი ყველა სტრიქონისთვის. */
+    /* One flat token buffer covering every line. */
     Language lang = w->highlight ? highlighter_language_from_name(w->language) : LANG_NONE;
 
     if (lang != LANG_NONE) {
@@ -925,8 +926,8 @@ bool media_render_code_widget(CodeWidget *w)
             return false;
         }
 
-        /* ლექსერი მდგომარეობას სტრიქონებს შორის ატარებს (ბლოკ-კომენტარები და
-         * სამმაგი ბრჭყალები რამდენიმე სტრიქონს ფარავს). */
+        /* The lexer carries state between lines (block comments and triple
+         * quotes span several of them). */
         HighlightState state;
         memset(&state, 0, sizeof state);
 
@@ -955,19 +956,19 @@ bool media_render_code_widget(CodeWidget *w)
         return false;
     }
 
-    /* ფირფიტა ზუსტად გლიფების ტექსტურის ზომისაა — ისინი ერთსა და იმავე
-     * წერტილში იხატება, ამიტომ დამატებითი გასწორება არ სჭირდება. */
+    /* The panel is exactly the glyph texture's size — both are drawn at the
+     * same point, so no extra alignment is needed. */
     if (w->bg.a > 0) {
         if (!raster_plate(w->base.tex.width, w->base.tex.height, w->bg, w->corner_radius,
                           &w->plate)) {
-            fprintf(stderr, "გაფრთხილება: ფირფიტა ვერ დაიხატა — ვაგრძელებთ მის გარეშე.\n");
+            fprintf(stderr, "warning: could not draw the panel — continuing without it.\n");
         }
     }
     return true;
 }
 
 /* ------------------------------------------------------------------------- */
-/* სურათები (stb_image)                                                       */
+/* Images (stb_image)                                                         */
 /* ------------------------------------------------------------------------- */
 
 bool media_load_image_rgba(const char *path, Texture *out)
@@ -978,10 +979,10 @@ bool media_load_image_rgba(const char *path, Texture *out)
     memset(out, 0, sizeof *out);
 
     int w = 0, h = 0, channels = 0;
-    /* 4 = ყოველთვის RGBA-ს დაგვიბრუნებს, წყაროს არხების რაოდენობის მიუხედავად. */
+    /* 4 = always give us RGBA, whatever the source's channel count. */
     stbi_uc *data = stbi_load(path, &w, &h, &channels, 4);
     if (data == NULL) {
-        fprintf(stderr, "შეცდომა: სურათი '%s' ვერ ჩაიტვირთა (%s).\n", path,
+        fprintf(stderr, "error: could not load image '%s' (%s).\n", path,
                 stbi_failure_reason());
         return false;
     }
@@ -992,9 +993,9 @@ bool media_load_image_rgba(const char *path, Texture *out)
     }
 
     /*
-     * stb_image straight (არა-premultiplied) alpha-ს გვაძლევს, ჩვენი კონვენცია კი
-     * premultiplied-ია → აქვე ვამრავლებთ. ასე კერნელს ერთი ერთიანი blend ფორმულა
-     * ჰყოფნის, ტექსტურის წარმომავლობის მიუხედავად.
+     * stb_image gives straight (non-premultiplied) alpha while our convention
+     * is premultiplied → multiply here. That way the kernel needs only one
+     * blend formula, whatever a texture's origin.
      */
     size_t pixel_count = (size_t)w * (size_t)h;
     for (size_t i = 0; i < pixel_count; i++) {
@@ -1010,7 +1011,7 @@ bool media_load_image_rgba(const char *path, Texture *out)
 }
 
 /* ------------------------------------------------------------------------- */
-/* Cache-ის შევსება                                                           */
+/* Filling the cache                                                          */
 /* ------------------------------------------------------------------------- */
 
 bool media_prepare_textures(EditorContext *ctx)
@@ -1023,7 +1024,7 @@ bool media_prepare_textures(EditorContext *ctx)
         WidgetBase *b  = ctx->widgets[i];
         bool        ok = false;
 
-        /* base ყოველი ვიჯეტის პირველი ველია → ეს დაყვანები უსაფრთხოა. */
+        /* base is every widget's first field → these casts are safe. */
         switch (b->kind) {
             case WIDGET_TEXT:
                 ok = media_render_text_widget((TextWidget *)b);
@@ -1041,25 +1042,25 @@ bool media_prepare_textures(EditorContext *ctx)
                 ok = media_render_shape_widget((ShapeWidget *)b);
                 break;
             default:
-                fprintf(stderr, "გაფრთხილება: '%s' — უცნობი ტიპი, გამოტოვებულია.\n",
+                fprintf(stderr, "warning: '%s' — unknown type, skipped.\n",
                         b->id ? b->id : "(null)");
                 continue;
         }
 
         if (!ok) {
-            fprintf(stderr, "შეცდომა: '%s'-ის რასტერიზაცია ჩავარდა.\n",
+            fprintf(stderr, "error: rasterizing '%s' failed.\n",
                     b->id ? b->id : "(null)");
             return false;
         }
 
-        /* --- საბაზისო (scale=1) ზომა --------------------------------------- */
+        /* --- base size (scale = 1) ----------------------------------------- */
         b->base_w = (float)b->tex.width;
         b->base_h = (float)b->tex.height;
 
         if (b->kind == WIDGET_IMAGE) {
             const ImageWidget *iw = (const ImageWidget *)b;
 
-            /* მითითებული ზომა; თუ ერთი ღერძია მოცემული, მეორე პროპორციულად. */
+            /* Requested size; if only one axis is given, keep the aspect. */
             if (iw->request_w > 0 && iw->request_h > 0) {
                 b->base_w = (float)iw->request_w;
                 b->base_h = (float)iw->request_h;
@@ -1073,10 +1074,10 @@ bool media_prepare_textures(EditorContext *ctx)
         }
 
         /*
-         * --- განლაგების გადაწყვეტა -------------------------------------
+         * --- resolving the layout --------------------------------------
          *
-         * მხოლოდ აქ ვიცით ობიექტის ზომა, ამიტომ სწორედ ახლა ითარგმნება
-         * "center" / "bottom-160" / anchor პიქსელებში.
+         * Only here is the object's size known, so this is where
+         * "center" / "bottom-160" / anchors become pixels.
          */
         if (b->auto_center_x) {
             b->x = ((float)ctx->config.width - b->base_w) * 0.5f;
@@ -1091,7 +1092,7 @@ bool media_prepare_textures(EditorContext *ctx)
                     b->anchor_x = def_anchor;
                 }
             } else {
-                fprintf(stderr, "გაფრთხილება: '%s' — გაუგებარი x '%s'.\n",
+                fprintf(stderr, "warning: '%s' — unparsable x '%s'.\n",
                         b->id ? b->id : "(null)", b->x_expr);
             }
         }
@@ -1105,12 +1106,12 @@ bool media_prepare_textures(EditorContext *ctx)
                     b->anchor_y = def_anchor;
                 }
             } else {
-                fprintf(stderr, "გაფრთხილება: '%s' — გაუგებარი y '%s'.\n",
+                fprintf(stderr, "warning: '%s' — unparsable y '%s'.\n",
                         b->id ? b->id : "(null)", b->y_expr);
             }
         }
 
-        /* auto-center უკვე საბოლოო კოორდინატს იძლევა — მას მიმაგრება არ ეხება. */
+        /* auto-center already yields a final coordinate — anchoring skips it. */
         b->anchor_off_x = b->auto_center_x ? 0.0f : b->anchor_x * b->base_w;
         b->anchor_off_y = b->anchor_y * b->base_h;
     }

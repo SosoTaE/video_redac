@@ -57,9 +57,11 @@ Reports, per scene where relevant:
 ## Build
 
 ```bash
-make            # build
+make            # build (CUDA + NVENC)
+make CPU=1      # build the CPU backend — no CUDA toolkit or GPU required
 make run        # build + render showcase.json into out/
 make debug      # ASAN/UBSAN build with -G device code
+make sanitize   # CPU build under ASAN/UBSAN — covers the whole pixel pipeline
 make info       # environment diagnostics
 make clean      # remove objects and binary
 make distclean  # also remove out/
@@ -68,6 +70,15 @@ make distclean  # also remove out/
 `.c` files go through `gcc` (C11), `.cu` through `nvcc`, and linking is done by
 `nvcc` so it can add the CUDA runtime and perform device linking. Header
 dependencies are tracked with `-MMD -MP`.
+
+### Choosing a backend
+
+`src/renderer.cu` and `src/renderer_cpu.c` define the same three symbols, so
+exactly one is compiled — the Makefile filters the other out of the wildcard.
+`CPU=1` also switches the linker to plain `gcc`, drops `-L$(CUDA_HOME)/lib64`
+and adds `-fopenmp`; nothing in that path refers to CUDA, which is the point.
+
+Details and the shared-code layout: [09-backends.md](09-backends.md).
 
 ### GPU architecture
 
@@ -111,13 +122,28 @@ make debug GENCODE="-arch=sm_120"
 ASAN_OPTIONS=detect_leaks=1 ./video_redac project.json --check
 ```
 
-> **ASAN cannot be combined with a real render.** The CUDA runtime fails at the
-> very first call (`cudaGetDeviceCount` → out of memory) because ASAN's shadow
-> mapping collides with CUDA's address-space requirements. This is a documented
-> incompatibility, not a defect in this project — NVIDIA recommends
-> `compute-sanitizer` for device code.
+> **ASAN cannot be combined with a real render — in the CUDA build.** The CUDA
+> runtime fails at the very first call (`cudaGetDeviceCount` → out of memory)
+> because ASAN's shadow mapping collides with CUDA's address-space
+> requirements. This is a documented incompatibility, not a defect in this
+> project — NVIDIA recommends `compute-sanitizer` for device code.
 >
 > Use `--check` or `--dry-run`, which never touch CUDA.
+
+### Whole-pipeline — `make sanitize`
+
+The restriction above is a property of the CUDA runtime, not of the renderer. The
+CPU backend has no CUDA runtime, so it can be sanitized while actually rendering:
+
+```bash
+make sanitize
+ASAN_OPTIONS=detect_leaks=1 ./video_redac showcase.json --range 0:1
+```
+
+This is the only way to get ASAN/UBSAN over the compositor, the effect stack and
+the NV12 conversion — code that in the CUDA build is reachable only through
+kernels. Since both backends share `pixel_ops.h`, a bug found here is a bug in
+the kernels too.
 
 `media_shutdown()` releases Cairo/fontconfig's global font caches so LSAN's
 report stays empty and genuine leaks remain visible.

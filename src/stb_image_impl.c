@@ -1,10 +1,10 @@
 /*
- * stb_image_impl.c — stb_image-ის ერთადერთი translation unit.
+ * stb_image_impl.c — the single translation unit for stb_image.
  *
- * header-only ბიბლიოთეკის იმპლემენტაცია ცალკე ფაილშია გატანილი ორი მიზეზით:
- *   1. ის ერთხელ კომპილირდება და აღარ ანელებს media_loader.c-ის ბილდს;
- *   2. მისი (მრავალრიცხოვანი) warning-ები აქვე იხშობა და პროექტის საკუთარ
- *      -Wall -Wextra-ს არ ჩრდილავს.
+ * The header-only library's implementation is isolated here for two reasons:
+ *   1. it compiles once and no longer slows down media_loader.c;
+ *   2. its (numerous) warnings are silenced here instead of drowning out the
+ *      project's own -Wall -Wextra.
  */
 
 #pragma GCC diagnostic push
@@ -15,7 +15,7 @@
 
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_NO_STDIO_WARNING
-/* გამორთული ფორმატები — ვამცირებთ ბინარის ზომას და attack surface-ს. */
+/* Disabled formats — smaller binary and a smaller attack surface. */
 #define STBI_NO_PSD
 #define STBI_NO_PIC
 #define STBI_NO_PNM

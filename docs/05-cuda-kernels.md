@@ -1,10 +1,20 @@
 # CUDA kernels
 
-Nine `__global__` kernels plus device helpers, all in `src/renderer.cu`.
+Nine `__global__` kernels in `src/renderer.cu`.
 
 Launch geometry is 16×16 threads (256 per block) throughout: a multiple of the
 warp size, and neighbouring threads touch neighbouring pixels, so writes
 coalesce into full rows.
+
+> **Where the maths actually lives.** The kernels are thin wrappers. Every
+> per-pixel function they call is in `include/pixel_ops.h`, which compiles both
+> as `__device__` code here and as ordinary C in the CPU backend — one
+> implementation, two drivers. A kernel does only what is genuinely CUDA's job:
+> map a thread to a pixel, bounds-check it, and call the shared function. See
+> [09-backends.md](09-backends.md).
+>
+> So `k_fx_blur` below *is* the launch geometry; the tap loop it describes is
+> `vr_px_fx_blur`.
 
 ---
 

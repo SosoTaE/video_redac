@@ -1,16 +1,16 @@
 /*
- * effects.c — ეფექტების სახელების ცხრილი და სიცოცხლის ციკლი.
+ * effects.c — the effect name table and lifetime management.
  *
- * თავად პიქსელების მათემატიკა renderer.cu-შია (კერნელებში); აქ მხოლოდ ის
- * host-მხრივი ნაწილია, რომელსაც CUDA არ სჭირდება.
+ * The pixel maths itself lives in renderer.cu (in the kernels); this file holds
+ * only the host-side part that needs no CUDA.
  */
 
 #include "effects.h"
 
 #include <string.h>
 
-/* რეგისტრისა და გამყოფების მიმართ ტოლერანტული შედარება: "rgb_split",
- * "rgbSplit" და "RGB-SPLIT" ერთი და იგივეა. */
+/* Comparison that tolerates case and separators: "rgb_split", "rgbSplit" and
+ * "RGB-SPLIT" are all the same name. */
 static bool loose_equal(const char *a, const char *b)
 {
     while (*a && *b) {

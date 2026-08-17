@@ -1,9 +1,9 @@
 /*
- * layout.c — პოზიციის გამოსახულებების გამომთვლელი.
+ * layout.c — evaluator for position expressions.
  *
- * მიზანმიმართულად პატარა რეკურსიის გარეშე პარსერია: გამოსახულებები მოკლეა
- * ("bottom-160", "50%+40") და სრული გამოთვლითი ენა აქ მხოლოდ ხარვეზების
- * წყარო იქნებოდა.
+ * A deliberately small, non-recursive parser: the expressions are short
+ * ("bottom-160", "50%+40") and a full expression language here would only be a
+ * source of bugs.
  */
 
 #include "layout.h"
@@ -13,7 +13,7 @@
 #include <string.h>
 
 /* ------------------------------------------------------------------------- */
-/* მიმაგრების სახელები                                                        */
+/* Anchor names                                                               */
 /* ------------------------------------------------------------------------- */
 
 bool layout_anchor_from_name(const char *name, float *out_ax, float *out_ay)
@@ -22,7 +22,7 @@ bool layout_anchor_from_name(const char *name, float *out_ax, float *out_ay)
         return false;
     }
 
-    /* 9 წერტილი, როგორც გრაფიკულ რედაქტორებში. */
+    /* The nine points, as in a graphics editor. */
     static const struct {
         const char *name;
         float       ax, ay;
@@ -36,7 +36,7 @@ bool layout_anchor_from_name(const char *name, float *out_ax, float *out_ay)
     for (size_t i = 0; i < sizeof kAnchors / sizeof kAnchors[0]; i++) {
         const char *a = name, *b = kAnchors[i].name;
         while (*a && *b) {
-            /* '-', '_' და ხარეები იგნორირდება: "bottom-right" == "bottomright" */
+            /* '-', '_' and spaces are ignored: "bottom-right" == "bottomright" */
             while (*a == '-' || *a == '_' || *a == ' ') a++;
             int ca = (*a >= 'A' && *a <= 'Z') ? *a + 32 : *a;
             if (ca != *b) break;
@@ -53,10 +53,10 @@ bool layout_anchor_from_name(const char *name, float *out_ax, float *out_ay)
 }
 
 /* ------------------------------------------------------------------------- */
-/* გამოსახულების გამოთვლა                                                     */
+/* Expression evaluation                                                      */
 /* ------------------------------------------------------------------------- */
 
-/* ერთი "term"-ის წაკითხვა. აბრუნებს false-ს, თუ ვერაფერი ამოიცნო. */
+/* Reads one "term". Returns false if nothing could be recognised. */
 static bool read_term(const char **p, float canvas, LayoutAxis axis,
                       float *out_value, float *out_anchor, bool *out_has_anchor)
 {
@@ -65,7 +65,7 @@ static bool read_term(const char **p, float canvas, LayoutAxis axis,
         s++;
     }
 
-    /* --- საკვანძო სიტყვა --- */
+    /* --- keyword --- */
     if (isalpha((unsigned char)*s)) {
         const char *start = s;
         while (isalpha((unsigned char)*s)) {
@@ -99,9 +99,9 @@ static bool read_term(const char **p, float canvas, LayoutAxis axis,
 
         *out_value = canvas * frac;
 
-        /* პირველი საკვანძო სიტყვა კარნახობს ნაგულისხმევ მიმაგრებას:
-         * "bottom-160" ბუნებრივად ნიშნავს "ქვედა კიდიდან 160px", ანუ ობიექტის
-         * ქვედა კიდე უნდა აითვალოს და არა ზედა. */
+        /* The first keyword dictates the default anchor: "bottom-160"
+         * naturally means "160 px above the bottom edge", i.e. the object's
+         * bottom edge is what gets measured, not its top. */
         if (!*out_has_anchor) {
             *out_anchor     = frac;
             *out_has_anchor = true;
@@ -111,7 +111,7 @@ static bool read_term(const char **p, float canvas, LayoutAxis axis,
         return true;
     }
 
-    /* --- რიცხვი, შესაძლოა პროცენტით --- */
+    /* --- a number, possibly a percentage --- */
     char  *end = NULL;
     double v   = strtod(s, &end);
     if (end == s) {
@@ -158,7 +158,7 @@ bool layout_eval(const char *expr, float canvas, LayoutAxis axis,
             break;
         }
         if (*p != '+' && *p != '-') {
-            return false; /* უცნობი სიმბოლო */
+            return false; /* unexpected character */
         }
 
         float sign = (*p == '+') ? 1.0f : -1.0f;

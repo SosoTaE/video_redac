@@ -1,9 +1,9 @@
 /*
- * anim.c — easing-ის მრუდები და keyframe track-ების შერჩევა.
+ * anim.c — easing curves and keyframe track sampling.
  *
- * ყველა მრუდი განსაზღვრულია [0,1] → ℝ. back/elastic/bounce განზრახ გამოდის
- * [0,1] დიაპაზონიდან — სწორედ ეს გადაჭარბება ქმნის "ცოცხალი" მოძრაობის
- * შეგრძნებას, რომელსაც წრფივი ინტერპოლაცია ვერ იძლევა.
+ * Every curve is defined as [0,1] → ℝ. back/elastic/bounce deliberately leave
+ * the [0,1] range — that overshoot is exactly what makes motion feel alive,
+ * which linear interpolation cannot do.
  */
 
 #include "anim.h"
@@ -13,7 +13,7 @@
 #include <string.h>
 
 /* ------------------------------------------------------------------------- */
-/* სახელების ცხრილი                                                           */
+/* Name table                                                                 */
 /* ------------------------------------------------------------------------- */
 
 static const struct {
@@ -40,9 +40,9 @@ static const struct {
 };
 
 /*
- * შედარება, რომელიც უგულებელყოფს რეგისტრს, '_'-ს, '-'-ს და ხარეებს.
- * ასე "easeInOut", "ease_in_out" და "easeinout" ერთი და იგივეა — JSON-ის
- * ავტორს არ უნდა ახსოვდეს ჩვენი მართლწერა.
+ * Comparison that ignores case, '_', '-' and spaces, so "easeInOut",
+ * "ease_in_out" and "easeinout" are the same name — the JSON author should not
+ * have to remember our spelling.
  */
 static bool loose_equal(const char *a, const char *b)
 {
@@ -90,7 +90,7 @@ const char *easing_name(EaseType e)
 }
 
 /* ------------------------------------------------------------------------- */
-/* მრუდები                                                                    */
+/* Curves                                                                     */
 /* ------------------------------------------------------------------------- */
 
 static float clamp01(float p)
@@ -98,7 +98,7 @@ static float clamp01(float p)
     return (p < 0.0f) ? 0.0f : (p > 1.0f) ? 1.0f : p;
 }
 
-/* bounce — გეომეტრიული პროგრესიით მცირდება ხტუნვის სიმაღლე. */
+/* bounce — each hop's height shrinks in a geometric progression. */
 static float bounce_out(float p)
 {
     const float n = 7.5625f;
@@ -121,7 +121,7 @@ float easing_apply(EaseType e, float p)
 {
     p = clamp01(p);
 
-    /* back-ის სტანდარტული ზედმეტობის კოეფიციენტი (≈10% გადაჭარბება). */
+    /* The standard back overshoot constant (≈10% past the target). */
     const float c1 = 1.70158f;
     const float c2 = c1 * 1.525f;
     const float c3 = c1 + 1.0f;
@@ -218,8 +218,8 @@ float track_sample(const Track *tr, float t)
     }
 
     /*
-     * წრფივი ძებნა: საკვანძო კადრები ერთეულებია (ტიპურად 2-5), ამიტომ ორობითი
-     * ძებნა აქ მხოლოდ კოდს ართულებდა და არაფერს მოიგებდა.
+     * Linear search: tracks hold a handful of keys (typically 2–5), so a
+     * binary search would only complicate the code and win nothing.
      */
     int i = 0;
     while (i + 1 < tr->count && tr->keys[i + 1].t <= t) {
@@ -231,10 +231,10 @@ float track_sample(const Track *tr, float t)
 
     float span = b->t - a->t;
     if (span <= 0.0f) {
-        return b->v; /* დამთხვეული ან შებრუნებული გასაღებები — ვიღებთ მეორეს */
+        return b->v; /* coincident or reversed keys — take the second */
     }
 
-    /* easing ეკუთვნის იმ გასაღებს, რომლისკენაც მივდივართ (b). */
+    /* Easing belongs to the key we are moving toward (b). */
     float p = easing_apply(b->ease, (t - a->t) / span);
     return a->v + (b->v - a->v) * p;
 }

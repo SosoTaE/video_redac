@@ -1,0 +1,167 @@
+#ifndef VIDEO_REDAC_RENDER_COMMON_H
+#define VIDEO_REDAC_RENDER_COMMON_H
+
+/*
+ * render_common.h — the backend-independent half of the renderer.
+ *
+ * Everything here is pure host computation: sampling the timeline, packing
+ * effect parameters, deriving transition matrices, choosing which scenes are
+ * on screen, and starting ffmpeg. None of it knows whether the pixels will
+ * ultimately be pushed by CUDA or by a loop over rows.
+ *
+ * Together with pixel_ops.h this is what makes two backends affordable. The
+ * split is:
+ *
+ *   pixel_ops.h      what to compute for one pixel   (shared, compiled twice)
+ *   render_common.c  what to compute for one frame   (shared, compiled once)
+ *   renderer.cu      how to get the GPU to do it     (backend)
+ *   renderer_cpu.c   how to get the CPU to do it     (backend)
+ *
+ * A backend should contain allocation, scheduling and the pixel loop — nothing
+ * that decides what a frame *looks* like. If you find yourself computing a
+ * position, an opacity or a matrix inside a backend, it belongs here instead.
+ */
+
+#include "effects.h"
+#include "pixel_ops.h"
+#include "types.h"
+
+#include <stdio.h>
+#include <time.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* ------------------------------------------------------------------------- */
+/* Small helpers                                                              */
+/* ------------------------------------------------------------------------- */
+
+float  vr_clampf(float v, float lo, float hi);
+double vr_seconds_since(const struct timespec *start);
+
+/* ------------------------------------------------------------------------- */
+/* Timeline                                                                   */
+/* ------------------------------------------------------------------------- */
+
+/*
+ * Fills `rt[]` for every widget in `scene` at scene-local time `local_ms`.
+ *
+ * Pure: the result depends only on the timeline and the timestamp, never on
+ * the previous frame — which is what lets any frame be rendered on its own
+ * (seek, preview, --range, or a parallel backend).
+ *
+ * `rt` must have room for scene->widget_count entries.
+ */
+void vr_evaluate_scene(const EditorContext *ctx, const Scene *scene,
+                       WidgetRuntime *rt, int local_ms);
+
+/*
+ * Typewriter cutoffs: `reveal` (0..1) → one x threshold per line.
+ * `out` must have room for g->line_count floats.
+ */
+void vr_compute_reveal_cutoffs(const GlyphMetrics *g, float reveal, float *out);
+
+/* ------------------------------------------------------------------------- */
+/* Scene selection                                                            */
+/* ------------------------------------------------------------------------- */
+
+/*
+ * Which scene — or which pair, mid-transition — is visible at `time_ms`.
+ *
+ * `*out_b` is NULL when a single scene covers the moment; otherwise `*out_p` is
+ * the transition's progress in 0..1 and `*out_index` identifies the transition
+ * between the two.
+ */
+void vr_select_scenes(const EditorContext *ctx, int time_ms,
+                      size_t *out_index, const Scene **out_a, const Scene **out_b,
+                      float *out_p);
+
+/* ------------------------------------------------------------------------- */
+/* Compositing geometry                                                       */
+/* ------------------------------------------------------------------------- */
+
+/*
+ * Derives the compositing parameters for one layer: the inverse matrix, the
+ * destination centre and the screen-clipped bounding box.
+ *
+ * Returns false when there is nothing to draw (degenerate size, or entirely
+ * off-screen) — the caller should then skip the layer entirely.
+ */
+bool vr_composite_setup(int fb_w, int fb_h, int tex_w, int tex_h,
+                        const WidgetBase *b, const WidgetRuntime *rt,
+                        CompositeParams *out);
+
+/* ------------------------------------------------------------------------- */
+/* Effects                                                                    */
+/* ------------------------------------------------------------------------- */
+
+/* Samples an effect's Tracks at time `t` and packs them into a plain POD. */
+EffectGPU vr_effect_sample(const Effect *fx, float t);
+
+/*
+ * The per-frame seed for grain and glitch. Tied to the frame index, so the
+ * animation moves while any single frame stays reproducible.
+ */
+unsigned int vr_effect_seed(long long frame);
+
+/* The blur radius actually used for an effect, or 0 to skip the pass.
+ * Capped so neither backend can be handed an unbounded tap count. */
+int vr_blur_radius(const EffectGPU *g);
+
+/* ------------------------------------------------------------------------- */
+/* Transitions                                                                */
+/* ------------------------------------------------------------------------- */
+
+/* Builds one side's inverse matrix from translation / scale / rotation. */
+void vr_trans_side_set(TransSide *s, float opacity, float tx, float ty,
+                       float scale, float rot_deg, int w, int h);
+
+/* The preset's parameters at progress `p`. */
+void vr_transition_preset(TransitionType type, float p, int w, int h,
+                          TransSide *from, TransSide *to);
+
+/* The JSON's `from`/`to` tracks and masks override the preset. */
+void vr_transition_apply_inline(const Transition *tr, float p, int w, int h,
+                                TransSide *from, TransSide *to);
+
+/* ------------------------------------------------------------------------- */
+/* Output                                                                     */
+/* ------------------------------------------------------------------------- */
+
+/*
+ * The software equivalent of a hardware encoder ("h264_nvenc" → "libx264"),
+ * or NULL if the name is not a hardware encoder in the first place.
+ */
+const char *vr_software_encoder(const char *encoder);
+
+/*
+ * Starts ffmpeg as a subprocess and returns its stdin.
+ *
+ * `default_encoder` is what the backend would like to use when neither the
+ * environment nor the project names one — "h264_nvenc" for CUDA, "libx264" for
+ * the CPU. The precedence is: $VIDEO_REDAC_ENCODER > the JSON "output" block >
+ * this default.
+ *
+ * `allow_hardware` false makes a project's NVENC request fall back to the
+ * software equivalent, with a warning. The CPU backend passes false because the
+ * machine it exists for may well have no NVIDIA GPU — and a project file that
+ * says "h264_nvenc" should still render there rather than dying inside ffmpeg.
+ * $VIDEO_REDAC_ENCODER is never overridden: naming an encoder explicitly is
+ * taken as knowing what you are asking for.
+ */
+FILE *vr_open_ffmpeg_pipe(const EditorContext *ctx, const char *output_file,
+                          const char *default_encoder, bool allow_hardware);
+
+/*
+ * The frame range to render: [*out_first, *out_last], plus the timeline's full
+ * length in *out_total. Honours ctx->range_start_sec / range_end_sec.
+ */
+void vr_frame_range(const EditorContext *ctx, long long *out_first,
+                    long long *out_last, long long *out_total);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* VIDEO_REDAC_RENDER_COMMON_H */

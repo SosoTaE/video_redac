@@ -1,8 +1,8 @@
 /*
- * arena.c — bump-allocator-ის იმპლემენტაცია.
+ * arena.c — the bump allocator's implementation.
  *
- * მთელი ლოგიკა ორ ხაზში ჯდება: `used`-ს ვასწორებთ align-ზე და ვზრდით.
- * სირთულე მხოლოდ overflow-ის სწორად შემოწმებაშია.
+ * The whole idea fits in two lines: align `used`, then bump it. The only
+ * subtlety is checking for overflow correctly.
  */
 
 #include "arena.h"
@@ -10,7 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* გავასწოროთ `n` ზემოთ `align`-ის ჯერადამდე. align — 2-ის ხარისხი. */
+/* Round `n` up to a multiple of `align`, which must be a power of two. */
 static size_t align_up(size_t n, size_t align)
 {
     return (n + (align - 1)) & ~(align - 1);
@@ -29,7 +29,7 @@ bool arena_init(Arena *a, size_t capacity)
 
     a->base = (uint8_t *)malloc(capacity);
     if (a->base == NULL) {
-        /* ველებს მაინც ვასუფთავებთ, რომ arena_destroy() უსაფრთხო იყოს. */
+        /* Still clear the fields so arena_destroy() stays safe. */
         a->capacity = a->used = a->peak = 0;
         a->owns_base = false;
         return false;
@@ -51,7 +51,7 @@ void arena_init_from_buffer(Arena *a, void *buffer, size_t capacity)
     a->capacity  = (buffer != NULL) ? capacity : 0;
     a->used      = 0;
     a->peak      = 0;
-    a->owns_base = false; /* ბუფერი სხვისია — არ გავათავისუფლოთ */
+    a->owns_base = false; /* the buffer belongs to someone else — never free it */
 }
 
 void *arena_alloc(Arena *a, size_t size, size_t align)
@@ -66,10 +66,10 @@ void *arena_alloc(Arena *a, size_t size, size_t align)
     size_t offset = align_up(a->used, align);
 
     /*
-     * Overflow-ის ორმაგი შემოწმება:
-     *   1. align_up-მა შეიძლება გადაატრიალოს, თუ used უზარმაზარია → offset < used;
-     *   2. offset + size შეიძლება გადაატრიალოს → ამას იძლევა capacity - offset.
-     * ორივე შემთხვევაში უსაფრთხოდ ვბრუნდებით NULL-ით.
+     * Two overflow checks, both necessary:
+     *   1. align_up can wrap if `used` is enormous → offset < used;
+     *   2. offset + size can wrap → hence the `capacity - offset` form.
+     * Either way we return NULL safely.
      */
     if (offset < a->used || offset > a->capacity) {
         return NULL;
@@ -98,7 +98,7 @@ void *arena_alloc_zero(Arena *a, size_t size, size_t align)
 void arena_reset(Arena *a)
 {
     if (a != NULL) {
-        a->used = 0; /* სულ ესაა — არავითარი free() ციკლი */
+        a->used = 0; /* that is all — no free() loop */
     }
 }
 
@@ -111,7 +111,7 @@ ArenaMarker arena_mark(const Arena *a)
 
 void arena_release(Arena *a, ArenaMarker m)
 {
-    /* არასოდეს "გავზარდოთ" used უკან-დაბრუნებისას — ეს ლოგიკის შეცდომას ნიშნავს. */
+    /* Never *grow* used while rolling back — that would mean a logic error. */
     if (a != NULL && m.used <= a->used) {
         a->used = m.used;
     }

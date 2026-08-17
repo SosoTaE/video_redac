@@ -1,7 +1,8 @@
 # Host-side modules
 
-Every function outside `renderer.cu`. Kernels are in
-[05-cuda-kernels.md](05-cuda-kernels.md).
+Every function outside the rendering backends. Kernels are in
+[05-cuda-kernels.md](05-cuda-kernels.md), the backends themselves and the code
+they share in [09-backends.md](09-backends.md).
 
 Signatures are abbreviated; `static` marks a file-local helper.
 

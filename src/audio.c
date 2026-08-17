@@ -1,16 +1,15 @@
 /*
- * audio.c — ფონოგრამის აწყობა და ვიდეოსთან შეერთება (ffmpeg-ის მეორე გავლა).
+ * audio.c — building the soundtrack and muxing it (ffmpeg's second pass).
  *
- * ყოველი ბილიკი ერთ filter_complex-ის ჯაჭვად იქცევა:
+ * Every track becomes one filter_complex chain:
  *
  *   [N:a] aresample → aformat → atrim → volume → afade(in) → afade(out) → adelay
  *
- * რიგი მნიშვნელოვანია: ჯერ ვჭრით, მერე ვაძლიერებთ, მერე ვამკრთალებთ და
- * მხოლოდ ბოლოს ვანაცვლებთ ტაიმლაინზე. საპირისპირო თანმიმდევრობისას fade-ები
- * არასწორ ადგილას მოხვდებოდა.
+ * The order matters: trim first, then gain, then the fades, and only then
+ * position on the timeline. Any other order puts the fades in the wrong place.
  *
- * ბოლოს ყველა ჯაჭვი `amix`-ით ჯამდება და `alimiter`-ში გაივლის, რომ
- * გადამფარავმა კლიპებმა ციფრული კლიპინგი არ მოგვცეს.
+ * Finally every chain is summed with `amix` and passed through `alimiter`, so
+ * overlapping clips cannot clip digitally.
  */
 
 #include "audio.h"
@@ -20,19 +19,19 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* საერთო ფორმატი მიქსამდე — სხვადასხვა წყაროს განსხვავებული სიხშირე/არხები
- * amix-ს დაბნევდა, ამიტომ ყველას ერთნაირად მოვიყვანთ. */
+/* A common format before mixing — differing rates and channel layouts would
+ * confuse amix, so every source is normalised first. */
 #define AUDIO_RATE   "48000"
 #define AUDIO_LAYOUT "stereo"
 
 /* ------------------------------------------------------------------------- */
-/* shell-ის ციტირება                                                          */
+/* Shell quoting                                                              */
 /* ------------------------------------------------------------------------- */
 
 /*
- * ერთმაგი ბრჭყალები shell-ში *ყველაფერს* სიტყვასიტყვით ტოვებს; ერთადერთი
- * გამონაკლისი თავად ' არის, რომელსაც კლასიკური '\'' ხრიკით ვხურავთ.
- * ასე გამორიცხულია ბრძანების ინექცია ფაილის სახელით.
+ * Single quotes make the shell take *everything* literally; the only
+ * exception is ' itself, closed with the classic '\'' trick.
+ * That rules out command injection through a file name.
  */
 bool vr_shell_quote(const char *in, char *out, size_t out_size)
 {
@@ -70,8 +69,8 @@ char *audio_make_silent_path(const char *output_file)
     const char *dot   = strrchr(output_file, '.');
     const char *slash = strrchr(output_file, '/');
 
-    /* წერტილი გაფართოებად ითვლება მხოლოდ თუ ბოლო '/'-ის შემდეგაა
-     * (თორემ "./out" ან "a.b/out" აგვერეოდა). */
+    /* A dot counts as an extension only if it comes after the last '/'
+     * (otherwise "./out" or "a.b/out" would confuse us). */
     if (dot != NULL && slash != NULL && dot < slash) {
         dot = NULL;
     }
@@ -93,7 +92,7 @@ char *audio_make_silent_path(const char *output_file)
 }
 
 /* ------------------------------------------------------------------------- */
-/* დინამიური სტრიქონი (filter_complex შეიძლება ძალიან გრძელი გახდეს)          */
+/* A growable string (filter_complex can get very long)                       */
 /* ------------------------------------------------------------------------- */
 
 typedef struct {
@@ -151,15 +150,15 @@ static void sb_addf(StrBuf *sb, const char *fmt, ...)
 }
 
 /* ------------------------------------------------------------------------- */
-/* წყაროს ხანგრძლივობის დადგენა                                               */
+/* Determining the source's duration                                          */
 /* ------------------------------------------------------------------------- */
 
 /*
- * ffprobe-ს ვეკითხებით ფაილის სიგრძეს.
+ * Asks ffprobe how long the file is.
  *
- * ეს მხოლოდ fade_out-ის სწორად განსათავსებლადაა საჭირო: მისი დაწყების დრო
- * კლიპის *ბოლოდან* ითვლება, ანუ სიგრძის ცოდნის გარეშე ვერ დაითვლება.
- * ჩავარდნისას ვაბრუნებთ 0-ს და გამომძახებელი გონივრულ ვარაუდზე გადადის.
+ * This is needed only to place fade_out correctly: its start is measured from
+ * the clip's *end*, so it cannot be computed without knowing the length.
+ * On failure we return 0 and the caller falls back to a sensible guess.
  */
 static float probe_duration(const char *path)
 {
@@ -192,7 +191,7 @@ static float probe_duration(const char *path)
 }
 
 /* ------------------------------------------------------------------------- */
-/* მიქსი                                                                      */
+/* Mixing                                                                     */
 /* ------------------------------------------------------------------------- */
 
 bool audio_mux(const EditorContext *ctx, const char *silent_video, const char *output_file)
@@ -207,7 +206,7 @@ bool audio_mux(const EditorContext *ctx, const char *silent_video, const char *o
     StrBuf filter;  memset(&filter, 0, sizeof filter);
     StrBuf mixmap;  memset(&mixmap, 0, sizeof mixmap);
 
-    int used = 0; /* რამდენი ბილიკი შევიდა რეალურად */
+    int used = 0; /* how many tracks actually made it in */
 
     for (size_t i = 0; i < ctx->audio_count; i++) {
         const AudioTrack *t = &ctx->audio[i];
@@ -217,32 +216,32 @@ bool audio_mux(const EditorContext *ctx, const char *silent_video, const char *o
 
         float avail = video_dur - t->start;
         if (avail <= 0.01f) {
-            fprintf(stderr, "გაფრთხილება: ხმა '%s' ვიდეოს ბოლოს მიღმა იწყება — გამოტოვებულია.\n",
+            fprintf(stderr, "warning: audio '%s' starts past the end of the video — skipped.\n",
                     t->path);
             continue;
         }
 
-        /* რამდენ ხანს უნდა ჟღერდეს. */
+        /* How long it should sound. */
         float dur;
         if (t->duration > 0.0f) {
             dur = t->duration;
         } else if (t->loop) {
-            dur = avail;             /* ციკლი ვიდეოს ბოლომდე */
+            dur = avail;             /* loop to the end of the video */
         } else {
             float src = probe_duration(t->path) - t->in;
             dur = (src > 0.0f) ? src : avail;
         }
         if (dur > avail) {
-            dur = avail;             /* ვიდეოს მიღმა არ გავიდეთ */
+            dur = avail;             /* never run past the video */
         }
 
         char quoted[2048];
         if (!vr_shell_quote(t->path, quoted, sizeof quoted)) {
-            fprintf(stderr, "გაფრთხილება: ხმის გზა ძალიან გრძელია — გამოტოვებულია.\n");
+            fprintf(stderr, "warning: audio path too long — skipped.\n");
             continue;
         }
 
-        /* --- შემავალი ნაკადის პარამეტრები (მკაცრად -i-მდე) --- */
+        /* --- input stream options (strictly before -i) --- */
         if (t->loop) {
             sb_addf(&inputs, "-stream_loop -1 ");
         }
@@ -251,8 +250,8 @@ bool audio_mux(const EditorContext *ctx, const char *silent_video, const char *o
         }
         sb_addf(&inputs, "-i %s ", quoted);
 
-        /* --- ფილტრების ჯაჭვი --- */
-        int ff_index = used + 1; /* 0 = ვიდეო */
+        /* --- the filter chain --- */
+        int ff_index = used + 1; /* 0 = the video */
 
         sb_addf(&filter,
                 "[%d:a]aresample=" AUDIO_RATE
@@ -269,7 +268,7 @@ bool audio_mux(const EditorContext *ctx, const char *silent_video, const char *o
             sb_addf(&filter, ",afade=t=out:st=%.3f:d=%.3f", (double)(dur - fo), (double)fo);
         }
         if (t->start > 0.0f) {
-            /* all=1 → დაყოვნება ყველა არხზე ერთნაირად. */
+            /* all=1 → delay every channel by the same amount. */
             sb_addf(&filter, ",adelay=delays=%.0f:all=1", (double)(t->start * 1000.0f));
         }
 
@@ -279,12 +278,12 @@ bool audio_mux(const EditorContext *ctx, const char *silent_video, const char *o
     }
 
     if (used == 0) {
-        fprintf(stderr, "შეცდომა: ვერც ერთი ხმოვანი ბილიკი ვერ გამოდგა.\n");
+        fprintf(stderr, "error: not a single audio track was usable.\n");
         sb_free(&inputs); sb_free(&filter); sb_free(&mixmap);
         return false;
     }
 
-    /* ჯამი + ლიმიტერი. normalize=0 → ბილიკებს ავტომატურად არ უწევს ხმას. */
+    /* Sum + limiter. normalize=0 → tracks are not automatically attenuated. */
     if (used > 1) {
         sb_addf(&filter, "%samix=inputs=%d:normalize=0:duration=longest,"
                          "alimiter=limit=0.95[aout]", mixmap.data, used);
@@ -299,13 +298,13 @@ bool audio_mux(const EditorContext *ctx, const char *silent_video, const char *o
         return false;
     }
 
-    /* filter_complex-ს ბრჭყალებში ვდებთ — შიგნით [ ] ; , | სიმბოლოებია. */
+    /* Quote the filter_complex — it contains [ ] ; , | characters. */
     StrBuf quoted_filter; memset(&quoted_filter, 0, sizeof quoted_filter);
     size_t qf_size = filter.len * 4 + 8;
     quoted_filter.data = (char *)malloc(qf_size);
     if (quoted_filter.data == NULL || filter.failed || inputs.failed || mixmap.failed ||
         !vr_shell_quote(filter.data, quoted_filter.data, qf_size)) {
-        fprintf(stderr, "შეცდომა: ხმის ფილტრის აწყობა ჩავარდა.\n");
+        fprintf(stderr, "error: building the audio filter failed.\n");
         sb_free(&inputs); sb_free(&filter); sb_free(&mixmap); sb_free(&quoted_filter);
         return false;
     }
@@ -313,7 +312,7 @@ bool audio_mux(const EditorContext *ctx, const char *silent_video, const char *o
     StrBuf cmd; memset(&cmd, 0, sizeof cmd);
     sb_addf(&cmd, "ffmpeg -hide_banner -loglevel error -y -i %s %s"
                   "-filter_complex %s "
-                  /* ვიდეო *ასლით* გადადის — მეორედ არ კოდირდება. */
+                  /* The video is *copied* — never re-encoded. */
                   "-map 0:v -c:v copy -map '[aout]' -c:a aac -b:a 192k -ar " AUDIO_RATE " "
                   "-t %.3f -movflags +faststart %s",
                   quoted_in, inputs.data, quoted_filter.data,
@@ -321,12 +320,12 @@ bool audio_mux(const EditorContext *ctx, const char *silent_video, const char *o
 
     bool ok = !cmd.failed;
     if (ok) {
-        fprintf(stderr, "ხმა: %d ბილიკი → მიქსი და შეერთება…\n", used);
+        fprintf(stderr, "audio: mixing and muxing %d track(s)…\n", used);
 
         int status = system(cmd.data);
         if (status != 0) {
-            fprintf(stderr, "შეცდომა: ხმის შეერთება ჩავარდა (ffmpeg კოდი %d).\n", status);
-            fprintf(stderr, "ბრძანება იყო:\n%s\n", cmd.data);
+            fprintf(stderr, "error: audio mux failed (ffmpeg exit %d).\n", status);
+            fprintf(stderr, "the command was:\n%s\n", cmd.data);
             ok = false;
         }
     }

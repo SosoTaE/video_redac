@@ -1,10 +1,8 @@
 # video_redac — Documentation
 
 From a JSON description to an MP4: layout and text rasterization on the CPU,
-compositing and effects on the GPU, encoding on NVENC.
-
-> **Note on language.** These documents are in English; the source comments are
-> in Georgian. Both describe the same code — where they disagree, the code wins.
+compositing and effects on the GPU, encoding on NVENC — or the whole pipeline on
+the CPU, if there is no GPU to be had (see [09-backends.md](09-backends.md)).
 
 ## Contents
 
@@ -18,12 +16,15 @@ compositing and effects on the GPU, encoding on NVENC.
 | [06-algorithms.md](06-algorithms.md) | The algorithms in depth — and why they are what they are |
 | [07-cli-and-build.md](07-cli-and-build.md) | CLI, Makefile, sanitizers, troubleshooting |
 | [08-performance.md](08-performance.md) | Measurements and bottleneck analysis |
+| [09-backends.md](09-backends.md) | The CUDA and CPU backends, and the code they share |
 
 ## Quick start
 
 ```bash
-make
+make                                            # CUDA + NVENC
 ./video_redac showcase.json -o out/showcase.mp4
+
+make CPU=1                                      # no GPU? no CUDA toolkit? still builds
 ```
 
 A minimal project:

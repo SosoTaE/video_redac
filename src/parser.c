@@ -1,12 +1,12 @@
 /*
  * parser.c — video.json → EditorContext.
  *
- * პრინციპები:
- *   1. პარსერი მხოლოდ *კითხულობს* — ის არაფერს არ ხატავს და GPU-ს არ ეხება.
- *   2. ყოველი გამოყოფილი რესურსი აღირიცხება კონტექსტში, რომ
- *      editor_context_free() ერთი გამოძახებით ასუფთავებდეს ყველაფერს.
- *   3. JSON-ის ნებისმიერი ველი შეიძლება აკლდეს — ყველგან გვაქვს default.
- *      აკლია ველი ≠ შეცდომა; მხოლოდ ავარიული სიტუაციები აბრუნებს NULL-ს.
+ * Principles:
+ *   1. The parser only *reads* — it draws nothing and never touches the GPU.
+ *   2. Every allocation is recorded in the context, so a single call to
+ *      editor_context_free() cleans up everything.
+ *   3. Any JSON field may be absent — everything has a default.
+ *      A missing field is not an error; only genuine failures return NULL.
  */
 
 #include "parser.h"
@@ -24,15 +24,15 @@
 #include "media_loader.h"
 #include "renderer.h"
 
-/* ერთი კადრის დროებითი მეხსიერება. 4 MiB უხვად ჰყოფნის რამდენიმე ათას
- * WidgetRuntime-ს; საჭიროებისას ერთ ადგილას იცვლება. */
+/* Scratch memory for one frame. 4 MiB comfortably holds several thousand
+ * WidgetRuntime entries; change it here if that ever stops being true. */
 #define FRAME_ARENA_BYTES (4u * 1024u * 1024u)
 
 /* ------------------------------------------------------------------------- */
-/* პატარა დამხმარეები                                                         */
+/* Small helpers                                                              */
 /* ------------------------------------------------------------------------- */
 
-/* strdup POSIX-ისაა, ჩვენ კი -std=c11 გვაქვს — ვწერთ საკუთარს. */
+/* strdup is POSIX and we build with -std=c11 — so we roll our own. */
 static char *dup_string(const char *src)
 {
     if (src == NULL) {
@@ -54,19 +54,19 @@ char *read_file_to_string(const char *filename, size_t *out_len)
 
     FILE *file = fopen(filename, "rb");
     if (file == NULL) {
-        fprintf(stderr, "შეცდომა: ფაილი '%s' ვერ გაიხსნა.\n", filename);
+        fprintf(stderr, "error: could not open '%s'.\n", filename);
         return NULL;
     }
 
     if (fseek(file, 0, SEEK_END) != 0) {
-        fprintf(stderr, "შეცდომა: '%s' არ არის seekable.\n", filename);
+        fprintf(stderr, "error: '%s' is not seekable.\n", filename);
         fclose(file);
         return NULL;
     }
 
     long length = ftell(file);
     if (length < 0) {
-        fprintf(stderr, "შეცდომა: '%s'-ის ზომა ვერ დადგინდა.\n", filename);
+        fprintf(stderr, "error: could not determine the size of '%s'.\n", filename);
         fclose(file);
         return NULL;
     }
@@ -74,13 +74,13 @@ char *read_file_to_string(const char *filename, size_t *out_len)
 
     char *buffer = (char *)malloc((size_t)length + 1);
     if (buffer == NULL) {
-        fprintf(stderr, "შეცდომა: მეხსიერება ვერ გამოიყო (%ld ბაიტი).\n", length + 1);
+        fprintf(stderr, "error: allocation failed (%ld bytes).\n", length + 1);
         fclose(file);
         return NULL;
     }
 
     size_t read_size = fread(buffer, 1, (size_t)length, file);
-    buffer[read_size] = '\0'; /* fread-ის *ფაქტობრივ* შედეგზე ვხურავთ, არა length-ზე */
+    buffer[read_size] = '\0'; /* terminate at what fread *actually* read, not at length */
     fclose(file);
 
     if (out_len != NULL) {
@@ -90,8 +90,8 @@ char *read_file_to_string(const char *filename, size_t *out_len)
 }
 
 /*
- * "#RRGGBB" ან "#RRGGBBAA" (ასევე "RRGGBB" ლატით-გარეშე) → Color.
- * false → ფორმატი არასწორია; გამომძახებელი default-ს ტოვებს.
+ * "#RRGGBB" or "#RRGGBBAA" (also without the leading '#') → Color.
+ * false → malformed; the caller keeps its default.
  */
 bool parse_hex_color(const char *hex, Color *out)
 {
@@ -113,7 +113,7 @@ bool parse_hex_color(const char *hex, Color *out)
         char       *end     = NULL;
         unsigned long byte  = strtoul(pair, &end, 16);
         if (end != pair + 2) {
-            return false; /* არა-hex სიმბოლო */
+            return false; /* a non-hex character */
         }
         v[i / 2] = (unsigned int)byte;
     }
@@ -125,7 +125,7 @@ bool parse_hex_color(const char *hex, Color *out)
     return true;
 }
 
-/* cJSON-ის მოსახერხებელი წამკითხავები default-ებით. */
+/* Convenience readers over cJSON, with defaults. */
 static int json_int(const cJSON *obj, const char *key, int fallback)
 {
     const cJSON *it = cJSON_GetObjectItemCaseSensitive(obj, key);
@@ -152,22 +152,22 @@ static bool json_has(const cJSON *obj, const char *key)
 static Color json_color(const cJSON *obj, const char *key, Color fallback)
 {
     Color c = fallback;
-    parse_hex_color(json_str(obj, key, NULL), &c); /* ჩავარდნისას c უცვლელია */
+    parse_hex_color(json_str(obj, key, NULL), &c); /* on failure c is untouched */
     return c;
 }
 
 /*
- * დინამიური მასივის გაზრდა და ერთი ცარიელი (განულებული) სლოტის დაბრუნება.
+ * Grows a dynamic array and returns one empty (zeroed) slot.
  *
- * `items` void**-ია, რომ ერთი იმპლემენტაცია სამივე მასივს ემსახუროს.
- * NULL → realloc ჩავარდა; მაშინ ძველი მასივი ხელუხლებელი რჩება (არ იკარგება).
+ * `items` is void** so a single implementation serves every array.
+ * NULL → realloc failed; the old array is left intact (nothing is lost).
  */
 static void *array_push(void **items, size_t *count, size_t *cap, size_t elem_size)
 {
     if (*count == *cap) {
         size_t new_cap = (*cap == 0) ? 8 : (*cap * 2);
         if (new_cap > SIZE_MAX / elem_size) {
-            return NULL; /* ზომის overflow */
+            return NULL; /* size overflow */
         }
         void *grown = realloc(*items, new_cap * elem_size);
         if (grown == NULL) {
@@ -185,20 +185,20 @@ static void *array_push(void **items, size_t *count, size_t *cap, size_t elem_si
 
 
 /* ------------------------------------------------------------------------- */
-/* ცვლადები: ${name} → მნიშვნელობა                                            */
+/* Variables: ${name} → value                                                 */
 /* ------------------------------------------------------------------------- */
 
 /*
- * ჩანაცვლება ხდება *დაპარსულ* ხეზე და არა ნედლ ტექსტზე.
+ * Substitution happens on the *parsed tree*, never on the raw text.
  *
- * ნედლ JSON-ში ჩანაცვლება მაცდური, მაგრამ საშიშია: მნიშვნელობაში მოხვედრილი
- * ბრჭყალი ან უკუსახაზავი მთელ დოკუმენტს გატეხდა. ხეზე მუშაობისას მნიშვნელობა
- * ყოველთვის რჩება ერთ სტრიქონულ კვანძში და სინტაქსს ვერ შეეხება.
+ * Substituting into raw JSON is tempting but dangerous: a quote or backslash
+ * inside a value would break the whole document. On the tree, a value always
+ * stays inside one string node and can never affect the syntax.
  */
 static char *expand_vars(const char *src, const cJSON *vars)
 {
     if (src == NULL || vars == NULL || strstr(src, "${") == NULL) {
-        return NULL; /* არაფერი შესაცვლელია */
+        return NULL; /* nothing to substitute */
     }
 
     size_t cap = strlen(src) + 64, len = 0;
@@ -230,7 +230,7 @@ static char *expand_vars(const char *src, const cJSON *vars)
                     }
 
                     if (rep == NULL) {
-                        fprintf(stderr, "გაფრთხილება: ცვლადი '${%s}' განსაზღვრული არაა.\n", name);
+                        fprintf(stderr, "warning: variable '${%s}' is not defined.\n", name);
                         rep = "";
                     }
 
@@ -268,7 +268,7 @@ static char *expand_vars(const char *src, const cJSON *vars)
     return out;
 }
 
-/* რეკურსიულად გადის ხეზე და ყველა სტრიქონულ მნიშვნელობაში ავრცობს ცვლადებს. */
+/* Walks the tree recursively, expanding variables in every string value. */
 static void substitute_vars(cJSON *node, const cJSON *vars)
 {
     for (cJSON *it = node; it != NULL; it = it->next) {
@@ -285,35 +285,35 @@ static void substitute_vars(cJSON *node, const cJSON *vars)
 }
 
 /* ------------------------------------------------------------------------- */
-/* სტილები: გამეორებადი თვისებების ერთ ადგილას აღწერა                         */
+/* Styles: describing repeated properties in one place                        */
 /* ------------------------------------------------------------------------- */
 
 /*
- * ობიექტს ურთავს დასახელებული სტილის ველებს.
+ * Merges a named style's fields into an object.
  *
- * ობიექტის *საკუთარი* ველები ყოველთვის იმარჯვებს — სტილი მხოლოდ იმას ავსებს,
- * რაც ობიექტს არ აქვს. `"style"` შეიძლება იყოს ერთი სახელი ან სახელების მასივი
- * (მაშინ თანმიმდევრობით ედება, პირველი ყველაზე ზოგადი).
+ * The object's *own* fields always win — a style only fills what is missing.
+ * `"style"` may be one name or an array of names (applied in order, the first
+ * being the most general).
  */
 static void apply_style_chain(cJSON *obj, const cJSON *styles, const char *name, int depth)
 {
     if (depth > 8) {
-        fprintf(stderr, "გაფრთხილება: სტილების ციკლი '%s'-თან — შევჩერდი.\n", name);
+        fprintf(stderr, "warning: style cycle at '%s' — stopping.\n", name);
         return;
     }
 
     const cJSON *st = cJSON_GetObjectItemCaseSensitive(styles, name);
     if (!cJSON_IsObject(st)) {
-        fprintf(stderr, "გაფრთხილება: სტილი '%s' ვერ მოიძებნა.\n", name);
+        fprintf(stderr, "warning: style '%s' not found.\n", name);
         return;
     }
 
     for (const cJSON *field = st->child; field != NULL; field = field->next) {
         if (field->string == NULL || strcmp(field->string, "style") == 0) {
-            continue; /* "style" მეტამონაცემია და არა თვისება */
+            continue; /* "style" is metadata, not a property */
         }
         if (cJSON_GetObjectItemCaseSensitive(obj, field->string) != NULL) {
-            continue; /* ობიექტს თავისი აქვს — ხელს არ ვახლებთ */
+            continue; /* the object has its own — leave it alone */
         }
         cJSON *copy = cJSON_Duplicate(field, true);
         if (copy != NULL) {
@@ -322,8 +322,8 @@ static void apply_style_chain(cJSON *obj, const cJSON *styles, const char *name,
     }
 
     /*
-     * სტილს თავად შეიძლება ჰქონდეს მშობელი: {"hero": {"style": "base", ...}}.
-     * მშობელი *შემდეგ* ედება, ანუ უფრო კონკრეტული სტილი ყოველთვის იმარჯვებს.
+     * A style may itself have a parent: {"hero": {"style": "base", ...}}.
+     * The parent is applied *afterwards*, so the more specific style wins.
      */
     const cJSON *parent = cJSON_GetObjectItemCaseSensitive(st, "style");
     if (cJSON_IsString(parent)) {
@@ -358,21 +358,21 @@ static void apply_styles(cJSON *obj, const cJSON *styles)
 }
 
 /* ------------------------------------------------------------------------- */
-/* ობიექტების პარსინგი                                                        */
+/* Parsing objects                                                            */
 /* ------------------------------------------------------------------------- */
 
 
 /* ------------------------------------------------------------------------- */
-/* Keyframe track-ების პარსინგი                                               */
+/* Parsing keyframe tracks                                                    */
 /* ------------------------------------------------------------------------- */
 
 /*
- * ველი შეიძლება იყოს ან რიცხვი, ან საკვანძო კადრების მასივი:
+ * A field may be either a number or an array of keyframes:
  *
  *     "opacity": 0.5
  *     "opacity": [ {"t": 0, "v": 0}, {"t": 1.2, "v": 1, "ease": "backout"} ]
  *
- * აბრუნებს true-ს მხოლოდ მაშინ, თუ რეალური ანიმაცია აიგო.
+ * Returns true only when a real animation was built.
  */
 static bool parse_track(const cJSON *item, Track *tr, float fallback)
 {
@@ -383,7 +383,7 @@ static bool parse_track(const cJSON *item, Track *tr, float fallback)
     }
     if (cJSON_IsNumber(item)) {
         track_set_constant(tr, (float)item->valuedouble);
-        return false; /* კონსტანტა — ანიმაცია არაა */
+        return false; /* a constant — not an animation */
     }
     if (!cJSON_IsArray(item)) {
         return false;
@@ -417,9 +417,9 @@ static bool parse_track(const cJSON *item, Track *tr, float fallback)
     }
 
     /*
-     * გასაღებები დროის ზრდადობით უნდა იდგეს — track_sample სწორედ ამას ეყრდნობა.
-     * JSON-ის ავტორს ეს შეიძლება შეშალოს, ამიტომ თავად ვალაგებთ (ჩასმით
-     * დახარისხება: გასაღებები ერთეულებია და თითქმის ყოველთვის უკვე დალაგებულია).
+     * Keys must be in ascending time order — track_sample relies on it. The
+     * JSON author may get that wrong, so we sort here (insertion sort: there
+     * are only a handful of keys and they are almost always sorted already).
      */
     for (int i = 1; i < idx; i++) {
         Keyframe cur = keys[i];
@@ -437,7 +437,7 @@ static bool parse_track(const cJSON *item, Track *tr, float fallback)
 }
 
 /* ------------------------------------------------------------------------- */
-/* ეფექტების პარსინგი                                                         */
+/* Parsing effects                                                            */
 /* ------------------------------------------------------------------------- */
 
 static const struct {
@@ -455,7 +455,7 @@ static const struct {
     { "temperature", FXP_TEMPERATURE }, { "tint",       FXP_TINT       },
 };
 
-/* ნეიტრალური საწყისები — რასაც JSON არ გადააწერს, ის უცვლელს ტოვებს კადრს. */
+/* Neutral defaults — whatever the JSON does not override leaves the frame alone. */
 static void effect_set_defaults(Effect *fx)
 {
     for (int i = 0; i < FXP_MAX; i++) {
@@ -496,8 +496,8 @@ static void effect_set_defaults(Effect *fx)
             track_set_constant(&fx->param[FXP_AMOUNT], 0.05f);
             break;
         case FX_SPLIT_TONE:
-            fx->color_a = (Color){  40,  70, 120, 255 }; /* ცივი ჩრდილები */
-            fx->color_b = (Color){ 255, 190, 130, 255 }; /* თბილი შუქები   */
+            fx->color_a = (Color){  40,  70, 120, 255 }; /* cool shadows    */
+            fx->color_b = (Color){ 255, 190, 130, 255 }; /* warm highlights */
             track_set_constant(&fx->param[FXP_AMOUNT], 0.25f);
             break;
         case FX_GRADIENT_MAP:
@@ -516,7 +516,7 @@ static bool parse_effects_into(struct Effect **list, size_t *count, size_t *cap,
                                const cJSON *arr)
 {
     if (!cJSON_IsArray(arr)) {
-        return true; /* ეფექტები არჩევითია */
+        return true; /* effects are optional */
     }
 
     const cJSON *item = NULL;
@@ -525,7 +525,7 @@ static bool parse_effects_into(struct Effect **list, size_t *count, size_t *cap,
         EffectType  type = effect_from_name(name);
 
         if (type == FX_NONE) {
-            fprintf(stderr, "გაფრთხილება: უცნობი ეფექტი '%s' — გამოტოვებულია.\n",
+            fprintf(stderr, "warning: unknown effect '%s' — skipped.\n",
                     name ? name : "(null)");
             continue;
         }
@@ -546,7 +546,7 @@ static bool parse_effects_into(struct Effect **list, size_t *count, size_t *cap,
             }
         }
 
-        /* ფერების სინონიმები: vignette-ს "color", ტონირებას "shadows"/"highlights". */
+        /* Colour synonyms: vignette uses "color", toning "shadows"/"highlights". */
         fx->color_a = json_color(item, "color",     fx->color_a);
         fx->color_a = json_color(item, "shadows",   fx->color_a);
         fx->color_a = json_color(item, "shadow",    fx->color_a);
@@ -556,14 +556,14 @@ static bool parse_effects_into(struct Effect **list, size_t *count, size_t *cap,
     return true;
 }
 
-/* საერთო ველების წაკითხვა WidgetBase-ში. */
+/* Reads the fields common to every WidgetBase. */
 static void parse_widget_base(WidgetBase *base, const cJSON *obj, WidgetKind kind, int z)
 {
     base->kind    = kind;
     base->id      = dup_string(json_str(obj, "id", "unnamed"));
     base->z_order = z;
 
-    /* --- მიმაგრება ("anchor": "center", "bottomright", …) ---------------- */
+    /* --- anchoring ("anchor": "center", "bottomright", …) ---------------- */
     const char *anchor_name = json_str(obj, "anchor", NULL);
     if (anchor_name != NULL) {
         float ax, ay;
@@ -572,11 +572,11 @@ static void parse_widget_base(WidgetBase *base, const cJSON *obj, WidgetKind kin
             base->anchor_y = ay;
             base->has_anchor_x = base->has_anchor_y = true;
         } else {
-            fprintf(stderr, "გაფრთხილება: უცნობი anchor '%s'.\n", anchor_name);
+            fprintf(stderr, "warning: unknown anchor '%s'.\n", anchor_name);
         }
     }
 
-    /* --- ფარდობითი გამოსახულებები ("center", "bottom-160") --------------- */
+    /* --- relative expressions ("center", "bottom-160") ------------------- */
     const cJSON *x_item = cJSON_GetObjectItemCaseSensitive(obj, "x");
     const cJSON *y_item = cJSON_GetObjectItemCaseSensitive(obj, "y");
 
@@ -587,14 +587,14 @@ static void parse_widget_base(WidgetBase *base, const cJSON *obj, WidgetKind kin
         base->y_expr = dup_string(y_item->valuestring);
     }
 
-    /* ვიღებთ ორივე ჩაწერას: "x" და "x_pos" (JSON-ის ორივე დიალექტი). */
+    /* Accept both spellings: "x" and "x_pos" (two JSON dialects). */
     if (json_has(obj, "x")) {
         base->x = json_float(obj, "x", 0.0f);
     } else if (json_has(obj, "x_pos")) {
         base->x = json_float(obj, "x_pos", 0.0f);
     } else {
-        /* X არ მითითებულა → ჰორიზონტალურად ვაცენტრებთ, როცა ტექსტურის
-         * სიგანე გახდება ცნობილი (იხ. media_prepare_textures). */
+        /* No X given → centre horizontally once the texture width is known
+         * (see media_prepare_textures). */
         base->auto_center_x = true;
     }
 
@@ -604,8 +604,8 @@ static void parse_widget_base(WidgetBase *base, const cJSON *obj, WidgetKind kin
     base->tex.premultiplied = true;
 
     /*
-     * თვისებების ტრეკები. თუ ველი მასივია, ის ანიმაციად იქცევა და საბაზისო
-     * სტატიკურ მნიშვნელობას ჩაანაცვლებს; რიცხვი კი უბრალოდ კონსტანტაა.
+     * Property tracks. If a field is an array it becomes an animation and
+     * replaces the static base value; a number is simply a constant.
      */
     parse_track(cJSON_GetObjectItemCaseSensitive(obj, "x"),        &base->tr_x, base->x);
     parse_track(cJSON_GetObjectItemCaseSensitive(obj, "y"),        &base->tr_y, base->y);
@@ -614,18 +614,19 @@ static void parse_widget_base(WidgetBase *base, const cJSON *obj, WidgetKind kin
     parse_track(cJSON_GetObjectItemCaseSensitive(obj, "rotation"), &base->tr_rotation, 0.0f);
 
     /*
-     * "has_track_*" ნიშნავს "JSON-მა ეს თვისება მიუთითა" და არა "ის ანიმირებულია".
+     * "has_track_*" means "the JSON specified this property", not "it is
+     * animated".
      *
-     * განსხვავება არსებითია: `"opacity": 0.0` მუდმივია, მაგრამ მაინც *მითითებულია*.
-     * თუ აქ parse_track()-ის შედეგს დავეყრდნობოდით (ის მხოლოდ მასივზე აბრუნებს true-ს),
-     * მუდმივი მნიშვნელობა ჩუმად დაიკარგებოდა და ობიექტი ნაგულისხმევ 1.0-ზე დაიხატებოდა —
-     * ანუ დამალვის მცდელობა პირიქით, სრულ ხილვადობას იძლეოდა.
+     * The distinction matters: `"opacity": 0.0` is a constant but is still
+     * *specified*. Relying on parse_track()'s return value (true only for
+     * arrays) would silently discard it and draw the object at the default 1.0 —
+     * so an attempt to hide something would instead make it fully visible.
      */
     /*
-     * სტრიქონული x/y გამოსახულებაა და არა ტრეკი — მისი მნიშვნელობა მოგვიანებით,
-     * ზომის ცოდნის შემდეგ ითვლება და პირდაპირ base->x/y-ში ჩაიწერება. თუ აქ
-     * has_track_x-ს დავაყენებდით, რენდერერი ტრეკს წაიკითხავდა (რომლის მუდმივაც
-     * პარსინგის მომენტში 0-ია) და გამოთვლილ პოზიციას უგულებელყოფდა.
+     * A string x/y is an expression, not a track — its value is computed later,
+     * once the size is known, and written straight into base->x/y. Setting
+     * has_track_x here would make the renderer read the track instead (whose
+     * constant is 0 at parse time), ignoring the computed position.
      */
     base->has_track_x        = json_has(obj, "x") && base->x_expr == NULL;
     base->has_track_y        = json_has(obj, "y") && base->y_expr == NULL;
@@ -633,16 +634,16 @@ static void parse_widget_base(WidgetBase *base, const cJSON *obj, WidgetKind kin
     base->has_track_scale    = json_has(obj, "scale");
     base->has_track_rotation = json_has(obj, "rotation");
 
-    /* ანიმირებული X თავად განსაზღვრავს პოზიციას — ავტო-ცენტრირება აღარ სჭირდება. */
+    /* An animated X defines the position itself — no auto-centring needed. */
     if (base->has_track_x) {
         base->auto_center_x = false;
     }
 }
 
 /*
- * სიგრძის წაკითხვა: რიცხვი პიქსელებია, სტრიქონი კი გამოსახულება ("80%").
- * ასე max_width კადრის ზომაზე მიბმულად იწერება და გარჩევადობის შეცვლისას
- * თავისით ერგება.
+ * Reads a length: a number is pixels, a string is an expression ("80%").
+ * That lets max_width be expressed relative to the canvas, so it adapts when
+ * the resolution changes.
  */
 static float json_length(const cJSON *obj, const char *key, float canvas, float fallback)
 {
@@ -655,7 +656,7 @@ static float json_length(const cJSON *obj, const char *key, float canvas, float 
         if (layout_eval(it->valuestring, canvas, LAYOUT_AXIS_X, &pos, &anchor)) {
             return pos;
         }
-        fprintf(stderr, "გაფრთხილება: გაუგებარი '%s' = '%s'.\n", key, it->valuestring);
+        fprintf(stderr, "warning: unparsable '%s' = '%s'.\n", key, it->valuestring);
     }
     return fallback;
 }
@@ -669,7 +670,7 @@ static float json_align(const cJSON *obj, const char *key, float fallback)
     if (strcmp(a, "center") == 0 || strcmp(a, "middle") == 0) return 0.5f;
     if (strcmp(a, "right")  == 0)                             return 1.0f;
     if (strcmp(a, "left")   == 0)                             return 0.0f;
-    fprintf(stderr, "გაფრთხილება: უცნობი align '%s'.\n", a);
+    fprintf(stderr, "warning: unknown align '%s'.\n", a);
     return fallback;
 }
 
@@ -692,7 +693,7 @@ static bool parse_text_object(EditorContext *ctx, const cJSON *obj, int z)
     w->align        = json_align(obj, "align", 0.0f);
 
     if (w->size < 1) {
-        w->size = 1; /* Cairo-სთვის 0/უარყოფითი ზომა უაზროა */
+        w->size = 1; /* a zero or negative size is meaningless to Cairo */
     }
     if (w->max_width < 0.0f) {
         w->max_width = 0.0f;
@@ -701,10 +702,10 @@ static bool parse_text_object(EditorContext *ctx, const cJSON *obj, int z)
 }
 
 /*
- * ფარდობითი გზა JSON-ის საქაღალდის მიმართ იხსნება.
+ * A relative path resolves against the JSON's own directory.
  *
- * ასე `"path": "logo.png"` მუშაობს იმის მიხედვით, სად დევს პროექტის ფაილი და
- * არა იმის მიხედვით, საიდან გაუშვა მომხმარებელმა პროგრამა.
+ * That way `"path": "logo.png"` depends on where the project file lives, not
+ * on where the user happened to run the program from.
  */
 static char *resolve_relative_path(const char *base_file, const char *path)
 {
@@ -712,15 +713,15 @@ static char *resolve_relative_path(const char *base_file, const char *path)
         return NULL;
     }
     if (path[0] == '/' || base_file == NULL) {
-        return dup_string(path); /* აბსოლუტური — ხელს არ ვახლებთ */
+        return dup_string(path); /* absolute — leave it alone */
     }
 
     const char *slash = strrchr(base_file, '/');
     if (slash == NULL) {
-        return dup_string(path); /* JSON მიმდინარე საქაღალდეშია */
+        return dup_string(path); /* the JSON is in the current directory */
     }
 
-    size_t dir_len = (size_t)(slash - base_file) + 1; /* '/'-ის ჩათვლით */
+    size_t dir_len = (size_t)(slash - base_file) + 1; /* including the '/' */
     size_t path_len = strlen(path);
 
     char *full = (char *)malloc(dir_len + path_len + 1);
@@ -745,12 +746,12 @@ static bool parse_shape_object(EditorContext *ctx, const cJSON *obj, int z, Widg
     w->color = json_color(obj, "color", (Color){ 255, 255, 255, 255 });
 
     if (kind == WIDGET_CIRCLE) {
-        /* წრეს რადიუსით ვწერთ, მაგრამ შიგნით ის შემომსაზღვრელი კვადრატია. */
+        /* A circle is written with a radius but stored as a bounding box. */
         float r = json_float(obj, "radius", 50.0f);
         w->w = json_float(obj, "w", r * 2.0f);
         w->h = json_float(obj, "h", r * 2.0f);
 
-        /* cx/cy = ცენტრი (videogen-ის კონვენცია) → ჩვენი ზედა-მარცხენა კუთხე. */
+        /* cx/cy = centre (videogen's convention) → our top-left corner. */
         if (json_has(obj, "cx")) {
             w->base.x = json_float(obj, "cx", 0.0f) - w->w * 0.5f;
             w->base.auto_center_x = false;
@@ -787,7 +788,7 @@ static bool parse_image_object(EditorContext *ctx, const cJSON *obj, int z,
         src = json_str(obj, "src", NULL);
     }
     if (src == NULL) {
-        fprintf(stderr, "შეცდომა: სურათს '%s' არ აქვს 'path'.\n",
+        fprintf(stderr, "error: image '%s' has no 'path'.\n",
                 w->base.id ? w->base.id : "(null)");
         return false;
     }
@@ -812,7 +813,7 @@ static bool parse_code_object(EditorContext *ctx, const cJSON *obj, int z)
 
     parse_widget_base(&w->base, obj, WIDGET_CODE, z);
 
-    /* "code" ან "content" — ორივე მიიღება. */
+    /* "code" or "content" — both are accepted. */
     const char *src = json_str(obj, "code", NULL);
     if (src == NULL) {
         src = json_str(obj, "content", "");
@@ -828,7 +829,7 @@ static bool parse_code_object(EditorContext *ctx, const cJSON *obj, int z)
     w->line_spacing = json_float(obj, "line_spacing", 1.35f);
     w->corner_radius = json_int(obj, "corner_radius", 12);
 
-    /* გაფერადება ჩართულია, თუ ენა ცნობილია და JSON-ში პირდაპირ არ გამორთეს. */
+    /* Highlighting is on unless the JSON explicitly turns it off. */
     const cJSON *hl = cJSON_GetObjectItemCaseSensitive(obj, "highlight");
     w->highlight = cJSON_IsBool(hl) ? cJSON_IsTrue(hl) : true;
 
@@ -845,13 +846,13 @@ static bool parse_code_object(EditorContext *ctx, const cJSON *obj, int z)
 }
 
 /* ------------------------------------------------------------------------- */
-/* ხმოვანი ბილიკების პარსინგი                                                 */
+/* Parsing audio tracks                                                       */
 /* ------------------------------------------------------------------------- */
 
 static bool parse_audio(EditorContext *ctx, const cJSON *arr, const char *base_file)
 {
     if (!cJSON_IsArray(arr)) {
-        return true; /* აუდიო არჩევითია */
+        return true; /* audio is optional */
     }
 
     const cJSON *item = NULL;
@@ -862,12 +863,12 @@ static bool parse_audio(EditorContext *ctx, const cJSON *arr, const char *base_f
         }
 
         if (path == NULL) {
-            /* TTS განზრახ არ გვაქვს — ვამბობთ ღიად, რომ მიზეზი გასაგები იყოს. */
+            /* TTS is deliberately absent — say so plainly. */
             if (json_has(item, "text")) {
-                fprintf(stderr, "გაფრთხილება: ხმოვან ბილიკს 'text' აქვს, მაგრამ სინთეზი (TTS) "
-                                "ამ პროექტის ნაწილი არ არის — მიუთითე მზა ფაილი 'path'-ით.\n");
+                fprintf(stderr, "warning: audio track has 'text', but speech synthesis "
+                                "is not part of this project — supply a file via 'path'.\n");
             } else {
-                fprintf(stderr, "გაფრთხილება: ხმოვან ბილიკს 'path' აკლია — გამოტოვებულია.\n");
+                fprintf(stderr, "warning: audio track has no 'path' — skipped.\n");
             }
             continue;
         }
@@ -901,15 +902,15 @@ static bool parse_audio(EditorContext *ctx, const cJSON *arr, const char *base_f
         }
 
         /*
-         * ფაილის არსებობას *პარსინგისას* ვამოწმებთ და არა მიქსისას.
+         * File existence is checked at *parse* time, not at mix time.
          *
-         * მიზეზი პრაქტიკულია: ხმა ბოლო ეტაპია, ანუ გზაში დაშვებული შეცდომა
-         * მხოლოდ მაშინ გამოჩნდებოდა, როცა ათასობით კადრი უკვე დარენდერებულია.
-         * ჯობს პროგრამა პირველივე წამში გაჩერდეს.
+         * The reason is practical: audio is the last stage, so a typo in a path
+         * would otherwise surface only after thousands of frames had already
+         * been rendered. Better to stop in the first second.
          */
         FILE *probe = fopen(a->path, "rb");
         if (probe == NULL) {
-            fprintf(stderr, "შეცდომა: ხმოვანი ფაილი '%s' ვერ გაიხსნა.\n", a->path);
+            fprintf(stderr, "error: could not open audio file '%s'.\n", a->path);
             return false;
         }
         fclose(probe);
@@ -918,7 +919,7 @@ static bool parse_audio(EditorContext *ctx, const cJSON *arr, const char *base_f
 }
 
 /* ------------------------------------------------------------------------- */
-/* ტაიმლაინის პარსინგი                                                        */
+/* Parsing the timeline                                                       */
 /* ------------------------------------------------------------------------- */
 
 static ActionType action_from_string(const char *s)
@@ -951,17 +952,17 @@ static bool parse_timeline_event(Scene *scene, const cJSON *obj)
     e->duration_ms  = json_int(obj, "duration_ms", 0);
     e->action       = action_from_string(action_name);
     e->target_id    = dup_string(json_str(obj, "target", ""));
-    e->target_index = -1; /* გაიხსნება resolve_timeline_targets()-ში */
+    e->target_index = -1; /* resolved in resolve_timeline_targets() */
 
-    /* SCALE-ის ნეიტრალური მნიშვნელობა 1.0-ია (და არა 0, რაც ობიექტს გააქრობდა). */
+    /* SCALE's neutral value is 1.0, not 0 — which would make the object vanish. */
     e->value = json_float(obj, "value", (e->action == ACTION_SCALE) ? 1.0f : 0.0f);
 
-    /* ნაგულისხმევი smoothstep-ია — ზუსტად ის ქცევა, რაც აქამდე ჩაშენებული იყო. */
+    /* smoothstep is the default — exactly the behaviour that used to be hard-wired. */
     e->ease = json_has(obj, "ease") ? easing_from_name(json_str(obj, "ease", NULL))
                                     : EASE_SMOOTH;
 
-    /* MOVE-ის ღერძები: "move_x"/"move_y" ერთ `value`-ს იყენებს, ზოგადი "move" კი
-     * ცალკე value_x/value_y-ს. */
+    /* MOVE axes: "move_x"/"move_y" use the single `value`, while plain "move"
+     * uses value_x/value_y. */
     if (action_name != NULL && strcmp(action_name, "move_x") == 0) {
         e->value_x = e->value;
     } else if (action_name != NULL && strcmp(action_name, "move_y") == 0) {
@@ -972,7 +973,7 @@ static bool parse_timeline_event(Scene *scene, const cJSON *obj)
     }
 
     if (e->action == ACTION_UNKNOWN) {
-        fprintf(stderr, "გაფრთხილება: უცნობი action '%s' (t=%d ms) — გამოტოვებულია.\n",
+        fprintf(stderr, "warning: unknown action '%s' (t=%d ms) — skipped.\n",
                 action_name ? action_name : "(null)", e->time_ms);
     }
     if (e->duration_ms < 0) {
@@ -983,7 +984,7 @@ static bool parse_timeline_event(Scene *scene, const cJSON *obj)
 
 
 /* ------------------------------------------------------------------------- */
-/* გადასვლები                                                                 */
+/* Transitions                                                                */
 /* ------------------------------------------------------------------------- */
 
 static TransitionType transition_from_name(const char *name)
@@ -1019,11 +1020,11 @@ static TransitionType transition_from_name(const char *name)
         }
     }
 
-    fprintf(stderr, "გაფრთხილება: უცნობი გადასვლა '%s' — მაგივრად ჭრა.\n", name);
+    fprintf(stderr, "warning: unknown transition '%s' — falling back to a cut.\n", name);
     return TRANS_CUT;
 }
 
-/* `from`/`to` ბლოკის არხები. აქ Track-ის "t" პროგრესია [0,1], და არა წამები. */
+/* Channels of a `from`/`to` block. Here a Track's "t" is progress in [0,1]. */
 static bool parse_transition_side(const cJSON *side, Track *op, Track *x, Track *y,
                                   Track *sc, Track *rot,
                                   float d_op, float d_sc)
@@ -1047,9 +1048,9 @@ static bool parse_transition_side(const cJSON *side, Track *op, Track *x, Track 
 }
 
 /*
- * მასკის წაკითხვა: { "shape": "circle", "cx": .5, "cy": .5, "r": [...] }
+ * Reads a mask: { "shape": "circle", "cx": .5, "cy": .5, "r": [...] }
  *                  { "shape": "rect",   "x": 0, "y": 0, "w": [...], "h": 1 }
- * პარამეტრები კადრის წილადებშია და ტრეკებიც შეიძლება იყოს.
+ * Parameters are canvas fractions and may themselves be tracks.
  */
 static int parse_mask(const cJSON *node, Track slots[4])
 {
@@ -1097,7 +1098,7 @@ static bool parse_transitions(EditorContext *ctx, const cJSON *arr)
         }
         tr->type = transition_from_name(use);
 
-        /* "duration" წამებშია (videogen-ის კონვენცია), "duration_ms" — მილიწამებში. */
+        /* "duration" is in seconds (videogen's convention), "duration_ms" in ms. */
         if (json_has(item, "duration_ms")) {
             tr->duration_ms = json_int(item, "duration_ms", 600);
         } else {
@@ -1123,7 +1124,7 @@ static bool parse_transitions(EditorContext *ctx, const cJSON *arr)
 }
 
 /* ------------------------------------------------------------------------- */
-/* ინდექსის აგება და ბმულების გახსნა                                          */
+/* Building the index and resolving references                                */
 /* ------------------------------------------------------------------------- */
 
 static int compare_by_z(const void *a, const void *b)
@@ -1134,11 +1135,10 @@ static int compare_by_z(const void *a, const void *b)
 }
 
 /*
- * აგებს ერთგვაროვან `widgets` ინდექსს.
+ * Builds the uniform `widgets` index.
  *
- * კრიტიკული: ეს უნდა მოხდეს *მას შემდეგ*, რაც `texts`/`codes` მასივები აღარ
- * გაიზრდება — realloc გადაანაცვლებს ელემენტებს და ინდექსის ყველა მაჩვენებელი
- * dangling გახდება.
+ * Critical: this must happen *after* the `texts`/`codes` arrays stop growing —
+ * a realloc moves the elements and every pointer in the index would dangle.
  */
 static bool ctx_build_widget_index(EditorContext *ctx)
 {
@@ -1169,14 +1169,14 @@ static bool ctx_build_widget_index(EditorContext *ctx)
     }
     ctx->widget_count = n;
 
-    /* JSON-ის თანმიმდევრობა = ხატვის თანმიმდევრობა (painter's algorithm). */
+    /* JSON order = drawing order (painter's algorithm). */
     qsort(ctx->widgets, ctx->widget_count, sizeof(WidgetBase *), compare_by_z);
     return true;
 }
 
 /*
- * სამიზნეები სცენის *შიგნით* იხსნება და ინდექსიც სცენა-ლოკალურია.
- * ასე ერთი და იგივე id სხვადასხვა სცენაში დამოუკიდებლად შეიძლება იარსებოს.
+ * Targets are resolved *within* a scene, and the index is scene-local too.
+ * That is what lets the same id exist independently in different scenes.
  */
 static void resolve_timeline_targets(EditorContext *ctx)
 {
@@ -1195,15 +1195,15 @@ static void resolve_timeline_targets(EditorContext *ctx)
             }
 
             if (e->target_index < 0 && e->action != ACTION_UNKNOWN) {
-                fprintf(stderr, "გაფრთხილება: სცენა '%s' — target '%s' არ მოიძებნა.\n",
-                        sc->id ? sc->id : "(უსახელო)",
+                fprintf(stderr, "warning: scene '%s' — target '%s' not found.\n",
+                        sc->id ? sc->id : "(unnamed)",
                         e->target_id ? e->target_id : "(null)");
             }
         }
     }
 }
 
-/* სცენების დაწყების მომენტები, გადასვლების გადაფარვის გათვალისწინებით. */
+/* Scene start times, accounting for transition overlap. */
 static void compute_scene_times(EditorContext *ctx)
 {
     int t = 0;
@@ -1214,13 +1214,13 @@ static void compute_scene_times(EditorContext *ctx)
         if (i < ctx->transition_count) {
             overlap = ctx->transitions[i].duration_ms;
 
-            /* გადასვლა ვერც ერთ მეზობელ სცენაზე გრძელი ვერ იქნება. */
+            /* A transition can never be longer than either neighbouring scene. */
             int limit = ctx->scenes[i].duration_ms;
             if (i + 1 < ctx->scene_count && ctx->scenes[i + 1].duration_ms < limit) {
                 limit = ctx->scenes[i + 1].duration_ms;
             }
             if (overlap > limit) {
-                fprintf(stderr, "გაფრთხილება: გადასვლა #%zu (%d ms) მეზობელ სცენაზე გრძელია — %d ms-მდე შევკვეცე.\n",
+                fprintf(stderr, "warning: transition #%zu (%d ms) is longer than its neighbour — clamped to %d ms.\n",
                         i, overlap, limit);
                 overlap = limit;
                 ctx->transitions[i].duration_ms = overlap;
@@ -1230,25 +1230,25 @@ static void compute_scene_times(EditorContext *ctx)
         t += ctx->scenes[i].duration_ms - overlap;
     }
 
-    /* ფილმის სრული სიგრძე = ბოლო სცენის დასასრული. */
+    /* The film's total length = the end of the last scene. */
     if (ctx->scene_count > 0) {
         const Scene *last = &ctx->scenes[ctx->scene_count - 1];
         ctx->config.duration_ms = last->start_ms + last->duration_ms;
     }
 }
 
-/* ვიდეოს ხანგრძლივობა: ან JSON-იდან, ან ტაიმლაინის ბოლო მოვლენიდან + კუდი. */
+/* Video duration: from the JSON, or from the last timeline event plus a tail. */
 
 
 /* ------------------------------------------------------------------------- */
-/* სცენის პარსინგი                                                            */
+/* Parsing a scene                                                            */
 /* ------------------------------------------------------------------------- */
 
 /*
- * კითხულობს ერთ სცენას: მის ობიექტებს, ტაიმლაინსა და ხანგრძლივობას.
+ * Reads one scene: its objects, timeline and duration.
  *
- * იმავე ფუნქციას იყენებს ბრტყელი რეჟიმიც — მაშინ `node` თავად root-ია და
- * სცენა ერთადერთია. ერთი გზა ნიშნავს, რომ ორივე რეჟიმი ერთნაირად იქცევა.
+ * Flat mode uses the same function — there `node` is the root itself and there
+ * is a single scene. One code path means both modes behave identically.
  */
 static bool parse_scene(EditorContext *ctx, const cJSON *node, const cJSON *styles,
                         const char *filepath, int *z, bool is_root)
@@ -1267,10 +1267,10 @@ static bool parse_scene(EditorContext *ctx, const cJSON *node, const cJSON *styl
         sc->has_bg   = true;
     }
 
-    /* --- ობიექტები --- */
+    /* --- objects --- */
     const cJSON *objects = cJSON_GetObjectItemCaseSensitive(node, "objects");
     if (!cJSON_IsArray(objects)) {
-        objects = cJSON_GetObjectItemCaseSensitive(node, "layers"); /* videogen-ის სინონიმი */
+        objects = cJSON_GetObjectItemCaseSensitive(node, "layers"); /* videogen synonym */
     }
 
     if (cJSON_IsArray(objects)) {
@@ -1292,15 +1292,15 @@ static bool parse_scene(EditorContext *ctx, const cJSON *node, const cJSON *styl
             } else if (strcmp(type, "circle") == 0) {
                 ok = parse_shape_object(ctx, obj, *z, WIDGET_CIRCLE);
             } else {
-                fprintf(stderr, "გაფრთხილება: უცნობი ობიექტის ტიპი '%s' — გამოტოვებულია.\n", type);
+                fprintf(stderr, "warning: unknown object type '%s' — skipped.\n", type);
                 continue;
             }
 
             if (!ok) {
-                fprintf(stderr, "შეცდომა: ობიექტისთვის მეხსიერება ვერ გამოიყო.\n");
+                fprintf(stderr, "error: could not allocate an object.\n");
                 return false;
             }
-            (*z)++;   /* z გლობალურად იზრდება → სცენის ობიექტები ინდექსში მომიჯნავე რჩება */
+            (*z)++;   /* z increases globally → a scene's objects stay adjacent in the index */
         }
     }
 
@@ -1308,11 +1308,11 @@ static bool parse_scene(EditorContext *ctx, const cJSON *node, const cJSON *styl
                         ctx->shape_count) - sc->first_widget;
 
     /*
-     * --- სცენის საკუთარი ეფექტები ---
+     * --- the scene's own effects ---
      *
-     * ბრტყელ რეჟიმში `node` თავად root-ია, ანუ აქაური "effects" *გლობალური*
-     * სტეკია და მას ცალკე კითხულობს parse_video_project_ex(). მისი აქ მეორედ
-     * წაკითხვა იმას ნიშნავდა, რომ ყველა ეფექტი ორჯერ დაედებოდა კადრს.
+     * In flat mode `node` is the root itself, so the "effects" here is the
+     * *global* stack, read separately by parse_video_project_ex(). Reading it
+     * a second time meant every effect was applied to the frame twice.
      */
     if (!is_root &&
         !parse_effects_into(&sc->effects, &sc->effect_count, &sc->effect_cap,
@@ -1320,19 +1320,19 @@ static bool parse_scene(EditorContext *ctx, const cJSON *node, const cJSON *styl
         return false;
     }
 
-    /* --- ტაიმლაინი --- */
+    /* --- timeline --- */
     const cJSON *timeline = cJSON_GetObjectItemCaseSensitive(node, "timeline");
     if (cJSON_IsArray(timeline)) {
         const cJSON *ev = NULL;
         cJSON_ArrayForEach(ev, timeline) {
             if (!parse_timeline_event(sc, ev)) {
-                fprintf(stderr, "შეცდომა: ტაიმლაინისთვის მეხსიერება ვერ გამოიყო.\n");
+                fprintf(stderr, "error: could not allocate a timeline event.\n");
                 return false;
             }
         }
     }
 
-    /* --- ხანგრძლივობა --- */
+    /* --- duration --- */
     if (json_has(node, "duration_ms")) {
         sc->duration_ms = json_int(node, "duration_ms", 0);
     } else if (json_has(node, "duration")) {
@@ -1353,7 +1353,7 @@ static bool parse_scene(EditorContext *ctx, const cJSON *node, const cJSON *styl
 }
 
 /* ------------------------------------------------------------------------- */
-/* მთავარი შესასვლელი                                                         */
+/* Main entry point                                                           */
 /* ------------------------------------------------------------------------- */
 
 EditorContext *parse_video_project(const char *filepath)
@@ -1373,16 +1373,16 @@ EditorContext *parse_video_project_ex(const char *filepath, char **defines, int 
     }
 
     cJSON *root = cJSON_Parse(json_text);
-    free(json_text); /* cJSON-მა უკვე გადმოიღო თავისი ასლები */
+    free(json_text); /* cJSON has already taken its own copies */
 
     if (root == NULL) {
         const char *err = cJSON_GetErrorPtr();
-        fprintf(stderr, "შეცდომა JSON-ის პარსინგისას%s%.40s\n",
-                err ? " ახლოს: " : ".", err ? err : "");
+        fprintf(stderr, "error parsing JSON%s%.40s\n",
+                err ? " near: " : ".", err ? err : "");
         return NULL;
     }
 
-    /* --- 0. ცვლადები: JSON-ის "vars" + ბრძანების ხაზის --set ------------- */
+    /* --- 0. Variables: the JSON's "vars" plus --set from the CLI --------- */
     cJSON *vars = cJSON_GetObjectItemCaseSensitive(root, "vars");
     if (vars == NULL) {
         vars = cJSON_AddObjectToObject(root, "vars");
@@ -1391,7 +1391,7 @@ EditorContext *parse_video_project_ex(const char *filepath, char **defines, int 
     for (int i = 0; i < define_count; i++) {
         const char *eq = strchr(defines[i], '=');
         if (eq == NULL) {
-            fprintf(stderr, "გაფრთხილება: --set '%s' არ შეიცავს '='.\n", defines[i]);
+            fprintf(stderr, "warning: --set '%s' contains no '='.\n", defines[i]);
             continue;
         }
         size_t klen = (size_t)(eq - defines[i]);
@@ -1402,7 +1402,7 @@ EditorContext *parse_video_project_ex(const char *filepath, char **defines, int 
         memcpy(key, defines[i], klen);
         key[klen] = '\0';
 
-        /* ბრძანების ხაზი JSON-ის მნიშვნელობას გადააწერს. */
+        /* The command line overrides the JSON's value. */
         cJSON_DeleteItemFromObjectCaseSensitive(vars, key);
         cJSON_AddStringToObject(vars, key, eq + 1);
     }
@@ -1427,7 +1427,7 @@ EditorContext *parse_video_project_ex(const char *filepath, char **defines, int 
     ctx->config.bg_color    = json_color(project, "bg_color", (Color){ 0, 0, 0, 255 });
     ctx->config.duration_ms = json_int(project, "duration_ms", 0);
 
-    /* --- 1b. output { } — კოდირების პარამეტრები --------------------------- */
+    /* --- 1b. output { } — encoding parameters ----------------------------- */
     {
         const cJSON *out_cfg = cJSON_GetObjectItemCaseSensitive(root, "output");
         ctx->output.encoder = dup_string(json_str(out_cfg, "encoder", "h264_nvenc"));
@@ -1445,29 +1445,29 @@ EditorContext *parse_video_project_ex(const char *filepath, char **defines, int 
         }
     }
 
-    /* გონივრული საზღვრები — არასწორი კონფიგი VRAM-ის უაზრო მოთხოვნას ნიშნავს. */
+    /* Sane limits — a bad config would ask for an absurd amount of VRAM. */
     if (ctx->config.width  < 16 || ctx->config.width  > 16384 ||
         ctx->config.height < 16 || ctx->config.height > 16384 ||
         ctx->config.fps    < 1  || ctx->config.fps    > 480) {
-        fprintf(stderr, "შეცდომა: არასწორი კონფიგი %dx%d @ %d fps.\n",
+        fprintf(stderr, "error: invalid config %dx%d @ %d fps.\n",
                 ctx->config.width, ctx->config.height, ctx->config.fps);
         goto fail;
     }
 
     /*
-     * H.264/HEVC-ის 4:2:0 ქრომა ორ პიქსელს ერთ ნიმუშად კრებს, ამიტომ კენტი
-     * ზომა კოდირებისას შეცდომას იძლევა. ჩუმად დამრგვალება უკეთესია, ვიდრე
-     * ffmpeg-ის გაუგებარი შეცდომა რენდერის ბოლოს.
+     * H.264/HEVC 4:2:0 chroma takes one sample per two pixels, so an odd
+     * dimension fails at encode time. Rounding down quietly beats a cryptic
+     * ffmpeg error at the very end of a render.
      */
     if ((ctx->config.width % 2) != 0 || (ctx->config.height % 2) != 0) {
-        fprintf(stderr, "გაფრთხილება: %dx%d კენტია — ვამრგვალებთ %dx%d-მდე (4:2:0 მოითხოვს ლუწს).\n",
+        fprintf(stderr, "warning: %dx%d is odd — rounding to %dx%d (4:2:0 needs even).\n",
                 ctx->config.width, ctx->config.height,
                 ctx->config.width & ~1, ctx->config.height & ~1);
         ctx->config.width  &= ~1;
         ctx->config.height &= ~1;
     }
 
-    /* --- 2. სცენები ან ბრტყელი objects[] ---------------------------------- */
+    /* --- 2. Scenes, or a flat objects[] ----------------------------------- */
     {
         const cJSON *scenes_arr = cJSON_GetObjectItemCaseSensitive(root, "scenes");
         int          z          = 0;
@@ -1480,14 +1480,14 @@ EditorContext *parse_video_project_ex(const char *filepath, char **defines, int 
                 }
             }
             if (ctx->scene_count == 0) {
-                fprintf(stderr, "შეცდომა: 'scenes' ცარიელია.\n");
+                fprintf(stderr, "error: 'scenes' is empty.\n");
                 goto fail;
             }
         } else {
             /*
-             * ბრტყელი რეჟიმი: ერთი იმპლიციტური სცენა, რომელიც ყველა ობიექტს
-             * იტევს. ასე რენდერერს ერთი კოდის გზა რჩება და ძველი პროექტები
-             * უცვლელად მუშაობს.
+             * Flat mode: one implicit scene holding every object. That leaves
+             * the renderer a single code path and keeps older projects
+             * working unchanged.
              */
             if (!parse_scene(ctx, root, styles, filepath, &z, true)) {
                 goto fail;
@@ -1499,31 +1499,31 @@ EditorContext *parse_video_project_ex(const char *filepath, char **defines, int 
     /* --- 3b. effects [ ] -------------------------------------------------- */
     if (!parse_effects_into(&ctx->effects, &ctx->effect_count, &ctx->effect_cap,
                             cJSON_GetObjectItemCaseSensitive(root, "effects"))) {
-        fprintf(stderr, "შეცდომა: ეფექტებისთვის მეხსიერება ვერ გამოიყო.\n");
+        fprintf(stderr, "error: could not allocate the effects.\n");
         goto fail;
     }
 
     /* --- 3c. audio [ ] ---------------------------------------------------- */
     if (!parse_audio(ctx, cJSON_GetObjectItemCaseSensitive(root, "audio"), filepath)) {
-        fprintf(stderr, "შეცდომა: ხმოვანი ბილიკები ვერ დამუშავდა.\n");
+        fprintf(stderr, "error: could not process the audio tracks.\n");
         goto fail;
     }
 
-    /* --- 4. ინდექსი, ბმულები, ხანგრძლივობა, არენა ------------------------- */
+    /* --- 4. Index, references, duration, arena ---------------------------- */
     if (!ctx_build_widget_index(ctx)) {
-        fprintf(stderr, "შეცდომა: ვიჯეტების ინდექსი ვერ აიგო.\n");
+        fprintf(stderr, "error: could not build the widget index.\n");
         goto fail;
     }
     resolve_timeline_targets(ctx);
 
     if (!parse_transitions(ctx, cJSON_GetObjectItemCaseSensitive(root, "transitions"))) {
-        fprintf(stderr, "შეცდომა: გადასვლებისთვის მეხსიერება ვერ გამოიყო.\n");
+        fprintf(stderr, "error: could not allocate the transitions.\n");
         goto fail;
     }
 
     /*
-     * ბრტყელ რეჟიმში პროექტის ხანგრძლივობა კარნახობს ერთადერთი სცენისას;
-     * სცენების რეჟიმში კი პირიქით — ჯამი განისაზღვრება სცენებით.
+     * In flat mode the project's duration dictates the single scene's; in
+     * scene mode it is the other way round — the total comes from the scenes.
      */
     if (ctx->scene_count == 1 && ctx->config.duration_ms > 0) {
         ctx->scenes[0].duration_ms = ctx->config.duration_ms;
@@ -1531,7 +1531,7 @@ EditorContext *parse_video_project_ex(const char *filepath, char **defines, int 
     compute_scene_times(ctx);
 
     if (!arena_init(&ctx->frame_arena, FRAME_ARENA_BYTES)) {
-        fprintf(stderr, "შეცდომა: კადრის არენა ვერ გამოიყო.\n");
+        fprintf(stderr, "error: could not allocate the frame arena.\n");
         goto fail;
     }
 
@@ -1545,10 +1545,10 @@ fail:
 }
 
 /* ------------------------------------------------------------------------- */
-/* გასუფთავება                                                                */
+/* Cleanup                                                                    */
 /* ------------------------------------------------------------------------- */
 
-/* ვიჯეტის საერთო ნაწილის რესურსები (მათ შორის თვისებების ტრეკები). */
+/* Resources owned by a widget's common part (property tracks included). */
 static void widget_base_free(WidgetBase *b)
 {
     free(b->id);
@@ -1572,8 +1572,8 @@ void editor_context_free(EditorContext *ctx)
         return;
     }
 
-    /* VRAM ჯერ — renderer-მა შეიძლება ჯერ კიდევ ეჭიროს device მაჩვენებლები,
-     * რომლებიც ტექსტურებში წერია. იდემპოტენტურია. */
+    /* VRAM first — the renderer may still hold device pointers stored inside
+     * the textures. Idempotent. */
     renderer_shutdown(ctx);
 
     for (size_t i = 0; i < ctx->text_count; i++) {
@@ -1587,7 +1587,7 @@ void editor_context_free(EditorContext *ctx)
     for (size_t i = 0; i < ctx->code_count; i++) {
         CodeWidget *w = &ctx->codes[i];
         widget_base_free(&w->base);
-        texture_free(&w->plate); /* ფირფიტა ცალკე შრეა */
+        texture_free(&w->plate); /* the panel is a separate layer */
         free(w->code);
         free(w->language);
         free(w->font);
@@ -1647,13 +1647,13 @@ void editor_context_free(EditorContext *ctx)
     }
     free(ctx->transitions);
 
-    free(ctx->widgets); /* მხოლოდ ინდექსი — თვით ვიჯეტები უკვე გათავისუფლდა */
+    free(ctx->widgets); /* the index only — the widgets themselves are already freed */
     arena_destroy(&ctx->frame_arena);
     free(ctx);
 }
 
 /* ------------------------------------------------------------------------- */
-/* დიაგნოსტიკა                                                                */
+/* Diagnostics                                                                */
 /* ------------------------------------------------------------------------- */
 
 static const char *action_name(ActionType a)
@@ -1676,18 +1676,18 @@ void editor_context_dump(const EditorContext *ctx)
         return;
     }
 
-    fprintf(stderr, "--- პროექტი -------------------------------------------\n");
-    fprintf(stderr, "  გარჩევადობა : %dx%d @ %d fps\n",
+    fprintf(stderr, "--- project -------------------------------------------\n");
+    fprintf(stderr, "  resolution : %dx%d @ %d fps\n",
             ctx->config.width, ctx->config.height, ctx->config.fps);
-    fprintf(stderr, "  ხანგრძლივობა: %d ms (%d კადრი)\n", ctx->config.duration_ms,
+    fprintf(stderr, "  duration   : %d ms (%d frames)\n", ctx->config.duration_ms,
             (int)(((long long)ctx->config.duration_ms * ctx->config.fps + 999) / 1000));
-    fprintf(stderr, "  ფონი        : #%02X%02X%02X%02X\n", ctx->config.bg_color.r,
+    fprintf(stderr, "  background : #%02X%02X%02X%02X\n", ctx->config.bg_color.r,
             ctx->config.bg_color.g, ctx->config.bg_color.b, ctx->config.bg_color.a);
 
-    fprintf(stderr, "--- ობიექტები (%zu) -----------------------------------\n", ctx->widget_count);
+    fprintf(stderr, "--- objects (%zu) -------------------------------------\n", ctx->widget_count);
     for (size_t i = 0; i < ctx->widget_count; i++) {
         const WidgetBase *b = ctx->widgets[i];
-        fprintf(stderr, "  [%zu] %-14s %-6s pos=(%s%.0f, %.0f) tex=%dx%d  %d სიმბოლო\n", i,
+        fprintf(stderr, "  [%zu] %-14s %-6s pos=(%s%.0f, %.0f) tex=%dx%d  %d chars\n", i,
                 b->id ? b->id : "(null)",
                 (b->kind == WIDGET_TEXT)  ? "text"  : (b->kind == WIDGET_CODE)   ? "code" :
                 (b->kind == WIDGET_IMAGE) ? "image" : (b->kind == WIDGET_CIRCLE) ? "circle" : "rect",
@@ -1696,11 +1696,11 @@ void editor_context_dump(const EditorContext *ctx)
                 b->tex.width, b->tex.height, b->glyphs.total_chars);
     }
 
-    fprintf(stderr, "--- სცენები (%zu) -------------------------------------\n", ctx->scene_count);
+    fprintf(stderr, "--- scenes (%zu) --------------------------------------\n", ctx->scene_count);
     for (size_t si = 0; si < ctx->scene_count; si++) {
         const Scene *sc = &ctx->scenes[si];
-        fprintf(stderr, "  [%zu] %-12s %6d..%-6d ms  %zu ობიექტი, %zu მოვლენა\n", si,
-                sc->id ? sc->id : "(უსახელო)", sc->start_ms,
+        fprintf(stderr, "  [%zu] %-12s %6d..%-6d ms  %zu objects, %zu events\n", si,
+                sc->id ? sc->id : "(unnamed)", sc->start_ms,
                 sc->start_ms + sc->duration_ms, sc->widget_count, sc->event_count);
 
         for (size_t i = 0; i < sc->event_count; i++) {
@@ -1710,18 +1710,18 @@ void editor_context_dump(const EditorContext *ctx)
                     e->target_id ? e->target_id : "(null)", e->duration_ms);
         }
         if (si < ctx->transition_count && ctx->transitions[si].type != TRANS_CUT) {
-            fprintf(stderr, "      ↕ გადასვლა: %d ms\n", ctx->transitions[si].duration_ms);
+            fprintf(stderr, "      ↕ transition: %d ms\n", ctx->transitions[si].duration_ms);
         }
     }
     if (ctx->effect_count > 0) {
-        fprintf(stderr, "--- ეფექტები (%zu) -------------------------------------\n",
+        fprintf(stderr, "--- effects (%zu) -------------------------------------\n",
                 ctx->effect_count);
         for (size_t i = 0; i < ctx->effect_count; i++) {
             fprintf(stderr, "  [%zu] %s\n", i, effect_name(ctx->effects[i].type));
         }
     }
     if (ctx->audio_count > 0) {
-        fprintf(stderr, "--- ხმა (%zu) ------------------------------------------\n",
+        fprintf(stderr, "--- audio (%zu) ----------------------------------------\n",
                 ctx->audio_count);
         for (size_t i = 0; i < ctx->audio_count; i++) {
             const AudioTrack *a = &ctx->audio[i];
@@ -1734,13 +1734,13 @@ void editor_context_dump(const EditorContext *ctx)
 }
 
 /* ------------------------------------------------------------------------- */
-/* ვალიდაცია                                                                  */
+/* Validation                                                                 */
 /* ------------------------------------------------------------------------- */
 
 /*
- * მიმაგრების შემდეგ `base->x/y` მიმაგრების *წერტილია* და არა ზედა-მარცხენა
- * კუთხე. დიაგნოსტიკამ და ვალიდაციამ ნამდვილი კიდე უნდა დაინახოს, თორემ
- * "right"-ზე მიმაგრებული ობიექტი ცრუდ აღინიშნება კადრს გარეთ გასულად.
+ * After anchoring, `base->x/y` is the anchor *point*, not the top-left corner.
+ * Diagnostics and validation must see the real edge, otherwise an object
+ * anchored to "right" is falsely reported as off-canvas.
  */
 static float widget_left(const WidgetBase *b) { return b->x - b->anchor_off_x; }
 static float widget_top (const WidgetBase *b) { return b->y - b->anchor_off_y; }
@@ -1766,23 +1766,23 @@ int editor_context_check(const EditorContext *ctx)
     #define VR_PROBLEM(...) do { fprintf(stderr, "  ✗ " __VA_ARGS__); problems++; } while (0)
     #define VR_NOTE(...)    do { fprintf(stderr, "  · " __VA_ARGS__); } while (0)
 
-    fprintf(stderr, "--- შემოწმება ------------------------------------------\n");
+    fprintf(stderr, "--- check ---------------------------------------------\n");
 
-    /* --- პროექტი --------------------------------------------------------- */
+    /* --- project --------------------------------------------------------- */
     if (ctx->config.duration_ms <= 0) {
-        VR_PROBLEM("ხანგრძლივობა ნულოვანია.\n");
+        VR_PROBLEM("duration is zero.\n");
     }
     if (ctx->widget_count == 0) {
-        VR_PROBLEM("პროექტში არც ერთი ობიექტი არაა.\n");
+        VR_PROBLEM("the project has no objects at all.\n");
     }
 
-    /* --- ობიექტები -------------------------------------------------------- */
+    /* --- objects ---------------------------------------------------------- */
     for (size_t i = 0; i < ctx->widget_count; i++) {
         const WidgetBase *b  = ctx->widgets[i];
         const char       *id = b->id ? b->id : "(null)";
 
         if (b->base_w < 1.0f || b->base_h < 1.0f) {
-            VR_PROBLEM("'%s' — ნულოვანი ზომა (%.0fx%.0f).\n", id,
+            VR_PROBLEM("'%s' — zero size (%.0fx%.0f).\n", id,
                        (double)b->base_w, (double)b->base_h);
             continue;
         }
@@ -1790,52 +1790,52 @@ int editor_context_check(const EditorContext *ctx)
         float x0 = widget_left(b), y0 = widget_top(b);
         float x1 = x0 + b->base_w,  y1 = y0 + b->base_h;
 
-        /* სრულიად კადრს გარეთ — ეს ყოველთვის შეცდომაა. */
+        /* Entirely off-canvas — always an error. */
         if (x1 <= 0.0f || y1 <= 0.0f ||
             x0 >= (float)ctx->config.width || y0 >= (float)ctx->config.height) {
-            VR_PROBLEM("'%s' (%s) — მთლიანად კადრს გარეთაა: x=%.0f..%.0f y=%.0f..%.0f\n",
+            VR_PROBLEM("'%s' (%s) — entirely off-canvas: x=%.0f..%.0f y=%.0f..%.0f\n",
                        id, kind_name(b->kind), (double)x0, (double)x1, (double)y0, (double)y1);
             continue;
         }
 
         /*
-         * ნაწილობრივ ამოვარდნა სურათისთვის ნორმაა (cover-კადრი განზრახ იჭრება),
-         * ტექსტისთვის კი თითქმის ყოველთვის ხარვეზია.
+         * Partial overflow is normal for an image (a cover shot is meant to be
+         * cropped) but is almost always a bug for text.
          */
         bool clipped = (x0 < 0.0f) || (y0 < 0.0f) ||
                        (x1 > (float)ctx->config.width) || (y1 > (float)ctx->config.height);
 
         if (clipped) {
             if (b->kind == WIDGET_TEXT || b->kind == WIDGET_CODE) {
-                VR_PROBLEM("'%s' (%s) — კიდეზე იჭრება: x=%.0f..%.0f y=%.0f..%.0f (კადრი %dx%d)\n",
+                VR_PROBLEM("'%s' (%s) — clipped at the edge: x=%.0f..%.0f y=%.0f..%.0f (canvas %dx%d)\n",
                            id, kind_name(b->kind), (double)x0, (double)x1,
                            (double)y0, (double)y1, ctx->config.width, ctx->config.height);
             } else {
-                VR_NOTE("'%s' (%s) კადრს სცდება — სავარაუდოდ განზრახ (cover).\n",
+                VR_NOTE("'%s' (%s) extends past the canvas — probably intentional (cover).\n",
                         id, kind_name(b->kind));
             }
         }
 
         if (b->tex.pixels == NULL) {
-            VR_PROBLEM("'%s' — ტექსტურა არ დარასტერიზდა.\n", id);
+            VR_PROBLEM("'%s' — the texture was not rasterized.\n", id);
         }
     }
 
-    /* --- ტაიმლაინი (სცენების მიხედვით) ------------------------------------ */
+    /* --- timeline (per scene) --------------------------------------------- */
     size_t total_events = 0;
     for (size_t si = 0; si < ctx->scene_count; si++) {
         const Scene *sc = &ctx->scenes[si];
-        const char  *sn = sc->id ? sc->id : "(უსახელო)";
+        const char  *sn = sc->id ? sc->id : "(unnamed)";
         total_events += sc->event_count;
 
         if (sc->duration_ms <= 0) {
-            VR_PROBLEM("სცენა '%s' — ნულოვანი ხანგრძლივობა.\n", sn);
+            VR_PROBLEM("scene '%s' — zero duration.\n", sn);
         }
 
         /*
-         * დუბლირებული id მხოლოდ *ერთი სცენის შიგნით* არის პრობლემა — სამიზნეები
-         * სცენა-ლოკალურად იხსნება, ამიტომ სხვადასხვა სცენაში ერთი და იგივე
-         * სახელი სრულიად ნორმალურია (და შაბლონებში სასურველიც).
+         * A duplicate id is a problem only *within one scene* — targets resolve
+         * scene-locally, so the same name in different scenes is perfectly
+         * normal (and desirable in templates).
          */
         for (size_t a = 0; a < sc->widget_count; a++) {
             const char *ia = ctx->widgets[sc->first_widget + a]->id;
@@ -1845,7 +1845,7 @@ int editor_context_check(const EditorContext *ctx)
             for (size_t b2 = a + 1; b2 < sc->widget_count; b2++) {
                 const char *ib = ctx->widgets[sc->first_widget + b2]->id;
                 if (ib != NULL && strcmp(ia, ib) == 0) {
-                    VR_PROBLEM("სცენა '%s' — id '%s' მეორდება; ტაიმლაინი მხოლოდ პირველს მიწვდება.\n",
+                    VR_PROBLEM("scene '%s' — duplicate id '%s'; the timeline reaches only the first.\n",
                                sn, ia);
                     break;
                 }
@@ -1856,34 +1856,34 @@ int editor_context_check(const EditorContext *ctx)
             const TimelineEvent *e = &sc->events[i];
 
             if (e->action == ACTION_UNKNOWN) {
-                VR_PROBLEM("'%s' #%zu — უცნობი action (t=%d ms).\n", sn, i, e->time_ms);
+                VR_PROBLEM("'%s' #%zu — unknown action (t=%d ms).\n", sn, i, e->time_ms);
                 continue;
             }
             if (e->target_index < 0) {
-                VR_PROBLEM("'%s' #%zu — target '%s' ვერ მოიძებნა.\n", sn, i,
+                VR_PROBLEM("'%s' #%zu — target '%s' not found.\n", sn, i,
                            e->target_id ? e->target_id : "(null)");
             }
             if (e->time_ms > sc->duration_ms) {
-                VR_PROBLEM("'%s' #%zu — t=%d ms სცენის ბოლოს (%d ms) მიღმაა.\n",
+                VR_PROBLEM("'%s' #%zu — t=%d ms is past the scene's end (%d ms).\n",
                            sn, i, e->time_ms, sc->duration_ms);
             }
         }
     }
 
-    /* --- ხმა -------------------------------------------------------------- */
+    /* --- audio ------------------------------------------------------------- */
     for (size_t i = 0; i < ctx->audio_count; i++) {
         const AudioTrack *a = &ctx->audio[i];
         if (a->start * 1000.0f >= (float)ctx->config.duration_ms) {
-            VR_PROBLEM("ხმა '%s' ვიდეოს ბოლოს მიღმა იწყება (%.2f წმ).\n",
+            VR_PROBLEM("audio '%s' starts past the end of the video (%.2f s).\n",
                        a->path ? a->path : "(null)", (double)a->start);
         }
     }
 
     if (problems == 0) {
-        fprintf(stderr, "  ✓ პრობლემა ვერ მოიძებნა (%zu სცენა, %zu ობიექტი, %zu მოვლენა)\n",
+        fprintf(stderr, "  ✓ no problems found (%zu scenes, %zu objects, %zu events)\n",
                 ctx->scene_count, ctx->widget_count, total_events);
     } else {
-        fprintf(stderr, "  %d პრობლემა\n", problems);
+        fprintf(stderr, "  %d problem(s)\n", problems);
     }
     fprintf(stderr, "-------------------------------------------------------\n");
 
