@@ -1,0 +1,86 @@
+{
+  "_comment": [
+    "hero_card.json — განცხადების სატიტულო ბარათი, სრულად JSON-ში.",
+    "",
+    "მნიშვნელოვანი: ამ ფაილს Python-გენერატორი არ სჭირდება. ყველა პოზიცია",
+    "ფარდობითია (anchor / % / bottom-N), ტექსტი თავად გადადის სტრიქონებზე,",
+    "მონაცემები კი ცვლადებია — ანუ ერთი ფაილი ნებისმიერ განცხადებას მოემსახურება.",
+    "",
+    "გაშვება:",
+    "  ./video_redac listing/hero_card.json -o hero.mp4 \\",
+    "     --set photo=photos/00.jpg \\",
+    "     --set street='300 Upper Station Camp Crk Rd' \\",
+    "     --set city='Gallatin, TN 37066' \\",
+    "     --set price='$525,000' \\",
+    "     --set agent='Cynthia Pearson · Compass'"
+  ],
+
+  "vars": {
+    "photo":  "photos/00.jpg",
+    "street": "123 Example Street",
+    "city":   "Anytown, ST 00000",
+    "price":  "$000,000",
+    "agent":  "Agent Name · Brokerage",
+    "status": "JUST LISTED",
+    "accent": "#E8C39E"
+  },
+
+  "styles": {
+    "base":  { "font": "DejaVu Sans-Bold", "color": "#FFFFFF" },
+    "kicker":{ "style": "base", "size": 30, "color": "${accent}", "x": "center" },
+    "head":  { "style": "base", "size": 58, "x": "center", "max_width": "84%", "align": "center" },
+    "sub":   { "font": "DejaVu Sans", "size": 36, "color": "#D7D3CC", "x": "center" }
+  },
+
+  "project": {
+    "width": 1080, "height": 1920, "fps": 30,
+    "bg_color": "#0B0B0F", "duration_ms": 6000
+  },
+
+  "objects": [
+    {
+      "_": "სრულეკრანიანი ფოტო — height=1920 + ავტო-ცენტრი იძლევა object-fit: cover-ს",
+      "id": "photo", "type": "image", "path": "${photo}", "height": 1920, "y": 0,
+      "scale": [{ "t": 0, "v": 1.0 }, { "t": 6, "v": 1.09, "ease": "linear" }],
+      "opacity": [{ "t": 0, "v": 0 }, { "t": 0.8, "v": 1, "ease": "easeout" }]
+    },
+
+    { "id": "scrim_b", "type": "image", "path": "assets/scrim_bottom.png",
+      "x": 0, "y": "bottom", "opacity": [{ "t": 0.2, "v": 0 }, { "t": 1.0, "v": 1 }] },
+    { "id": "scrim_t", "type": "image", "path": "assets/scrim_top.png",
+      "x": 0, "y": "top", "opacity": [{ "t": 0.2, "v": 0 }, { "t": 1.0, "v": 1 }] },
+
+    { "id": "kick", "type": "text", "style": "kicker", "content": "${status}",
+      "y": "top+110",
+      "opacity": [{ "t": 0.4, "v": 0 }, { "t": 1.0, "v": 1, "ease": "easeout" }] },
+
+    { "id": "addr", "type": "text", "style": "head", "content": "${street}",
+      "y": "bottom-430", "anchor": "bottom",
+      "opacity": [{ "t": 0.9, "v": 0 }, { "t": 1.6, "v": 1, "ease": "easeout" }] },
+
+    { "id": "city", "type": "text", "style": "sub", "content": "${city}",
+      "y": "bottom-365", "anchor": "bottom",
+      "opacity": [{ "t": 1.1, "v": 0 }, { "t": 1.8, "v": 1, "ease": "easeout" }] },
+
+    { "id": "rule", "type": "rect", "x": "center", "y": "bottom-345", "anchor": "bottom",
+      "w": 220, "h": 5, "color": "${accent}",
+      "opacity": [{ "t": 1.4, "v": 0 }, { "t": 2.0, "v": 1 }] },
+
+    { "id": "price", "type": "text", "style": "base", "content": "${price}",
+      "size": 92, "x": "center", "y": "bottom-200", "anchor": "bottom",
+      "opacity": [{ "t": 1.6, "v": 0 }, { "t": 2.3, "v": 1, "ease": "easeout" }],
+      "scale":   [{ "t": 1.6, "v": 0.9 }, { "t": 2.4, "v": 1.0, "ease": "backout" }] },
+
+    { "id": "agent", "type": "text", "style": "sub", "content": "${agent}",
+      "size": 30, "color": "#9A958D", "y": "bottom-90", "anchor": "bottom",
+      "opacity": [{ "t": 2.0, "v": 0 }, { "t": 2.7, "v": 1, "ease": "easeout" }] }
+  ],
+
+  "timeline": [],
+
+  "effects": [
+    { "type": "color_grade", "contrast": 1.06, "saturation": 1.08, "temperature": 0.035 },
+    { "type": "vignette", "amount": 0.32, "radius": 0.66, "softness": 0.6, "color": "#000000" },
+    { "type": "grain", "amount": 0.014 }
+  ]
+}

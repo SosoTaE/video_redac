@@ -1,0 +1,316 @@
+{
+  "_comment": "MASTER CONFIGURATION: Quantum Neural Mandala (No Images, Pure Geometry & Math)",
+  "vars": {
+    "bg_deep": "#040408",
+    "bg_mask": "#040408",
+    "neon_cyan": "#00F0FF",
+    "neon_magenta": "#FF007F",
+    "neon_gold": "#FFD700",
+    "text_white": "#FAFAFA",
+    "font_title": "Montserrat-Black",
+    "font_mono": "FiraCode-Bold"
+  },
+  "project": {
+    "width": 3840,
+    "height": 2160,
+    "fps": 60,
+    "bg_color": "${bg_deep}"
+  },
+  "output": {
+    "encoder": "h264_nvenc",
+    "preset": "p7",
+    "cq": 14
+  },
+  
+  "styles": {
+    "text_base": {
+      "font": "Inter-Regular",
+      "color": "${text_white}",
+      "align": "center",
+      "anchor": "middle"
+    },
+    "title_primary": {
+      "style": "text_base",
+      "font": "${font_title}",
+      "size": 180,
+      "color": "${neon_cyan}"
+    },
+    "title_secondary": {
+      "style": "text_base",
+      "font": "Inter-Light",
+      "size": 80,
+      "color": "${neon_gold}",
+      "opacity": 0.8
+    },
+    "thin_line_h": {
+      "type": "rect",
+      "color": "${neon_cyan}",
+      "h": 4,
+      "anchor": "middle"
+    },
+    "thin_line_v": {
+      "type": "rect",
+      "color": "${neon_cyan}",
+      "w": 4,
+      "anchor": "middle"
+    },
+    "code_hologram": {
+      "type": "code",
+      "font": "${font_mono}",
+      "size": 36,
+      "padding": 40,
+      "corner_radius": 12,
+      "bg_color": "#00000000",
+      "color": "${neon_magenta}"
+    }
+  },
+
+  "scenes": [
+    {
+      "_comment": "SCENE 1: THE SPARK - მინიმალისტური წერტილი, რომელიც იშლება რთულ გეომეტრიად",
+      "id": "scene_01_genesis",
+      "duration": 6.5,
+      "effects": [
+        { "type": "blur", "radius": [ {"t":0,"v":100}, {"t":2,"v":0,"ease":"expoout"} ] },
+        { "type": "vignette", "amount": 0.7, "radius": 0.6 }
+      ],
+      "objects": [
+        {
+          "_comment": "გარე ნეონური რგოლი (შექმნილია ორი წრის გადადებით)",
+          "id": "ring_outer_color",
+          "type": "circle",
+          "color": "${neon_magenta}",
+          "cx": "center", "cy": "middle",
+          "radius": [
+            { "t": 0, "v": 0 },
+            { "t": 3, "v": 1000, "ease": "elasticout" },
+            { "t": 6.5, "v": 1050, "ease": "linear" }
+          ],
+          "opacity": [ {"t":0, "v":1}, {"t":5, "v":1}, {"t":6.5, "v":0} ]
+        },
+        {
+          "id": "ring_outer_mask",
+          "type": "circle",
+          "color": "${bg_mask}",
+          "cx": "center", "cy": "middle",
+          "radius": [
+            { "t": 0, "v": 0 },
+            { "t": 3.1, "v": 990, "ease": "elasticout" },
+            { "t": 6.5, "v": 1040, "ease": "linear" }
+          ]
+        },
+        {
+          "_comment": "მბრუნავი ჯვარედინი ხაზები",
+          "id": "crosshair_1",
+          "style": "thin_line_h",
+          "color": "${neon_gold}",
+          "w": [ {"t":2, "v":0}, {"t":4, "v":2500, "ease":"expoout"} ],
+          "x": "center", "y": "middle",
+          "rotation": [ {"t":2, "v":0}, {"t":6.5, "v":90, "ease":"cubicinout"} ]
+        },
+        {
+          "id": "crosshair_2",
+          "style": "thin_line_v",
+          "color": "${neon_gold}",
+          "h": [ {"t":2, "v":0}, {"t":4, "v":2500, "ease":"expoout"} ],
+          "x": "center", "y": "middle",
+          "rotation": [ {"t":2, "v":0}, {"t":6.5, "v":90, "ease":"cubicinout"} ]
+        },
+        {
+          "id": "genesis_title",
+          "type": "text",
+          "style": "title_primary",
+          "content": "PHASE I: GENESIS",
+          "x": "center", "y": "middle",
+          "scale": [ {"t":0, "v":0}, {"t":2.5, "v":1.2, "ease":"backout"} ],
+          "opacity": [ {"t":0, "v":0}, {"t":2, "v":1}, {"t":5.5, "v":1}, {"t":6, "v":0} ]
+        }
+      ]
+    },
+    {
+      "_comment": "SCENE 2: QUANTUM LATTICE - კოდირება და ბადის სტრუქტურის აწყობა",
+      "id": "scene_02_lattice",
+      "duration": 7.0,
+      "bg_color": "#06060A",
+      "effects": [
+        { "type": "scanlines", "amount": 0.3, "count": 1440 },
+        { "type": "rgb_split", "amount": [ {"t":0,"v":20}, {"t":1,"v":0,"ease":"expoout"} ], "angle": 45 },
+        { "type": "color_grade", "contrast": 1.2, "saturation": 1.3 }
+      ],
+      "objects": [
+        {
+          "id": "grid_line_h1", "style": "thin_line_h", "color": "#1A1A2E", "w": 3840, "x": "center", "y": "top+540"
+        },
+        {
+          "id": "grid_line_h2", "style": "thin_line_h", "color": "#1A1A2E", "w": 3840, "x": "center", "y": "bottom-540"
+        },
+        {
+          "id": "grid_line_v1", "style": "thin_line_v", "color": "#1A1A2E", "h": 2160, "x": "left+960", "y": "middle"
+        },
+        {
+          "id": "grid_line_v2", "style": "thin_line_v", "color": "#1A1A2E", "h": 2160, "x": "right-960", "y": "middle"
+        },
+        {
+          "id": "holo_code_left",
+          "style": "code_hologram",
+          "language": "python",
+          "content": "def quantum_entangle(state_a, state_b):\n    matrix = compute_tensor(state_a, state_b)\n    while not matrix.is_stable():\n        matrix.apply_noise_filter()\n    return matrix.collapse()",
+          "x": "left+200", "y": "top+200", "anchor": "topleft",
+          "opacity": [ {"t":0,"v":0}, {"t":1,"v":1} ]
+        },
+        {
+          "id": "central_pulse",
+          "type": "circle",
+          "color": "${neon_cyan}",
+          "cx": "center", "cy": "middle",
+          "opacity": [ {"t":0,"v":0.8}, {"t":1,"v":0.1}, {"t":2,"v":0.8}, {"t":3,"v":0.1} ],
+          "radius": [ {"t":0,"v":50}, {"t":7,"v":800, "ease":"linear"} ]
+        },
+        {
+          "id": "data_text",
+          "type": "text",
+          "style": "title_secondary",
+          "content": "ENTANGLING QUBITS...\nSUCCESS",
+          "x": "right-200", "y": "bottom-200", "anchor": "bottomright",
+          "color": "${neon_magenta}",
+          "opacity": 0
+        }
+      ],
+      "timeline": [
+        { "time_ms": 500, "duration_ms": 3000, "action": "typewrite", "target": "holo_code_left" },
+        { "time_ms": 4000, "duration_ms": 1000, "action": "fade_in", "target": "data_text" }
+      ]
+    },
+    {
+      "_comment": "SCENE 3: THE MANDALA - ყველაზე რთული გეომეტრიული ფიგურების სინქრონიზაცია",
+      "id": "scene_03_mandala",
+      "duration": 8.5,
+      "effects": [
+        { "type": "vignette", "amount": 0.8, "radius": 0.4 },
+        { "type": "glitch", "amount": [ {"t":5.0,"v":0}, {"t":5.2,"v":0.3}, {"t":5.4,"v":0} ] }
+      ],
+      "objects": [
+        {
+          "_comment": "მანდალას ბირთვი (რგოლი 1)",
+          "id": "mandala_r1_c", "type": "circle", "color": "${neon_cyan}", "cx": "center", "cy": "middle",
+          "radius": [ {"t":0,"v":0}, {"t":2,"v":300, "ease":"expoout"} ]
+        },
+        {
+          "id": "mandala_r1_m", "type": "circle", "color": "${bg_mask}", "cx": "center", "cy": "middle",
+          "radius": [ {"t":0.1,"v":0}, {"t":2.1,"v":280, "ease":"expoout"} ]
+        },
+        {
+          "_comment": "მანდალას რგოლი 2 (ოქროსფერი)",
+          "id": "mandala_r2_c", "type": "circle", "color": "${neon_gold}", "cx": "center", "cy": "middle",
+          "radius": [ {"t":1,"v":0}, {"t":3,"v":600, "ease":"elasticout"} ]
+        },
+        {
+          "id": "mandala_r2_m", "type": "circle", "color": "${bg_mask}", "cx": "center", "cy": "middle",
+          "radius": [ {"t":1.1,"v":0}, {"t":3.1,"v":570, "ease":"elasticout"} ]
+        },
+        {
+          "_comment": "დინამიური მბრუნავი პულსაცია (მართკუთხედების კალეიდოსკოპი)",
+          "id": "kaleido_1", "type": "rect", "color": "${neon_magenta}",
+          "w": 1800, "h": 20, "x": "center", "y": "middle", "anchor": "middle",
+          "opacity": 0.5,
+          "scale": [ {"t":2,"v":0}, {"t":4,"v":1, "ease":"backout"} ],
+          "rotation": [ {"t":2,"v":0}, {"t":8.5,"v":360, "ease":"smooth"} ]
+        },
+        {
+          "id": "kaleido_2", "type": "rect", "color": "${neon_cyan}",
+          "w": 1800, "h": 20, "x": "center", "y": "middle", "anchor": "middle",
+          "opacity": 0.5,
+          "scale": [ {"t":2.5,"v":0}, {"t":4.5,"v":1, "ease":"backout"} ],
+          "rotation": [ {"t":2.5,"v":45}, {"t":8.5,"v":-315, "ease":"smooth"} ]
+        },
+        {
+          "id": "sync_text",
+          "type": "text",
+          "style": "title_primary",
+          "size": 120,
+          "content": "SYNERGY 100%",
+          "x": "center", "y": "middle",
+          "opacity": [ {"t":0,"v":0}, {"t":4,"v":0}, {"t":5,"v":1} ],
+          "scale": [ {"t":4,"v":0.5}, {"t":5,"v":1.0, "ease":"bounceout"} ]
+        }
+      ]
+    },
+    {
+      "_comment": "SCENE 4: ASCENSION - სიმშვიდე, ფერების შებრუნება (Invert) და სუფთა ესთეტიკა",
+      "id": "scene_04_ascension",
+      "duration": 6.0,
+      "bg_color": "#FFFFFF",
+      "effects": [
+        { "type": "invert", "amount": [ {"t":0,"v":1}, {"t":4,"v":0, "ease":"cubicinout"} ] },
+        { "type": "grain", "amount": 0.05 }
+      ],
+      "objects": [
+        {
+          "id": "final_aura",
+          "type": "circle",
+          "color": "${neon_cyan}",
+          "cx": "center", "cy": "middle",
+          "opacity": 0.2,
+          "radius": [ {"t":0,"v":0}, {"t":6,"v":2000, "ease":"easeout"} ]
+        },
+        {
+          "id": "final_word",
+          "type": "text",
+          "style": "title_primary",
+          "size": 220,
+          "color": "#000000",
+          "content": "A W A K E N E D",
+          "x": "center", "y": "middle",
+          "opacity": [ {"t":0,"v":0}, {"t":2,"v":1, "ease":"smooth"} ],
+          "y_pos": [ {"t":0, "v":"middle+200"}, {"t":3, "v":"middle", "ease":"expoout"} ]
+        },
+        {
+          "id": "sub_text_final",
+          "type": "text",
+          "style": "title_secondary",
+          "color": "#333333",
+          "content": "SYSTEM IS NOW CONSCIOUS",
+          "x": "center", "y": "middle+250",
+          "opacity": [ {"t":0,"v":0}, {"t":3,"v":0}, {"t":5,"v":1} ]
+        }
+      ]
+    }
+  ],
+
+  "transitions": [
+    {
+      "_comment": "TRANSITION 1: კომპლექსური შუაზე გაპობა ჰორიზონტალურად",
+      "duration": 1.5,
+      "toMask": {
+        "shape": "rect",
+        "x": 0.5, "y": 0.5,
+        "w": [ {"t":0,"v":0}, {"t":1,"v":1, "ease":"expoinout"} ],
+        "h": 1
+      },
+      "from": {
+        "scale": [ {"t":0,"v":1}, {"t":1,"v":1.5, "ease":"easein"} ]
+      }
+    },
+    {
+      "_comment": "TRANSITION 2: დინამიური ზუმი (Zoom In) მანდალას ბირთვის გამოსაჩენად",
+      "use": "zoom_in",
+      "duration_ms": 1200,
+      "to": {
+        "rotate": [ {"t":0,"v":45}, {"t":1,"v":0, "ease":"backout"} ]
+      }
+    },
+    {
+      "_comment": "TRANSITION 3: კრისტალური წრიული გარდამავალი ეფექტი ძლიერი ბრუნვით",
+      "duration": 2.0,
+      "toMask": {
+        "shape": "circle",
+        "cx": 0.5, "cy": 0.5,
+        "r": [ {"t":0,"v":0}, {"t":1,"v":1.5, "ease":"cubicinout"} ]
+      },
+      "to": {
+        "rotate": [ {"t":0,"v":-180}, {"t":1,"v":0, "ease":"expoout"} ],
+        "scale": [ {"t":0,"v":0.2}, {"t":1,"v":1, "ease":"backout"} ]
+      }
+    }
+  ]
+}

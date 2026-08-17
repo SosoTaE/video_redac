@@ -1,0 +1,138 @@
+# Performance
+
+All figures measured on an RTX 5070 (Blackwell, sm_120), CUDA 13.3,
+ffmpeg 8.1.2, rendering to H.264 via `h264_nvenc` at `-preset p5 -cq 21`.
+
+## Headline
+
+| Project | Resolution | Frames | Time | fps |
+|---|---|---|---|---|
+| `showcase.json` | 1080×1920 @ 60 | 1320 | 3.41 s | 387 |
+| `listing_60.json` | 1080×1920 @ 30 | 1800 | 4.62 s | 390 |
+| `binsearch.json` | 1080×1920 @ 60 | 1440 | 3.70 s | 389 |
+| `transitions.json` | 1080×1080 @ 60 | 636 | 1.08 s | 589 |
+| `effects_demo.json` | 1280×720 @ 30 | 180 | 0.42 s | 433 |
+
+Roughly 390 fps at 1080×1920 — about 6.5× real time at 60 fps.
+
+## Where the time goes
+
+The renderer is **encoder-bound**, not compute-bound. Measured by feeding
+ffmpeg the same volume of data with no rendering at all:
+
+| Configuration | 600 frames @ 1080×1920 |
+|---|---|
+| Raw RGBA pipe + NVENC, **zero rendering** | 2.10 s |
+| Full renderer, RGBA | 1.94 s |
+| NV12 pipe + NVENC, zero rendering | 1.78 s |
+| **Full renderer, NV12** | **1.66 s** |
+| Pipe transport only (ffmpeg discards) | 0.57 s |
+
+The renderer runs *at* the ceiling. Of the remaining 1.66 s, roughly 0.57 s is
+pipe transport and ~1.1 s is NVENC itself.
+
+Independently confirmed by sampling the hardware during a render:
+
+```
+SM (CUDA cores) :  ~24%
+NVENC (encoder) :  100%
+```
+
+> A monitoring widget that **adds** these engines will show >100% — they are
+> independent hardware blocks, each reporting its own load. Nothing is wrong.
+> Almost no other workload saturates NVENC while also running CUDA kernels,
+> which is why this program in particular triggers that display artifact.
+
+## What actually helped: NV12 on the GPU
+
+| | fps |
+|---|---|
+| RGBA pipe | 306–315 |
+| NV12 pipe | 355–361 |
+
+A ~17% gain, from two effects: 2.67× fewer bytes crossing PCIe and the pipe
+(8.29 MB → 3.11 MB per frame), and the RGB→YUV conversion moving off the CPU,
+where ffmpeg had been doing it every frame.
+
+Fixing the colour tagging afterwards removed a hidden `swscale` RGB round-trip
+as well — that was a correctness fix that also happened to be free performance.
+
+## What did not help: double buffering
+
+| | fps |
+|---|---|
+| `VR_PIPELINE_DEPTH=1` (serial) | 306, 315 |
+| `VR_PIPELINE_DEPTH=2` (overlapped) | 308, 298 |
+
+Within noise. The GPU work was already fully hidden behind the pipe write, so
+there was nothing left to overlap. The mechanism is architecturally correct and
+costs nothing, but it was aimed at the wrong bottleneck.
+
+This is why the A/B was worth running: the intuition ("overlap render and
+encode") was reasonable and simply wrong for this workload.
+
+## Effects are nearly free
+
+1320 frames at 1080×1920, `showcase.json`:
+
+| | fps |
+|---|---|
+| No effects | 391.7 |
+| 7 effects (`color_grade`, `blur r=6`, `rgb_split`, `split_tone`, `vignette`, `grain`, `scanlines`) | 387.0 |
+
+**1.2%.** The SMs had ~76% headroom, so a full post-processing stack fits inside
+it. This is where the architecture pays off relative to a CPU compositor, where
+the same stack would cost tens of milliseconds per frame.
+
+## Memory
+
+At 1080×1920, per pipeline slot:
+
+| Buffer | Size | Allocated when |
+|---|---|---|
+| `d_frame` (RGBA) | 7.91 MB | always |
+| `d_nv12` | 2.97 MB | always |
+| `h_frame` (pinned) | 2.97 MB | always |
+| `d_fx` | 7.91 MB | any effect exists |
+| `d_scene[2]` | 15.82 MB | more than one scene |
+
+With two slots that is 21.8 MB of frame buffers for a simple project, up to
+~69 MB with effects and scenes.
+
+Textures dominate for image-heavy projects — `listing_60.json` uses 164 MB
+because photos are stored at full resolution (2048×1365) even when displayed
+smaller. Downscaling at load time is an obvious future saving.
+
+Pinned host memory matters: a pageable buffer would make the driver stage the
+copy through its own pinned buffer first, doubling the work and making the
+transfer effectively synchronous.
+
+## Scaling notes
+
+- **Object count is cheap.** `binsearch.json` composites 86 objects per frame at
+  389 fps. Each layer's grid covers only its destination bounding box, so small
+  objects cost almost nothing.
+- **Resolution is the main lever**, since the bottleneck is bytes and encoder
+  throughput. 1280×720 renders at 430–590 fps.
+- **`hevc_nvenc`** has more headroom than H.264 on Blackwell if the encoder is
+  the limit.
+- **Faster presets** (`p4`, `p1`) trade file size for speed.
+
+## Reproducing
+
+```bash
+# headline
+./video_redac showcase.json -o /tmp/t.mp4
+
+# encoder ceiling, no rendering
+dd if=/dev/zero bs=3110400 count=600 2>/dev/null | \
+  ffmpeg -hide_banner -loglevel error -y -f rawvideo -pixel_format nv12 \
+    -video_size 1080x1920 -framerate 60 -i - -c:v h264_nvenc \
+    -preset p5 -cq 21 /tmp/ceiling.mp4
+
+# double-buffering A/B
+make clean && make CPPFLAGS_EXTRA=-DVR_PIPELINE_DEPTH=1
+
+# engine utilisation during a render
+nvidia-smi --query-gpu=utilization.gpu,utilization.encoder --format=csv -l 1
+```

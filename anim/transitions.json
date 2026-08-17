@@ -1,0 +1,507 @@
+{
+  "_comment": [
+    "transitions.json — ყველა ჩაშენებული გადასვლა თანმიმდევრობით.",
+    "ბოლო გადასვლა ხელით აღწერილია from/to ტრეკებით — preset-ის გარეშე."
+  ],
+  "project": {
+    "width": 1080,
+    "height": 1080,
+    "fps": 60,
+    "bg_color": "#11111B"
+  },
+  "scenes": [
+    {
+      "id": "s0",
+      "duration": 1.8,
+      "bg_color": "#89B4FA",
+      "objects": [
+        {
+          "id": "n",
+          "type": "text",
+          "content": "1",
+          "font": "DejaVu Sans-Bold",
+          "size": 150,
+          "color": "#11111BDD",
+          "x": "center",
+          "y": "40%",
+          "anchor": "center"
+        },
+        {
+          "id": "l",
+          "type": "text",
+          "content": "crossfade",
+          "font": "DejaVu Sans-Bold",
+          "size": 56,
+          "color": "#11111B",
+          "x": "center",
+          "y": "62%",
+          "anchor": "center",
+          "opacity": [
+            {
+              "t": 0.0,
+              "v": 0
+            },
+            {
+              "t": 0.5,
+              "v": 1,
+              "ease": "easeout"
+            }
+          ]
+        },
+        {
+          "id": "bar",
+          "type": "rect",
+          "x": "center",
+          "y": "72%",
+          "w": 180,
+          "h": 6,
+          "color": "#11111B99",
+          "anchor": "center"
+        }
+      ],
+      "timeline": []
+    },
+    {
+      "id": "s1",
+      "duration": 1.8,
+      "bg_color": "#F38BA8",
+      "objects": [
+        {
+          "id": "n",
+          "type": "text",
+          "content": "2",
+          "font": "DejaVu Sans-Bold",
+          "size": 150,
+          "color": "#11111BDD",
+          "x": "center",
+          "y": "40%",
+          "anchor": "center"
+        },
+        {
+          "id": "l",
+          "type": "text",
+          "content": "slide left",
+          "font": "DejaVu Sans-Bold",
+          "size": 56,
+          "color": "#11111B",
+          "x": "center",
+          "y": "62%",
+          "anchor": "center",
+          "opacity": [
+            {
+              "t": 0.0,
+              "v": 0
+            },
+            {
+              "t": 0.5,
+              "v": 1,
+              "ease": "easeout"
+            }
+          ]
+        },
+        {
+          "id": "bar",
+          "type": "rect",
+          "x": "center",
+          "y": "72%",
+          "w": 180,
+          "h": 6,
+          "color": "#11111B99",
+          "anchor": "center"
+        }
+      ],
+      "timeline": []
+    },
+    {
+      "id": "s2",
+      "duration": 1.8,
+      "bg_color": "#A6E3A1",
+      "objects": [
+        {
+          "id": "n",
+          "type": "text",
+          "content": "3",
+          "font": "DejaVu Sans-Bold",
+          "size": 150,
+          "color": "#11111BDD",
+          "x": "center",
+          "y": "40%",
+          "anchor": "center"
+        },
+        {
+          "id": "l",
+          "type": "text",
+          "content": "push up",
+          "font": "DejaVu Sans-Bold",
+          "size": 56,
+          "color": "#11111B",
+          "x": "center",
+          "y": "62%",
+          "anchor": "center",
+          "opacity": [
+            {
+              "t": 0.0,
+              "v": 0
+            },
+            {
+              "t": 0.5,
+              "v": 1,
+              "ease": "easeout"
+            }
+          ]
+        },
+        {
+          "id": "bar",
+          "type": "rect",
+          "x": "center",
+          "y": "72%",
+          "w": 180,
+          "h": 6,
+          "color": "#11111B99",
+          "anchor": "center"
+        }
+      ],
+      "timeline": []
+    },
+    {
+      "id": "s3",
+      "duration": 1.8,
+      "bg_color": "#F9E2AF",
+      "objects": [
+        {
+          "id": "n",
+          "type": "text",
+          "content": "4",
+          "font": "DejaVu Sans-Bold",
+          "size": 150,
+          "color": "#11111BDD",
+          "x": "center",
+          "y": "40%",
+          "anchor": "center"
+        },
+        {
+          "id": "l",
+          "type": "text",
+          "content": "zoom in",
+          "font": "DejaVu Sans-Bold",
+          "size": 56,
+          "color": "#11111B",
+          "x": "center",
+          "y": "62%",
+          "anchor": "center",
+          "opacity": [
+            {
+              "t": 0.0,
+              "v": 0
+            },
+            {
+              "t": 0.5,
+              "v": 1,
+              "ease": "easeout"
+            }
+          ]
+        },
+        {
+          "id": "bar",
+          "type": "rect",
+          "x": "center",
+          "y": "72%",
+          "w": 180,
+          "h": 6,
+          "color": "#11111B99",
+          "anchor": "center"
+        }
+      ],
+      "timeline": []
+    },
+    {
+      "id": "s4",
+      "duration": 1.8,
+      "bg_color": "#CBA6F7",
+      "objects": [
+        {
+          "id": "n",
+          "type": "text",
+          "content": "5",
+          "font": "DejaVu Sans-Bold",
+          "size": 150,
+          "color": "#11111BDD",
+          "x": "center",
+          "y": "40%",
+          "anchor": "center"
+        },
+        {
+          "id": "l",
+          "type": "text",
+          "content": "spin",
+          "font": "DejaVu Sans-Bold",
+          "size": 56,
+          "color": "#11111B",
+          "x": "center",
+          "y": "62%",
+          "anchor": "center",
+          "opacity": [
+            {
+              "t": 0.0,
+              "v": 0
+            },
+            {
+              "t": 0.5,
+              "v": 1,
+              "ease": "easeout"
+            }
+          ]
+        },
+        {
+          "id": "bar",
+          "type": "rect",
+          "x": "center",
+          "y": "72%",
+          "w": 180,
+          "h": 6,
+          "color": "#11111B99",
+          "anchor": "center"
+        }
+      ],
+      "timeline": []
+    },
+    {
+      "id": "s5",
+      "duration": 1.8,
+      "bg_color": "#89DCEB",
+      "objects": [
+        {
+          "id": "n",
+          "type": "text",
+          "content": "6",
+          "font": "DejaVu Sans-Bold",
+          "size": 150,
+          "color": "#11111BDD",
+          "x": "center",
+          "y": "40%",
+          "anchor": "center"
+        },
+        {
+          "id": "l",
+          "type": "text",
+          "content": "wipe right",
+          "font": "DejaVu Sans-Bold",
+          "size": 56,
+          "color": "#11111B",
+          "x": "center",
+          "y": "62%",
+          "anchor": "center",
+          "opacity": [
+            {
+              "t": 0.0,
+              "v": 0
+            },
+            {
+              "t": 0.5,
+              "v": 1,
+              "ease": "easeout"
+            }
+          ]
+        },
+        {
+          "id": "bar",
+          "type": "rect",
+          "x": "center",
+          "y": "72%",
+          "w": 180,
+          "h": 6,
+          "color": "#11111B99",
+          "anchor": "center"
+        }
+      ],
+      "timeline": []
+    },
+    {
+      "id": "s6",
+      "duration": 1.8,
+      "bg_color": "#FAB387",
+      "objects": [
+        {
+          "id": "n",
+          "type": "text",
+          "content": "7",
+          "font": "DejaVu Sans-Bold",
+          "size": 150,
+          "color": "#11111BDD",
+          "x": "center",
+          "y": "40%",
+          "anchor": "center"
+        },
+        {
+          "id": "l",
+          "type": "text",
+          "content": "iris",
+          "font": "DejaVu Sans-Bold",
+          "size": 56,
+          "color": "#11111B",
+          "x": "center",
+          "y": "62%",
+          "anchor": "center",
+          "opacity": [
+            {
+              "t": 0.0,
+              "v": 0
+            },
+            {
+              "t": 0.5,
+              "v": 1,
+              "ease": "easeout"
+            }
+          ]
+        },
+        {
+          "id": "bar",
+          "type": "rect",
+          "x": "center",
+          "y": "72%",
+          "w": 180,
+          "h": 6,
+          "color": "#11111B99",
+          "anchor": "center"
+        }
+      ],
+      "timeline": []
+    },
+    {
+      "id": "s7",
+      "duration": 1.8,
+      "bg_color": "#94E2D5",
+      "objects": [
+        {
+          "id": "n",
+          "type": "text",
+          "content": "8",
+          "font": "DejaVu Sans-Bold",
+          "size": 150,
+          "color": "#11111BDD",
+          "x": "center",
+          "y": "40%",
+          "anchor": "center"
+        },
+        {
+          "id": "l",
+          "type": "text",
+          "content": "fade",
+          "font": "DejaVu Sans-Bold",
+          "size": 56,
+          "color": "#11111B",
+          "x": "center",
+          "y": "62%",
+          "anchor": "center",
+          "opacity": [
+            {
+              "t": 0.0,
+              "v": 0
+            },
+            {
+              "t": 0.5,
+              "v": 1,
+              "ease": "easeout"
+            }
+          ]
+        },
+        {
+          "id": "bar",
+          "type": "rect",
+          "x": "center",
+          "y": "72%",
+          "w": 180,
+          "h": 6,
+          "color": "#11111B99",
+          "anchor": "center"
+        }
+      ],
+      "timeline": []
+    },
+    {
+      "id": "s8",
+      "duration": 1.8,
+      "bg_color": "#F5C2E7",
+      "objects": [
+        {
+          "id": "n",
+          "type": "text",
+          "content": "9",
+          "font": "DejaVu Sans-Bold",
+          "size": 150,
+          "color": "#11111BDD",
+          "x": "center",
+          "y": "40%",
+          "anchor": "center"
+        },
+        {
+          "id": "l",
+          "type": "text",
+          "content": "done",
+          "font": "DejaVu Sans-Bold",
+          "size": 56,
+          "color": "#11111B",
+          "x": "center",
+          "y": "62%",
+          "anchor": "center",
+          "opacity": [
+            {
+              "t": 0.0,
+              "v": 0
+            },
+            {
+              "t": 0.5,
+              "v": 1,
+              "ease": "easeout"
+            }
+          ]
+        },
+        {
+          "id": "bar",
+          "type": "rect",
+          "x": "center",
+          "y": "72%",
+          "w": 180,
+          "h": 6,
+          "color": "#11111B99",
+          "anchor": "center"
+        }
+      ],
+      "timeline": []
+    }
+  ],
+  "transitions": [
+    {
+      "use": "crossfade",
+      "duration": 0.7
+    },
+    {
+      "use": "slide_left",
+      "duration": 0.7
+    },
+    {
+      "use": "push_up",
+      "duration": 0.7
+    },
+    {
+      "use": "zoom_in",
+      "duration": 0.7
+    },
+    {
+      "use": "spin",
+      "duration": 0.7
+    },
+    {
+      "use": "wipe_right",
+      "duration": 0.7
+    },
+    {
+      "use": "iris",
+      "duration": 0.7
+    },
+    {
+      "use": "fade",
+      "duration": 0.7
+    }
+  ]
+}

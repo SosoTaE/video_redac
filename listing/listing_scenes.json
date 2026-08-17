@@ -1,0 +1,217 @@
+{
+  "_comment": [
+    "listing_scenes.json — იგივე განცხადების ვიდეო, სრულად JSON-ში.",
+    "",
+    "ეს ფაილი build_listing.py-ის (387 ხაზი Python) ჩამნაცვლებელია და",
+    "იმავდროულად Tier 1/2-ის მიღება-ჩაბარების ტესტია: თუ შედეგი იგივეა,",
+    "მაშინ სცენებმა, ცვლადებმა, სტილებმა და anchor-ებმა გენერატორი ზედმეტი გახადა.",
+    "",
+    "გაშვება:",
+    "  ./video_redac listing/listing_scenes.json -o listing_scenes.mp4"
+  ],
+
+  "vars": {
+    "street": "300 Upper Station Camp Crk Rd",
+    "city":   "Gallatin, TN 37066",
+    "price":  "$525,000",
+    "beds":   "4",
+    "baths":  "3",
+    "sqft":   "2,192",
+    "acres":  "1.9",
+    "mls":    "2898711",
+    "agent":  "Cynthia Pearson",
+    "role":   "Realtor®  ·  Compass",
+    "phone":  "919.621.9777",
+    "email":  "cindy.pearson@compass.com",
+    "accent": "#E8C39E"
+  },
+
+  "styles": {
+    "_note": "სტილები ატარებს ტიპსაც, პოზიციასაც და ანიმაციასაც — სცენაში მხოლოდ მონაცემი რჩება",
+
+    "cover": { "type": "image", "height": 1920, "y": 0,
+               "scale": [ { "t": 0, "v": 1.0 }, { "t": 4.6, "v": 1.09, "ease": "linear" } ] },
+
+    "scrim": { "type": "image", "path": "assets/scrim_bottom.png", "x": 0, "y": "bottom" },
+    "scrimtop": { "type": "image", "path": "assets/scrim_top.png", "x": 0, "y": "top" },
+
+    "head": { "type": "text", "font": "DejaVu Sans-Bold", "size": 62, "color": "#FFFFFF",
+              "x": "center", "y": "bottom-420", "anchor": "bottom",
+              "max_width": "84%", "align": "center",
+              "opacity": [ { "t": 0.25, "v": 0 }, { "t": 0.85, "v": 1, "ease": "easeout" } ] },
+
+    "sub":  { "type": "text", "font": "DejaVu Sans", "size": 34, "color": "#D7D3CC",
+              "x": "center", "y": "bottom-340", "anchor": "bottom",
+              "max_width": "80%", "align": "center",
+              "opacity": [ { "t": 0.4, "v": 0 }, { "t": 1.0, "v": 1, "ease": "easeout" } ] },
+
+    "veil": { "type": "rect", "x": 0, "y": 0, "w": 1080, "h": 1920, "color": "#0B0B0FBF" },
+
+    "statnum": { "type": "text", "font": "DejaVu Sans-Bold", "size": 92, "color": "#FFFFFF",
+                 "anchor": "center" },
+    "statlbl": { "type": "text", "font": "DejaVu Sans-Bold", "size": 30, "color": "${accent}",
+                 "anchor": "center" },
+
+    "ctaline": { "type": "text", "font": "DejaVu Sans", "size": 34, "color": "#D7D3CC",
+                 "x": "center", "anchor": "center" }
+  },
+
+  "project": { "width": 1080, "height": 1920, "fps": 30, "bg_color": "#0B0B0F" },
+
+  "output": { "encoder": "h264_nvenc", "preset": "p5", "cq": 21 },
+
+  "scenes": [
+    {
+      "id": "hero", "duration": 5.2,
+      "objects": [
+        { "id": "p", "style": "cover", "path": "photos/00.jpg" },
+        { "id": "st", "style": "scrimtop" },
+        { "id": "sb", "style": "scrim" },
+        { "id": "brand", "type": "text", "font": "DejaVu Sans-Bold", "size": 30,
+          "color": "#D7D3CC", "x": "center", "y": "top+96" , "content": "COMPASS" },
+        { "id": "status", "type": "text", "font": "DejaVu Sans-Bold", "size": 30,
+          "color": "${accent}", "x": "center", "y": "top+150", "content": "JUST LISTED" },
+        { "id": "addr", "style": "head", "content": "${street}" },
+        { "id": "city", "style": "sub", "content": "${city}" },
+        { "id": "rule", "type": "rect", "x": "center", "y": "bottom-300", "anchor": "bottom",
+          "w": 220, "h": 5, "color": "${accent}" },
+        { "id": "price", "type": "text", "font": "DejaVu Sans-Bold", "size": 92,
+          "color": "#FFFFFF", "x": "center", "y": "bottom-160", "anchor": "bottom",
+          "content": "${price}",
+          "opacity": [ { "t": 0.9, "v": 0 }, { "t": 1.6, "v": 1, "ease": "easeout" } ],
+          "scale":   [ { "t": 0.9, "v": 0.92 }, { "t": 1.7, "v": 1.0, "ease": "backout" } ] }
+      ]
+    },
+
+    {
+      "id": "stats", "duration": 4.2,
+      "objects": [
+        { "id": "p", "style": "cover", "path": "photos/33.jpg" },
+        { "id": "v", "style": "veil" },
+        { "id": "n1", "style": "statnum", "content": "${beds}",  "x": "25%", "y": "38%" },
+        { "id": "l1", "style": "statlbl", "content": "BEDS",     "x": "25%", "y": "44%" },
+        { "id": "n2", "style": "statnum", "content": "${baths}", "x": "75%", "y": "38%" },
+        { "id": "l2", "style": "statlbl", "content": "BATHS",    "x": "75%", "y": "44%" },
+        { "id": "n3", "style": "statnum", "content": "${sqft}",  "x": "25%", "y": "56%" },
+        { "id": "l3", "style": "statlbl", "content": "SQ FT",    "x": "25%", "y": "62%" },
+        { "id": "n4", "style": "statnum", "content": "${acres}", "x": "75%", "y": "56%" },
+        { "id": "l4", "style": "statlbl", "content": "ACRES",    "x": "75%", "y": "62%" }
+      ]
+    },
+
+    { "id": "f1",  "duration": 3.9, "objects": [
+      { "id": "p", "style": "cover", "path": "photos/05.jpg" }, { "id": "s", "style": "scrim" },
+      { "id": "h", "style": "head", "content": "Covered Front Porch" },
+      { "id": "b", "style": "sub",  "content": "Morning coffee, evening quiet" } ] },
+
+    { "id": "f2",  "duration": 3.9, "objects": [
+      { "id": "p", "style": "cover", "path": "photos/07.jpg" }, { "id": "s", "style": "scrim" },
+      { "id": "h", "style": "head", "content": "Vaulted Ceilings" },
+      { "id": "b", "style": "sub",  "content": "Stone wood-burning fireplace" } ] },
+
+    { "id": "f3",  "duration": 3.9, "objects": [
+      { "id": "p", "style": "cover", "path": "photos/06.jpg" }, { "id": "s", "style": "scrim" },
+      { "id": "h", "style": "head", "content": "Open to Above" },
+      { "id": "b", "style": "sub",  "content": "Light from every angle" } ] },
+
+    { "id": "f4",  "duration": 3.9, "objects": [
+      { "id": "p", "style": "cover", "path": "photos/13.jpg" }, { "id": "s", "style": "scrim" },
+      { "id": "h", "style": "head", "content": "Renovated Kitchen" },
+      { "id": "b", "style": "sub",  "content": "New stainless appliances" } ] },
+
+    { "id": "f5",  "duration": 3.9, "objects": [
+      { "id": "p", "style": "cover", "path": "photos/14.jpg" }, { "id": "s", "style": "scrim" },
+      { "id": "h", "style": "head", "content": "Open-Concept Living" },
+      { "id": "b", "style": "sub",  "content": "Kitchen flows to the living room" } ] },
+
+    { "id": "f6",  "duration": 3.9, "objects": [
+      { "id": "p", "style": "cover", "path": "photos/16.jpg" }, { "id": "s", "style": "scrim" },
+      { "id": "h", "style": "head", "content": "Sun-Filled Sunroom" },
+      { "id": "b", "style": "sub",  "content": "Wall of windows, wood ceiling" } ] },
+
+    { "id": "f7",  "duration": 3.9, "objects": [
+      { "id": "p", "style": "cover", "path": "photos/22.jpg" }, { "id": "s", "style": "scrim" },
+      { "id": "h", "style": "head", "content": "Primary Suite" },
+      { "id": "b", "style": "sub",  "content": "Sliding barn door" } ] },
+
+    { "id": "f8",  "duration": 3.9, "objects": [
+      { "id": "p", "style": "cover", "path": "photos/21.jpg" }, { "id": "s", "style": "scrim" },
+      { "id": "h", "style": "head", "content": "Spa-Worthy Bath" },
+      { "id": "b", "style": "sub",  "content": "Full tiled walk-in shower" } ] },
+
+    { "id": "f9",  "duration": 3.9, "objects": [
+      { "id": "p", "style": "cover", "path": "photos/19.jpg" }, { "id": "s", "style": "scrim" },
+      { "id": "h", "style": "head", "content": "Four Bedrooms" },
+      { "id": "b", "style": "sub",  "content": "Room for everyone" } ] },
+
+    { "id": "f10", "duration": 3.9, "objects": [
+      { "id": "p", "style": "cover", "path": "photos/25.jpg" }, { "id": "s", "style": "scrim" },
+      { "id": "h", "style": "head", "content": "Bonus Room Upstairs" },
+      { "id": "b", "style": "sub",  "content": "Movie nights or game room" } ] },
+
+    { "id": "f11", "duration": 3.9, "objects": [
+      { "id": "p", "style": "cover", "path": "photos/04.jpg" }, { "id": "s", "style": "scrim" },
+      { "id": "h", "style": "head", "content": "Massive Deck" },
+      { "id": "b", "style": "sub",  "content": "Built for gathering" } ] },
+
+    { "id": "f12", "duration": 3.9, "objects": [
+      { "id": "p", "style": "cover", "path": "photos/28.jpg" }, { "id": "s", "style": "scrim" },
+      { "id": "h", "style": "head", "content": "Detached 4-Car Garage" },
+      { "id": "b", "style": "sub",  "content": "Plus workshop space" } ] },
+
+    { "id": "f13", "duration": 3.9, "objects": [
+      { "id": "p", "style": "cover", "path": "photos/32.jpg" }, { "id": "s", "style": "scrim" },
+      { "id": "h", "style": "head", "content": "1.9 Acres" },
+      { "id": "b", "style": "sub",  "content": "Mini-farm ready — bring goats" } ] },
+
+    {
+      "id": "cta", "duration": 6.4,
+      "objects": [
+        { "id": "p", "style": "cover", "path": "photos/05.jpg" },
+        { "id": "v", "style": "veil" },
+        { "id": "t", "type": "text", "font": "DejaVu Sans-Bold", "size": 54, "color": "#FFFFFF",
+          "x": "center", "y": "34%", "anchor": "center", "content": "Schedule a Private Tour" },
+        { "id": "r", "type": "rect", "x": "center", "y": "40%", "anchor": "center",
+          "w": 220, "h": 5, "color": "${accent}" },
+        { "id": "a", "type": "text", "font": "DejaVu Sans-Bold", "size": 66, "color": "#FFFFFF",
+          "x": "center", "y": "46%", "anchor": "center", "content": "${agent}" },
+        { "id": "ro", "style": "ctaline", "content": "${role}", "y": "51%", "size": 34,
+          "color": "${accent}" },
+        { "id": "ph", "type": "text", "font": "DejaVu Sans-Bold", "size": 58, "color": "#FFFFFF",
+          "x": "center", "y": "59%", "anchor": "center", "content": "${phone}" },
+        { "id": "em", "style": "ctaline", "content": "${email}", "y": "64%", "size": 32 },
+        { "id": "ad", "style": "ctaline", "content": "${street}", "y": "73%", "size": 32 },
+        { "id": "ci", "style": "ctaline", "content": "${city}",   "y": "76%", "size": 32 },
+        { "id": "ml", "type": "text", "font": "DejaVu Sans-Bold", "size": 30,
+          "color": "${accent}", "x": "center", "y": "82%", "anchor": "center",
+          "content": "MLS #${mls}  ·  ${price}" }
+      ]
+    }
+  ],
+
+  "transitions": [
+    { "use": "crossfade", "duration": 0.7 },
+    { "use": "crossfade", "duration": 0.7 },
+    { "use": "crossfade", "duration": 0.7 },
+    { "use": "crossfade", "duration": 0.7 },
+    { "use": "crossfade", "duration": 0.7 },
+    { "use": "crossfade", "duration": 0.7 },
+    { "use": "crossfade", "duration": 0.7 },
+    { "use": "crossfade", "duration": 0.7 },
+    { "use": "crossfade", "duration": 0.7 },
+    { "use": "crossfade", "duration": 0.7 },
+    { "use": "crossfade", "duration": 0.7 },
+    { "use": "crossfade", "duration": 0.7 },
+    { "use": "crossfade", "duration": 0.7 },
+    { "use": "crossfade", "duration": 0.7 },
+    { "use": "crossfade", "duration": 0.7 }
+  ],
+
+  "effects": [
+    { "type": "color_grade", "contrast": 1.06, "saturation": 1.07,
+      "temperature": 0.035, "exposure": 0.02 },
+    { "type": "vibrance", "amount": 0.18 },
+    { "type": "vignette", "amount": 0.30, "radius": 0.68, "softness": 0.62, "color": "#000000" },
+    { "type": "grain", "amount": 0.012 }
+  ]
+}

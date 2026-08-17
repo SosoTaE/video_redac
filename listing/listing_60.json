@@ -1,0 +1,2281 @@
+{
+  "_comment": [
+    "listing.json — ავტომატურად აგებული build_listing.py-ით. ხელით ნუ დაარედაქტირებ.",
+    "წყარო: MLS #2898711, 300 Upper Station Camp Crk Rd, Gallatin, TN 37066",
+    "",
+    "ვერტიკალური 1080x1920 @ 30fps — Reels / TikTok / YouTube Shorts.",
+    "სურათები 'cover' რეჟიმშია (height=1920, x ავტო-ცენტრი) + Ken Burns."
+  ],
+  "_audio_example": [
+    "ხმა განზრახ არ არის ჩამატებული — სალიცენზიო მუსიკა ჩვენ არ გვაქვს.",
+    "დასამატებლად ჩასვი ზედა დონეზე:",
+    "\"audio\": [ { \"path\": \"assets/track.mp3\", \"volume\": 0.5, \"loop\": true,",
+    "             \"fade_in\": 1.0, \"fade_out\": 2.5 } ]"
+  ],
+  "project": {
+    "width": 1080,
+    "height": 1920,
+    "fps": 30,
+    "bg_color": "#0B0B0F",
+    "duration_ms": 60000
+  },
+  "objects": [
+    {
+      "id": "hero",
+      "type": "image",
+      "path": "photos/00.jpg",
+      "height": 1920,
+      "y": 0,
+      "scale": [
+        {
+          "t": 0.0,
+          "v": 1.0
+        },
+        {
+          "t": 5.3,
+          "v": 1.1,
+          "ease": "linear"
+        }
+      ],
+      "opacity": [
+        {
+          "t": 0.0,
+          "v": 0.0
+        },
+        {
+          "t": 0.7,
+          "v": 1.0,
+          "ease": "easeout"
+        }
+      ]
+    },
+    {
+      "id": "scrim_b",
+      "type": "image",
+      "path": "assets/scrim_bottom.png",
+      "x": 0,
+      "y": 940
+    },
+    {
+      "id": "scrim_t",
+      "type": "image",
+      "path": "assets/scrim_top.png",
+      "x": 0,
+      "y": 0
+    },
+    {
+      "id": "brand",
+      "type": "text",
+      "content": "COMPASS",
+      "font": "DejaVu Sans-Bold",
+      "size": 30,
+      "color": "#D7D3CC",
+      "y": 96,
+      "line_spacing": 1.0
+    },
+    {
+      "id": "status",
+      "type": "text",
+      "content": "JUST LISTED",
+      "font": "DejaVu Sans-Bold",
+      "size": 30,
+      "color": "#E8C39E",
+      "y": 150,
+      "line_spacing": 1.25
+    },
+    {
+      "id": "addr",
+      "type": "text",
+      "content": "300 Upper Station Camp Crk Rd",
+      "font": "DejaVu Sans-Bold",
+      "size": 52,
+      "color": "#FFFFFF",
+      "y": 1360,
+      "line_spacing": 1.25
+    },
+    {
+      "id": "city",
+      "type": "text",
+      "content": "Gallatin, TN 37066",
+      "font": "DejaVu Sans",
+      "size": 38,
+      "color": "#D7D3CC",
+      "y": 1450,
+      "line_spacing": 1.25
+    },
+    {
+      "id": "rule1",
+      "type": "image",
+      "path": "assets/rule.png",
+      "x": 430,
+      "y": 1530
+    },
+    {
+      "id": "price",
+      "type": "text",
+      "content": "$525,000",
+      "font": "DejaVu Sans-Bold",
+      "size": 92,
+      "color": "#FFFFFF",
+      "y": 1580,
+      "line_spacing": 1.25
+    },
+    {
+      "id": "stats_bg",
+      "type": "image",
+      "path": "photos/33.jpg",
+      "height": 1920,
+      "y": 0,
+      "scale": [
+        {
+          "t": 4.6,
+          "v": 1.1
+        },
+        {
+          "t": 8.899999999999999,
+          "v": 1.0,
+          "ease": "linear"
+        }
+      ],
+      "opacity": [
+        {
+          "t": 4.6,
+          "v": 0.0
+        },
+        {
+          "t": 5.3,
+          "v": 1.0,
+          "ease": "easeout"
+        }
+      ]
+    },
+    {
+      "id": "stats_veil",
+      "type": "rect",
+      "x": 0,
+      "y": 0,
+      "w": 1080,
+      "h": 1920,
+      "color": "#0B0B0FB8"
+    },
+    {
+      "id": "sv0",
+      "type": "text",
+      "content": "4",
+      "font": "DejaVu Sans-Bold",
+      "size": 92,
+      "color": "#FFFFFF",
+      "y": 700,
+      "line_spacing": 1.25,
+      "x": 238
+    },
+    {
+      "id": "sl0",
+      "type": "text",
+      "content": "BEDS",
+      "font": "DejaVu Sans-Bold",
+      "size": 30,
+      "color": "#E8C39E",
+      "y": 818,
+      "line_spacing": 1.25,
+      "x": 225
+    },
+    {
+      "id": "sv1",
+      "type": "text",
+      "content": "3",
+      "font": "DejaVu Sans-Bold",
+      "size": 92,
+      "color": "#FFFFFF",
+      "y": 700,
+      "line_spacing": 1.25,
+      "x": 778
+    },
+    {
+      "id": "sl1",
+      "type": "text",
+      "content": "BATHS",
+      "font": "DejaVu Sans-Bold",
+      "size": 30,
+      "color": "#E8C39E",
+      "y": 818,
+      "line_spacing": 1.25,
+      "x": 755
+    },
+    {
+      "id": "sv2",
+      "type": "text",
+      "content": "2,192",
+      "font": "DejaVu Sans-Bold",
+      "size": 92,
+      "color": "#FFFFFF",
+      "y": 1000,
+      "line_spacing": 1.25,
+      "x": 124
+    },
+    {
+      "id": "sl2",
+      "type": "text",
+      "content": "SQ FT",
+      "font": "DejaVu Sans-Bold",
+      "size": 30,
+      "color": "#E8C39E",
+      "y": 1118,
+      "line_spacing": 1.25,
+      "x": 221
+    },
+    {
+      "id": "sv3",
+      "type": "text",
+      "content": "1.9",
+      "font": "DejaVu Sans-Bold",
+      "size": 92,
+      "color": "#FFFFFF",
+      "y": 1000,
+      "line_spacing": 1.25,
+      "x": 729
+    },
+    {
+      "id": "sl3",
+      "type": "text",
+      "content": "ACRES",
+      "font": "DejaVu Sans-Bold",
+      "size": 30,
+      "color": "#E8C39E",
+      "y": 1118,
+      "line_spacing": 1.25,
+      "x": 755
+    },
+    {
+      "id": "ph0",
+      "type": "image",
+      "path": "photos/05.jpg",
+      "height": 1920,
+      "y": 0,
+      "scale": [
+        {
+          "t": 8.2,
+          "v": 1.0
+        },
+        {
+          "t": 12.423076923076922,
+          "v": 1.1,
+          "ease": "linear"
+        }
+      ],
+      "opacity": [
+        {
+          "t": 8.2,
+          "v": 0.0
+        },
+        {
+          "t": 8.899999999999999,
+          "v": 1.0,
+          "ease": "easeout"
+        }
+      ]
+    },
+    {
+      "id": "sc0",
+      "type": "image",
+      "path": "assets/scrim_bottom.png",
+      "x": 0,
+      "y": 940
+    },
+    {
+      "id": "h0",
+      "type": "text",
+      "content": "Covered Front Porch",
+      "font": "DejaVu Sans-Bold",
+      "size": 62,
+      "color": "#FFFFFF",
+      "y": 1430,
+      "line_spacing": 1.25
+    },
+    {
+      "id": "s0",
+      "type": "text",
+      "content": "Morning coffee, evening quiet",
+      "font": "DejaVu Sans",
+      "size": 34,
+      "color": "#D7D3CC",
+      "y": 1540,
+      "line_spacing": 1.25
+    },
+    {
+      "id": "ph1",
+      "type": "image",
+      "path": "photos/07.jpg",
+      "height": 1920,
+      "y": 0,
+      "scale": [
+        {
+          "t": 11.723076923076922,
+          "v": 1.0
+        },
+        {
+          "t": 15.946153846153845,
+          "v": 1.1,
+          "ease": "linear"
+        }
+      ],
+      "opacity": [
+        {
+          "t": 11.723076923076922,
+          "v": 0.0
+        },
+        {
+          "t": 12.423076923076922,
+          "v": 1.0,
+          "ease": "easeout"
+        }
+      ]
+    },
+    {
+      "id": "sc1",
+      "type": "image",
+      "path": "assets/scrim_bottom.png",
+      "x": 0,
+      "y": 940
+    },
+    {
+      "id": "h1",
+      "type": "text",
+      "content": "Vaulted Ceilings",
+      "font": "DejaVu Sans-Bold",
+      "size": 62,
+      "color": "#FFFFFF",
+      "y": 1430,
+      "line_spacing": 1.25
+    },
+    {
+      "id": "s1",
+      "type": "text",
+      "content": "Stone wood-burning fireplace",
+      "font": "DejaVu Sans",
+      "size": 34,
+      "color": "#D7D3CC",
+      "y": 1540,
+      "line_spacing": 1.25
+    },
+    {
+      "id": "ph2",
+      "type": "image",
+      "path": "photos/06.jpg",
+      "height": 1920,
+      "y": 0,
+      "scale": [
+        {
+          "t": 15.246153846153845,
+          "v": 1.1
+        },
+        {
+          "t": 19.469230769230766,
+          "v": 1.0,
+          "ease": "linear"
+        }
+      ],
+      "opacity": [
+        {
+          "t": 15.246153846153845,
+          "v": 0.0
+        },
+        {
+          "t": 15.946153846153845,
+          "v": 1.0,
+          "ease": "easeout"
+        }
+      ]
+    },
+    {
+      "id": "sc2",
+      "type": "image",
+      "path": "assets/scrim_bottom.png",
+      "x": 0,
+      "y": 940
+    },
+    {
+      "id": "h2",
+      "type": "text",
+      "content": "Open to Above",
+      "font": "DejaVu Sans-Bold",
+      "size": 62,
+      "color": "#FFFFFF",
+      "y": 1430,
+      "line_spacing": 1.25
+    },
+    {
+      "id": "s2",
+      "type": "text",
+      "content": "Light from every angle",
+      "font": "DejaVu Sans",
+      "size": 34,
+      "color": "#D7D3CC",
+      "y": 1540,
+      "line_spacing": 1.25
+    },
+    {
+      "id": "ph3",
+      "type": "image",
+      "path": "photos/13.jpg",
+      "height": 1920,
+      "y": 0,
+      "scale": [
+        {
+          "t": 18.769230769230766,
+          "v": 1.1
+        },
+        {
+          "t": 22.992307692307687,
+          "v": 1.0,
+          "ease": "linear"
+        }
+      ],
+      "opacity": [
+        {
+          "t": 18.769230769230766,
+          "v": 0.0
+        },
+        {
+          "t": 19.469230769230766,
+          "v": 1.0,
+          "ease": "easeout"
+        }
+      ]
+    },
+    {
+      "id": "sc3",
+      "type": "image",
+      "path": "assets/scrim_bottom.png",
+      "x": 0,
+      "y": 940
+    },
+    {
+      "id": "h3",
+      "type": "text",
+      "content": "Renovated Kitchen",
+      "font": "DejaVu Sans-Bold",
+      "size": 62,
+      "color": "#FFFFFF",
+      "y": 1430,
+      "line_spacing": 1.25
+    },
+    {
+      "id": "s3",
+      "type": "text",
+      "content": "New stainless appliances",
+      "font": "DejaVu Sans",
+      "size": 34,
+      "color": "#D7D3CC",
+      "y": 1540,
+      "line_spacing": 1.25
+    },
+    {
+      "id": "ph4",
+      "type": "image",
+      "path": "photos/14.jpg",
+      "height": 1920,
+      "y": 0,
+      "scale": [
+        {
+          "t": 22.292307692307688,
+          "v": 1.0
+        },
+        {
+          "t": 26.51538461538461,
+          "v": 1.1,
+          "ease": "linear"
+        }
+      ],
+      "opacity": [
+        {
+          "t": 22.292307692307688,
+          "v": 0.0
+        },
+        {
+          "t": 22.992307692307687,
+          "v": 1.0,
+          "ease": "easeout"
+        }
+      ]
+    },
+    {
+      "id": "sc4",
+      "type": "image",
+      "path": "assets/scrim_bottom.png",
+      "x": 0,
+      "y": 940
+    },
+    {
+      "id": "h4",
+      "type": "text",
+      "content": "Open-Concept Living",
+      "font": "DejaVu Sans-Bold",
+      "size": 62,
+      "color": "#FFFFFF",
+      "y": 1430,
+      "line_spacing": 1.25
+    },
+    {
+      "id": "s4",
+      "type": "text",
+      "content": "Kitchen flows to the living room",
+      "font": "DejaVu Sans",
+      "size": 34,
+      "color": "#D7D3CC",
+      "y": 1540,
+      "line_spacing": 1.25
+    },
+    {
+      "id": "ph5",
+      "type": "image",
+      "path": "photos/16.jpg",
+      "height": 1920,
+      "y": 0,
+      "scale": [
+        {
+          "t": 25.81538461538461,
+          "v": 1.1
+        },
+        {
+          "t": 30.03846153846153,
+          "v": 1.0,
+          "ease": "linear"
+        }
+      ],
+      "opacity": [
+        {
+          "t": 25.81538461538461,
+          "v": 0.0
+        },
+        {
+          "t": 26.51538461538461,
+          "v": 1.0,
+          "ease": "easeout"
+        }
+      ]
+    },
+    {
+      "id": "sc5",
+      "type": "image",
+      "path": "assets/scrim_bottom.png",
+      "x": 0,
+      "y": 940
+    },
+    {
+      "id": "h5",
+      "type": "text",
+      "content": "Sun-Filled Sunroom",
+      "font": "DejaVu Sans-Bold",
+      "size": 62,
+      "color": "#FFFFFF",
+      "y": 1430,
+      "line_spacing": 1.25
+    },
+    {
+      "id": "s5",
+      "type": "text",
+      "content": "Wall of windows, wood ceiling",
+      "font": "DejaVu Sans",
+      "size": 34,
+      "color": "#D7D3CC",
+      "y": 1540,
+      "line_spacing": 1.25
+    },
+    {
+      "id": "ph6",
+      "type": "image",
+      "path": "photos/22.jpg",
+      "height": 1920,
+      "y": 0,
+      "scale": [
+        {
+          "t": 29.33846153846153,
+          "v": 1.0
+        },
+        {
+          "t": 33.561538461538454,
+          "v": 1.1,
+          "ease": "linear"
+        }
+      ],
+      "opacity": [
+        {
+          "t": 29.33846153846153,
+          "v": 0.0
+        },
+        {
+          "t": 30.03846153846153,
+          "v": 1.0,
+          "ease": "easeout"
+        }
+      ]
+    },
+    {
+      "id": "sc6",
+      "type": "image",
+      "path": "assets/scrim_bottom.png",
+      "x": 0,
+      "y": 940
+    },
+    {
+      "id": "h6",
+      "type": "text",
+      "content": "Primary Suite",
+      "font": "DejaVu Sans-Bold",
+      "size": 62,
+      "color": "#FFFFFF",
+      "y": 1430,
+      "line_spacing": 1.25
+    },
+    {
+      "id": "s6",
+      "type": "text",
+      "content": "Sliding barn door",
+      "font": "DejaVu Sans",
+      "size": 34,
+      "color": "#D7D3CC",
+      "y": 1540,
+      "line_spacing": 1.25
+    },
+    {
+      "id": "ph7",
+      "type": "image",
+      "path": "photos/21.jpg",
+      "height": 1920,
+      "y": 0,
+      "scale": [
+        {
+          "t": 32.86153846153845,
+          "v": 1.0
+        },
+        {
+          "t": 37.084615384615375,
+          "v": 1.1,
+          "ease": "linear"
+        }
+      ],
+      "opacity": [
+        {
+          "t": 32.86153846153845,
+          "v": 0.0
+        },
+        {
+          "t": 33.561538461538454,
+          "v": 1.0,
+          "ease": "easeout"
+        }
+      ]
+    },
+    {
+      "id": "sc7",
+      "type": "image",
+      "path": "assets/scrim_bottom.png",
+      "x": 0,
+      "y": 940
+    },
+    {
+      "id": "h7",
+      "type": "text",
+      "content": "Spa-Worthy Bath",
+      "font": "DejaVu Sans-Bold",
+      "size": 62,
+      "color": "#FFFFFF",
+      "y": 1430,
+      "line_spacing": 1.25
+    },
+    {
+      "id": "s7",
+      "type": "text",
+      "content": "Full tiled walk-in shower",
+      "font": "DejaVu Sans",
+      "size": 34,
+      "color": "#D7D3CC",
+      "y": 1540,
+      "line_spacing": 1.25
+    },
+    {
+      "id": "ph8",
+      "type": "image",
+      "path": "photos/19.jpg",
+      "height": 1920,
+      "y": 0,
+      "scale": [
+        {
+          "t": 36.38461538461537,
+          "v": 1.1
+        },
+        {
+          "t": 40.6076923076923,
+          "v": 1.0,
+          "ease": "linear"
+        }
+      ],
+      "opacity": [
+        {
+          "t": 36.38461538461537,
+          "v": 0.0
+        },
+        {
+          "t": 37.084615384615375,
+          "v": 1.0,
+          "ease": "easeout"
+        }
+      ]
+    },
+    {
+      "id": "sc8",
+      "type": "image",
+      "path": "assets/scrim_bottom.png",
+      "x": 0,
+      "y": 940
+    },
+    {
+      "id": "h8",
+      "type": "text",
+      "content": "Four Bedrooms",
+      "font": "DejaVu Sans-Bold",
+      "size": 62,
+      "color": "#FFFFFF",
+      "y": 1430,
+      "line_spacing": 1.25
+    },
+    {
+      "id": "s8",
+      "type": "text",
+      "content": "Room for everyone",
+      "font": "DejaVu Sans",
+      "size": 34,
+      "color": "#D7D3CC",
+      "y": 1540,
+      "line_spacing": 1.25
+    },
+    {
+      "id": "ph9",
+      "type": "image",
+      "path": "photos/25.jpg",
+      "height": 1920,
+      "y": 0,
+      "scale": [
+        {
+          "t": 39.907692307692294,
+          "v": 1.0
+        },
+        {
+          "t": 44.13076923076922,
+          "v": 1.1,
+          "ease": "linear"
+        }
+      ],
+      "opacity": [
+        {
+          "t": 39.907692307692294,
+          "v": 0.0
+        },
+        {
+          "t": 40.6076923076923,
+          "v": 1.0,
+          "ease": "easeout"
+        }
+      ]
+    },
+    {
+      "id": "sc9",
+      "type": "image",
+      "path": "assets/scrim_bottom.png",
+      "x": 0,
+      "y": 940
+    },
+    {
+      "id": "h9",
+      "type": "text",
+      "content": "Bonus Room Upstairs",
+      "font": "DejaVu Sans-Bold",
+      "size": 62,
+      "color": "#FFFFFF",
+      "y": 1430,
+      "line_spacing": 1.25
+    },
+    {
+      "id": "s9",
+      "type": "text",
+      "content": "Movie nights or game room",
+      "font": "DejaVu Sans",
+      "size": 34,
+      "color": "#D7D3CC",
+      "y": 1540,
+      "line_spacing": 1.25
+    },
+    {
+      "id": "ph10",
+      "type": "image",
+      "path": "photos/04.jpg",
+      "height": 1920,
+      "y": 0,
+      "scale": [
+        {
+          "t": 43.430769230769215,
+          "v": 1.1
+        },
+        {
+          "t": 47.65384615384614,
+          "v": 1.0,
+          "ease": "linear"
+        }
+      ],
+      "opacity": [
+        {
+          "t": 43.430769230769215,
+          "v": 0.0
+        },
+        {
+          "t": 44.13076923076922,
+          "v": 1.0,
+          "ease": "easeout"
+        }
+      ]
+    },
+    {
+      "id": "sc10",
+      "type": "image",
+      "path": "assets/scrim_bottom.png",
+      "x": 0,
+      "y": 940
+    },
+    {
+      "id": "h10",
+      "type": "text",
+      "content": "Massive Deck",
+      "font": "DejaVu Sans-Bold",
+      "size": 62,
+      "color": "#FFFFFF",
+      "y": 1430,
+      "line_spacing": 1.25
+    },
+    {
+      "id": "s10",
+      "type": "text",
+      "content": "Built for gathering",
+      "font": "DejaVu Sans",
+      "size": 34,
+      "color": "#D7D3CC",
+      "y": 1540,
+      "line_spacing": 1.25
+    },
+    {
+      "id": "ph11",
+      "type": "image",
+      "path": "photos/28.jpg",
+      "height": 1920,
+      "y": 0,
+      "scale": [
+        {
+          "t": 46.953846153846136,
+          "v": 1.1
+        },
+        {
+          "t": 51.17692307692306,
+          "v": 1.0,
+          "ease": "linear"
+        }
+      ],
+      "opacity": [
+        {
+          "t": 46.953846153846136,
+          "v": 0.0
+        },
+        {
+          "t": 47.65384615384614,
+          "v": 1.0,
+          "ease": "easeout"
+        }
+      ]
+    },
+    {
+      "id": "sc11",
+      "type": "image",
+      "path": "assets/scrim_bottom.png",
+      "x": 0,
+      "y": 940
+    },
+    {
+      "id": "h11",
+      "type": "text",
+      "content": "Detached 4-Car Garage",
+      "font": "DejaVu Sans-Bold",
+      "size": 62,
+      "color": "#FFFFFF",
+      "y": 1430,
+      "line_spacing": 1.25
+    },
+    {
+      "id": "s11",
+      "type": "text",
+      "content": "Plus workshop space",
+      "font": "DejaVu Sans",
+      "size": 34,
+      "color": "#D7D3CC",
+      "y": 1540,
+      "line_spacing": 1.25
+    },
+    {
+      "id": "ph12",
+      "type": "image",
+      "path": "photos/32.jpg",
+      "height": 1920,
+      "y": 0,
+      "scale": [
+        {
+          "t": 50.47692307692306,
+          "v": 1.0
+        },
+        {
+          "t": 54.69999999999998,
+          "v": 1.1,
+          "ease": "linear"
+        }
+      ],
+      "opacity": [
+        {
+          "t": 50.47692307692306,
+          "v": 0.0
+        },
+        {
+          "t": 51.17692307692306,
+          "v": 1.0,
+          "ease": "easeout"
+        }
+      ]
+    },
+    {
+      "id": "sc12",
+      "type": "image",
+      "path": "assets/scrim_bottom.png",
+      "x": 0,
+      "y": 940
+    },
+    {
+      "id": "h12",
+      "type": "text",
+      "content": "1.9 Acres",
+      "font": "DejaVu Sans-Bold",
+      "size": 62,
+      "color": "#FFFFFF",
+      "y": 1430,
+      "line_spacing": 1.25
+    },
+    {
+      "id": "s12",
+      "type": "text",
+      "content": "Mini-farm ready — bring goats",
+      "font": "DejaVu Sans",
+      "size": 34,
+      "color": "#D7D3CC",
+      "y": 1540,
+      "line_spacing": 1.25
+    },
+    {
+      "id": "cta_bg",
+      "type": "image",
+      "path": "photos/05.jpg",
+      "height": 1920,
+      "y": 0,
+      "scale": [
+        {
+          "t": 53.99999999999998,
+          "v": 1.0
+        },
+        {
+          "t": 60.69999999999998,
+          "v": 1.1,
+          "ease": "linear"
+        }
+      ],
+      "opacity": [
+        {
+          "t": 53.99999999999998,
+          "v": 0.0
+        },
+        {
+          "t": 54.69999999999998,
+          "v": 1.0,
+          "ease": "easeout"
+        }
+      ]
+    },
+    {
+      "id": "cta_veil",
+      "type": "rect",
+      "x": 0,
+      "y": 0,
+      "w": 1080,
+      "h": 1920,
+      "color": "#0B0B0FCC"
+    },
+    {
+      "id": "cta_head",
+      "type": "text",
+      "content": "Schedule a Private Tour",
+      "font": "DejaVu Sans-Bold",
+      "size": 54,
+      "color": "#FFFFFF",
+      "y": 640,
+      "line_spacing": 1.25
+    },
+    {
+      "id": "rule2",
+      "type": "image",
+      "path": "assets/rule.png",
+      "x": 430,
+      "y": 760
+    },
+    {
+      "id": "agent",
+      "type": "text",
+      "content": "Cynthia Pearson",
+      "font": "DejaVu Sans-Bold",
+      "size": 66,
+      "color": "#FFFFFF",
+      "y": 850,
+      "line_spacing": 1.25
+    },
+    {
+      "id": "role",
+      "type": "text",
+      "content": "Realtor®  ·  Compass",
+      "font": "DejaVu Sans",
+      "size": 34,
+      "color": "#E8C39E",
+      "y": 950,
+      "line_spacing": 1.25
+    },
+    {
+      "id": "phone",
+      "type": "text",
+      "content": "919.621.9777",
+      "font": "DejaVu Sans-Bold",
+      "size": 58,
+      "color": "#FFFFFF",
+      "y": 1120,
+      "line_spacing": 1.25
+    },
+    {
+      "id": "email",
+      "type": "text",
+      "content": "cindy.pearson@compass.com",
+      "font": "DejaVu Sans",
+      "size": 32,
+      "color": "#D7D3CC",
+      "y": 1215,
+      "line_spacing": 1.25
+    },
+    {
+      "id": "cta_addr",
+      "type": "text",
+      "content": "300 Upper Station Camp Crk Rd\nGallatin, TN 37066",
+      "font": "DejaVu Sans",
+      "size": 32,
+      "color": "#D7D3CC",
+      "y": 1420,
+      "line_spacing": 1.35
+    },
+    {
+      "id": "mls",
+      "type": "text",
+      "content": "MLS #2898711  ·  $525,000",
+      "font": "DejaVu Sans-Bold",
+      "size": 30,
+      "color": "#E8C39E",
+      "y": 1580,
+      "line_spacing": 1.25
+    }
+  ],
+  "timeline": [
+    {
+      "time_ms": 0,
+      "action": "fade_in",
+      "target": "scrim_b",
+      "duration_ms": 500
+    },
+    {
+      "time_ms": 0,
+      "action": "fade_in",
+      "target": "scrim_t",
+      "duration_ms": 500
+    },
+    {
+      "time_ms": 300,
+      "action": "fade_in",
+      "target": "brand",
+      "duration_ms": 500,
+      "ease": "easeout"
+    },
+    {
+      "time_ms": 500,
+      "action": "fade_in",
+      "target": "status",
+      "duration_ms": 500,
+      "ease": "easeout"
+    },
+    {
+      "time_ms": 900,
+      "action": "fade_in",
+      "target": "addr",
+      "duration_ms": 500,
+      "ease": "easeout"
+    },
+    {
+      "time_ms": 900,
+      "action": "move_y",
+      "target": "addr",
+      "value": -28,
+      "duration_ms": 750,
+      "ease": "backout"
+    },
+    {
+      "time_ms": 1100,
+      "action": "fade_in",
+      "target": "city",
+      "duration_ms": 500,
+      "ease": "easeout"
+    },
+    {
+      "time_ms": 1100,
+      "action": "move_y",
+      "target": "city",
+      "value": -28,
+      "duration_ms": 750,
+      "ease": "backout"
+    },
+    {
+      "time_ms": 1350,
+      "action": "fade_in",
+      "target": "rule1",
+      "duration_ms": 500
+    },
+    {
+      "time_ms": 1500,
+      "action": "fade_in",
+      "target": "price",
+      "duration_ms": 500,
+      "ease": "easeout"
+    },
+    {
+      "time_ms": 1500,
+      "action": "move_y",
+      "target": "price",
+      "value": -28,
+      "duration_ms": 750,
+      "ease": "backout"
+    },
+    {
+      "time_ms": 4149,
+      "action": "fade_out",
+      "target": "brand",
+      "duration_ms": 450
+    },
+    {
+      "time_ms": 4149,
+      "action": "fade_out",
+      "target": "status",
+      "duration_ms": 450
+    },
+    {
+      "time_ms": 4149,
+      "action": "fade_out",
+      "target": "addr",
+      "duration_ms": 450
+    },
+    {
+      "time_ms": 4149,
+      "action": "fade_out",
+      "target": "city",
+      "duration_ms": 450
+    },
+    {
+      "time_ms": 4149,
+      "action": "fade_out",
+      "target": "price",
+      "duration_ms": 450
+    },
+    {
+      "time_ms": 4149,
+      "action": "fade_out",
+      "target": "rule1",
+      "duration_ms": 450
+    },
+    {
+      "time_ms": 5300,
+      "action": "fade_out",
+      "target": "hero",
+      "duration_ms": 120
+    },
+    {
+      "time_ms": 4600,
+      "action": "fade_in",
+      "target": "stats_veil",
+      "duration_ms": 600
+    },
+    {
+      "time_ms": 7799,
+      "action": "fade_out",
+      "target": "stats_veil",
+      "duration_ms": 400
+    },
+    {
+      "time_ms": 5050,
+      "action": "fade_in",
+      "target": "sv0",
+      "duration_ms": 500,
+      "ease": "easeout"
+    },
+    {
+      "time_ms": 5050,
+      "action": "move_y",
+      "target": "sv0",
+      "value": -22,
+      "duration_ms": 750,
+      "ease": "backout"
+    },
+    {
+      "time_ms": 7579,
+      "action": "fade_out",
+      "target": "sv0",
+      "duration_ms": 400
+    },
+    {
+      "time_ms": 5149,
+      "action": "fade_in",
+      "target": "sl0",
+      "duration_ms": 500,
+      "ease": "easeout"
+    },
+    {
+      "time_ms": 7579,
+      "action": "fade_out",
+      "target": "sl0",
+      "duration_ms": 400
+    },
+    {
+      "time_ms": 5210,
+      "action": "fade_in",
+      "target": "sv1",
+      "duration_ms": 500,
+      "ease": "easeout"
+    },
+    {
+      "time_ms": 5210,
+      "action": "move_y",
+      "target": "sv1",
+      "value": -22,
+      "duration_ms": 750,
+      "ease": "backout"
+    },
+    {
+      "time_ms": 7579,
+      "action": "fade_out",
+      "target": "sv1",
+      "duration_ms": 400
+    },
+    {
+      "time_ms": 5310,
+      "action": "fade_in",
+      "target": "sl1",
+      "duration_ms": 500,
+      "ease": "easeout"
+    },
+    {
+      "time_ms": 7579,
+      "action": "fade_out",
+      "target": "sl1",
+      "duration_ms": 400
+    },
+    {
+      "time_ms": 5370,
+      "action": "fade_in",
+      "target": "sv2",
+      "duration_ms": 500,
+      "ease": "easeout"
+    },
+    {
+      "time_ms": 5370,
+      "action": "move_y",
+      "target": "sv2",
+      "value": -22,
+      "duration_ms": 750,
+      "ease": "backout"
+    },
+    {
+      "time_ms": 7579,
+      "action": "fade_out",
+      "target": "sv2",
+      "duration_ms": 400
+    },
+    {
+      "time_ms": 5470,
+      "action": "fade_in",
+      "target": "sl2",
+      "duration_ms": 500,
+      "ease": "easeout"
+    },
+    {
+      "time_ms": 7579,
+      "action": "fade_out",
+      "target": "sl2",
+      "duration_ms": 400
+    },
+    {
+      "time_ms": 5529,
+      "action": "fade_in",
+      "target": "sv3",
+      "duration_ms": 500,
+      "ease": "easeout"
+    },
+    {
+      "time_ms": 5529,
+      "action": "move_y",
+      "target": "sv3",
+      "value": -22,
+      "duration_ms": 750,
+      "ease": "backout"
+    },
+    {
+      "time_ms": 7579,
+      "action": "fade_out",
+      "target": "sv3",
+      "duration_ms": 400
+    },
+    {
+      "time_ms": 5629,
+      "action": "fade_in",
+      "target": "sl3",
+      "duration_ms": 500,
+      "ease": "easeout"
+    },
+    {
+      "time_ms": 7579,
+      "action": "fade_out",
+      "target": "sl3",
+      "duration_ms": 400
+    },
+    {
+      "time_ms": 8899,
+      "action": "fade_out",
+      "target": "stats_bg",
+      "duration_ms": 120
+    },
+    {
+      "time_ms": 8350,
+      "action": "fade_in",
+      "target": "sc0",
+      "duration_ms": 500
+    },
+    {
+      "time_ms": 11373,
+      "action": "fade_out",
+      "target": "sc0",
+      "duration_ms": 400
+    },
+    {
+      "time_ms": 8549,
+      "action": "fade_in",
+      "target": "h0",
+      "duration_ms": 500,
+      "ease": "easeout"
+    },
+    {
+      "time_ms": 8549,
+      "action": "move_y",
+      "target": "h0",
+      "value": -28,
+      "duration_ms": 750,
+      "ease": "backout"
+    },
+    {
+      "time_ms": 11373,
+      "action": "fade_out",
+      "target": "h0",
+      "duration_ms": 400
+    },
+    {
+      "time_ms": 8700,
+      "action": "fade_in",
+      "target": "s0",
+      "duration_ms": 500,
+      "ease": "easeout"
+    },
+    {
+      "time_ms": 8700,
+      "action": "move_y",
+      "target": "s0",
+      "value": -28,
+      "duration_ms": 750,
+      "ease": "backout"
+    },
+    {
+      "time_ms": 11373,
+      "action": "fade_out",
+      "target": "s0",
+      "duration_ms": 400
+    },
+    {
+      "time_ms": 12423,
+      "action": "fade_out",
+      "target": "ph0",
+      "duration_ms": 120
+    },
+    {
+      "time_ms": 11873,
+      "action": "fade_in",
+      "target": "sc1",
+      "duration_ms": 500
+    },
+    {
+      "time_ms": 14896,
+      "action": "fade_out",
+      "target": "sc1",
+      "duration_ms": 400
+    },
+    {
+      "time_ms": 12073,
+      "action": "fade_in",
+      "target": "h1",
+      "duration_ms": 500,
+      "ease": "easeout"
+    },
+    {
+      "time_ms": 12073,
+      "action": "move_y",
+      "target": "h1",
+      "value": -28,
+      "duration_ms": 750,
+      "ease": "backout"
+    },
+    {
+      "time_ms": 14896,
+      "action": "fade_out",
+      "target": "h1",
+      "duration_ms": 400
+    },
+    {
+      "time_ms": 12223,
+      "action": "fade_in",
+      "target": "s1",
+      "duration_ms": 500,
+      "ease": "easeout"
+    },
+    {
+      "time_ms": 12223,
+      "action": "move_y",
+      "target": "s1",
+      "value": -28,
+      "duration_ms": 750,
+      "ease": "backout"
+    },
+    {
+      "time_ms": 14896,
+      "action": "fade_out",
+      "target": "s1",
+      "duration_ms": 400
+    },
+    {
+      "time_ms": 15946,
+      "action": "fade_out",
+      "target": "ph1",
+      "duration_ms": 120
+    },
+    {
+      "time_ms": 15396,
+      "action": "fade_in",
+      "target": "sc2",
+      "duration_ms": 500
+    },
+    {
+      "time_ms": 18419,
+      "action": "fade_out",
+      "target": "sc2",
+      "duration_ms": 400
+    },
+    {
+      "time_ms": 15596,
+      "action": "fade_in",
+      "target": "h2",
+      "duration_ms": 500,
+      "ease": "easeout"
+    },
+    {
+      "time_ms": 15596,
+      "action": "move_y",
+      "target": "h2",
+      "value": -28,
+      "duration_ms": 750,
+      "ease": "backout"
+    },
+    {
+      "time_ms": 18419,
+      "action": "fade_out",
+      "target": "h2",
+      "duration_ms": 400
+    },
+    {
+      "time_ms": 15746,
+      "action": "fade_in",
+      "target": "s2",
+      "duration_ms": 500,
+      "ease": "easeout"
+    },
+    {
+      "time_ms": 15746,
+      "action": "move_y",
+      "target": "s2",
+      "value": -28,
+      "duration_ms": 750,
+      "ease": "backout"
+    },
+    {
+      "time_ms": 18419,
+      "action": "fade_out",
+      "target": "s2",
+      "duration_ms": 400
+    },
+    {
+      "time_ms": 19469,
+      "action": "fade_out",
+      "target": "ph2",
+      "duration_ms": 120
+    },
+    {
+      "time_ms": 18919,
+      "action": "fade_in",
+      "target": "sc3",
+      "duration_ms": 500
+    },
+    {
+      "time_ms": 21942,
+      "action": "fade_out",
+      "target": "sc3",
+      "duration_ms": 400
+    },
+    {
+      "time_ms": 19119,
+      "action": "fade_in",
+      "target": "h3",
+      "duration_ms": 500,
+      "ease": "easeout"
+    },
+    {
+      "time_ms": 19119,
+      "action": "move_y",
+      "target": "h3",
+      "value": -28,
+      "duration_ms": 750,
+      "ease": "backout"
+    },
+    {
+      "time_ms": 21942,
+      "action": "fade_out",
+      "target": "h3",
+      "duration_ms": 400
+    },
+    {
+      "time_ms": 19269,
+      "action": "fade_in",
+      "target": "s3",
+      "duration_ms": 500,
+      "ease": "easeout"
+    },
+    {
+      "time_ms": 19269,
+      "action": "move_y",
+      "target": "s3",
+      "value": -28,
+      "duration_ms": 750,
+      "ease": "backout"
+    },
+    {
+      "time_ms": 21942,
+      "action": "fade_out",
+      "target": "s3",
+      "duration_ms": 400
+    },
+    {
+      "time_ms": 22992,
+      "action": "fade_out",
+      "target": "ph3",
+      "duration_ms": 120
+    },
+    {
+      "time_ms": 22442,
+      "action": "fade_in",
+      "target": "sc4",
+      "duration_ms": 500
+    },
+    {
+      "time_ms": 25465,
+      "action": "fade_out",
+      "target": "sc4",
+      "duration_ms": 400
+    },
+    {
+      "time_ms": 22642,
+      "action": "fade_in",
+      "target": "h4",
+      "duration_ms": 500,
+      "ease": "easeout"
+    },
+    {
+      "time_ms": 22642,
+      "action": "move_y",
+      "target": "h4",
+      "value": -28,
+      "duration_ms": 750,
+      "ease": "backout"
+    },
+    {
+      "time_ms": 25465,
+      "action": "fade_out",
+      "target": "h4",
+      "duration_ms": 400
+    },
+    {
+      "time_ms": 22792,
+      "action": "fade_in",
+      "target": "s4",
+      "duration_ms": 500,
+      "ease": "easeout"
+    },
+    {
+      "time_ms": 22792,
+      "action": "move_y",
+      "target": "s4",
+      "value": -28,
+      "duration_ms": 750,
+      "ease": "backout"
+    },
+    {
+      "time_ms": 25465,
+      "action": "fade_out",
+      "target": "s4",
+      "duration_ms": 400
+    },
+    {
+      "time_ms": 26515,
+      "action": "fade_out",
+      "target": "ph4",
+      "duration_ms": 120
+    },
+    {
+      "time_ms": 25965,
+      "action": "fade_in",
+      "target": "sc5",
+      "duration_ms": 500
+    },
+    {
+      "time_ms": 28988,
+      "action": "fade_out",
+      "target": "sc5",
+      "duration_ms": 400
+    },
+    {
+      "time_ms": 26165,
+      "action": "fade_in",
+      "target": "h5",
+      "duration_ms": 500,
+      "ease": "easeout"
+    },
+    {
+      "time_ms": 26165,
+      "action": "move_y",
+      "target": "h5",
+      "value": -28,
+      "duration_ms": 750,
+      "ease": "backout"
+    },
+    {
+      "time_ms": 28988,
+      "action": "fade_out",
+      "target": "h5",
+      "duration_ms": 400
+    },
+    {
+      "time_ms": 26315,
+      "action": "fade_in",
+      "target": "s5",
+      "duration_ms": 500,
+      "ease": "easeout"
+    },
+    {
+      "time_ms": 26315,
+      "action": "move_y",
+      "target": "s5",
+      "value": -28,
+      "duration_ms": 750,
+      "ease": "backout"
+    },
+    {
+      "time_ms": 28988,
+      "action": "fade_out",
+      "target": "s5",
+      "duration_ms": 400
+    },
+    {
+      "time_ms": 30038,
+      "action": "fade_out",
+      "target": "ph5",
+      "duration_ms": 120
+    },
+    {
+      "time_ms": 29488,
+      "action": "fade_in",
+      "target": "sc6",
+      "duration_ms": 500
+    },
+    {
+      "time_ms": 32511,
+      "action": "fade_out",
+      "target": "sc6",
+      "duration_ms": 400
+    },
+    {
+      "time_ms": 29688,
+      "action": "fade_in",
+      "target": "h6",
+      "duration_ms": 500,
+      "ease": "easeout"
+    },
+    {
+      "time_ms": 29688,
+      "action": "move_y",
+      "target": "h6",
+      "value": -28,
+      "duration_ms": 750,
+      "ease": "backout"
+    },
+    {
+      "time_ms": 32511,
+      "action": "fade_out",
+      "target": "h6",
+      "duration_ms": 400
+    },
+    {
+      "time_ms": 29838,
+      "action": "fade_in",
+      "target": "s6",
+      "duration_ms": 500,
+      "ease": "easeout"
+    },
+    {
+      "time_ms": 29838,
+      "action": "move_y",
+      "target": "s6",
+      "value": -28,
+      "duration_ms": 750,
+      "ease": "backout"
+    },
+    {
+      "time_ms": 32511,
+      "action": "fade_out",
+      "target": "s6",
+      "duration_ms": 400
+    },
+    {
+      "time_ms": 33561,
+      "action": "fade_out",
+      "target": "ph6",
+      "duration_ms": 120
+    },
+    {
+      "time_ms": 33011,
+      "action": "fade_in",
+      "target": "sc7",
+      "duration_ms": 500
+    },
+    {
+      "time_ms": 36034,
+      "action": "fade_out",
+      "target": "sc7",
+      "duration_ms": 400
+    },
+    {
+      "time_ms": 33211,
+      "action": "fade_in",
+      "target": "h7",
+      "duration_ms": 500,
+      "ease": "easeout"
+    },
+    {
+      "time_ms": 33211,
+      "action": "move_y",
+      "target": "h7",
+      "value": -28,
+      "duration_ms": 750,
+      "ease": "backout"
+    },
+    {
+      "time_ms": 36034,
+      "action": "fade_out",
+      "target": "h7",
+      "duration_ms": 400
+    },
+    {
+      "time_ms": 33361,
+      "action": "fade_in",
+      "target": "s7",
+      "duration_ms": 500,
+      "ease": "easeout"
+    },
+    {
+      "time_ms": 33361,
+      "action": "move_y",
+      "target": "s7",
+      "value": -28,
+      "duration_ms": 750,
+      "ease": "backout"
+    },
+    {
+      "time_ms": 36034,
+      "action": "fade_out",
+      "target": "s7",
+      "duration_ms": 400
+    },
+    {
+      "time_ms": 37084,
+      "action": "fade_out",
+      "target": "ph7",
+      "duration_ms": 120
+    },
+    {
+      "time_ms": 36534,
+      "action": "fade_in",
+      "target": "sc8",
+      "duration_ms": 500
+    },
+    {
+      "time_ms": 39557,
+      "action": "fade_out",
+      "target": "sc8",
+      "duration_ms": 400
+    },
+    {
+      "time_ms": 36734,
+      "action": "fade_in",
+      "target": "h8",
+      "duration_ms": 500,
+      "ease": "easeout"
+    },
+    {
+      "time_ms": 36734,
+      "action": "move_y",
+      "target": "h8",
+      "value": -28,
+      "duration_ms": 750,
+      "ease": "backout"
+    },
+    {
+      "time_ms": 39557,
+      "action": "fade_out",
+      "target": "h8",
+      "duration_ms": 400
+    },
+    {
+      "time_ms": 36884,
+      "action": "fade_in",
+      "target": "s8",
+      "duration_ms": 500,
+      "ease": "easeout"
+    },
+    {
+      "time_ms": 36884,
+      "action": "move_y",
+      "target": "s8",
+      "value": -28,
+      "duration_ms": 750,
+      "ease": "backout"
+    },
+    {
+      "time_ms": 39557,
+      "action": "fade_out",
+      "target": "s8",
+      "duration_ms": 400
+    },
+    {
+      "time_ms": 40607,
+      "action": "fade_out",
+      "target": "ph8",
+      "duration_ms": 120
+    },
+    {
+      "time_ms": 40057,
+      "action": "fade_in",
+      "target": "sc9",
+      "duration_ms": 500
+    },
+    {
+      "time_ms": 43080,
+      "action": "fade_out",
+      "target": "sc9",
+      "duration_ms": 400
+    },
+    {
+      "time_ms": 40257,
+      "action": "fade_in",
+      "target": "h9",
+      "duration_ms": 500,
+      "ease": "easeout"
+    },
+    {
+      "time_ms": 40257,
+      "action": "move_y",
+      "target": "h9",
+      "value": -28,
+      "duration_ms": 750,
+      "ease": "backout"
+    },
+    {
+      "time_ms": 43080,
+      "action": "fade_out",
+      "target": "h9",
+      "duration_ms": 400
+    },
+    {
+      "time_ms": 40407,
+      "action": "fade_in",
+      "target": "s9",
+      "duration_ms": 500,
+      "ease": "easeout"
+    },
+    {
+      "time_ms": 40407,
+      "action": "move_y",
+      "target": "s9",
+      "value": -28,
+      "duration_ms": 750,
+      "ease": "backout"
+    },
+    {
+      "time_ms": 43080,
+      "action": "fade_out",
+      "target": "s9",
+      "duration_ms": 400
+    },
+    {
+      "time_ms": 44130,
+      "action": "fade_out",
+      "target": "ph9",
+      "duration_ms": 120
+    },
+    {
+      "time_ms": 43580,
+      "action": "fade_in",
+      "target": "sc10",
+      "duration_ms": 500
+    },
+    {
+      "time_ms": 46603,
+      "action": "fade_out",
+      "target": "sc10",
+      "duration_ms": 400
+    },
+    {
+      "time_ms": 43780,
+      "action": "fade_in",
+      "target": "h10",
+      "duration_ms": 500,
+      "ease": "easeout"
+    },
+    {
+      "time_ms": 43780,
+      "action": "move_y",
+      "target": "h10",
+      "value": -28,
+      "duration_ms": 750,
+      "ease": "backout"
+    },
+    {
+      "time_ms": 46603,
+      "action": "fade_out",
+      "target": "h10",
+      "duration_ms": 400
+    },
+    {
+      "time_ms": 43930,
+      "action": "fade_in",
+      "target": "s10",
+      "duration_ms": 500,
+      "ease": "easeout"
+    },
+    {
+      "time_ms": 43930,
+      "action": "move_y",
+      "target": "s10",
+      "value": -28,
+      "duration_ms": 750,
+      "ease": "backout"
+    },
+    {
+      "time_ms": 46603,
+      "action": "fade_out",
+      "target": "s10",
+      "duration_ms": 400
+    },
+    {
+      "time_ms": 47653,
+      "action": "fade_out",
+      "target": "ph10",
+      "duration_ms": 120
+    },
+    {
+      "time_ms": 47103,
+      "action": "fade_in",
+      "target": "sc11",
+      "duration_ms": 500
+    },
+    {
+      "time_ms": 50126,
+      "action": "fade_out",
+      "target": "sc11",
+      "duration_ms": 400
+    },
+    {
+      "time_ms": 47303,
+      "action": "fade_in",
+      "target": "h11",
+      "duration_ms": 500,
+      "ease": "easeout"
+    },
+    {
+      "time_ms": 47303,
+      "action": "move_y",
+      "target": "h11",
+      "value": -28,
+      "duration_ms": 750,
+      "ease": "backout"
+    },
+    {
+      "time_ms": 50126,
+      "action": "fade_out",
+      "target": "h11",
+      "duration_ms": 400
+    },
+    {
+      "time_ms": 47453,
+      "action": "fade_in",
+      "target": "s11",
+      "duration_ms": 500,
+      "ease": "easeout"
+    },
+    {
+      "time_ms": 47453,
+      "action": "move_y",
+      "target": "s11",
+      "value": -28,
+      "duration_ms": 750,
+      "ease": "backout"
+    },
+    {
+      "time_ms": 50126,
+      "action": "fade_out",
+      "target": "s11",
+      "duration_ms": 400
+    },
+    {
+      "time_ms": 51176,
+      "action": "fade_out",
+      "target": "ph11",
+      "duration_ms": 120
+    },
+    {
+      "time_ms": 50626,
+      "action": "fade_in",
+      "target": "sc12",
+      "duration_ms": 500
+    },
+    {
+      "time_ms": 53649,
+      "action": "fade_out",
+      "target": "sc12",
+      "duration_ms": 400
+    },
+    {
+      "time_ms": 50826,
+      "action": "fade_in",
+      "target": "h12",
+      "duration_ms": 500,
+      "ease": "easeout"
+    },
+    {
+      "time_ms": 50826,
+      "action": "move_y",
+      "target": "h12",
+      "value": -28,
+      "duration_ms": 750,
+      "ease": "backout"
+    },
+    {
+      "time_ms": 53649,
+      "action": "fade_out",
+      "target": "h12",
+      "duration_ms": 400
+    },
+    {
+      "time_ms": 50976,
+      "action": "fade_in",
+      "target": "s12",
+      "duration_ms": 500,
+      "ease": "easeout"
+    },
+    {
+      "time_ms": 50976,
+      "action": "move_y",
+      "target": "s12",
+      "value": -28,
+      "duration_ms": 750,
+      "ease": "backout"
+    },
+    {
+      "time_ms": 53649,
+      "action": "fade_out",
+      "target": "s12",
+      "duration_ms": 400
+    },
+    {
+      "time_ms": 54699,
+      "action": "fade_out",
+      "target": "ph12",
+      "duration_ms": 120
+    },
+    {
+      "time_ms": 53999,
+      "action": "fade_in",
+      "target": "cta_veil",
+      "duration_ms": 700
+    },
+    {
+      "time_ms": 54499,
+      "action": "fade_in",
+      "target": "cta_head",
+      "duration_ms": 500,
+      "ease": "easeout"
+    },
+    {
+      "time_ms": 54499,
+      "action": "move_y",
+      "target": "cta_head",
+      "value": -28,
+      "duration_ms": 750,
+      "ease": "backout"
+    },
+    {
+      "time_ms": 54749,
+      "action": "fade_in",
+      "target": "rule2",
+      "duration_ms": 500
+    },
+    {
+      "time_ms": 54899,
+      "action": "fade_in",
+      "target": "agent",
+      "duration_ms": 500,
+      "ease": "easeout"
+    },
+    {
+      "time_ms": 54899,
+      "action": "move_y",
+      "target": "agent",
+      "value": -28,
+      "duration_ms": 750,
+      "ease": "backout"
+    },
+    {
+      "time_ms": 55049,
+      "action": "fade_in",
+      "target": "role",
+      "duration_ms": 500,
+      "ease": "easeout"
+    },
+    {
+      "time_ms": 55049,
+      "action": "move_y",
+      "target": "role",
+      "value": -28,
+      "duration_ms": 750,
+      "ease": "backout"
+    },
+    {
+      "time_ms": 55299,
+      "action": "fade_in",
+      "target": "phone",
+      "duration_ms": 500,
+      "ease": "easeout"
+    },
+    {
+      "time_ms": 55299,
+      "action": "move_y",
+      "target": "phone",
+      "value": -28,
+      "duration_ms": 750,
+      "ease": "backout"
+    },
+    {
+      "time_ms": 55449,
+      "action": "fade_in",
+      "target": "email",
+      "duration_ms": 500,
+      "ease": "easeout"
+    },
+    {
+      "time_ms": 55449,
+      "action": "move_y",
+      "target": "email",
+      "value": -28,
+      "duration_ms": 750,
+      "ease": "backout"
+    },
+    {
+      "time_ms": 55599,
+      "action": "fade_in",
+      "target": "cta_addr",
+      "duration_ms": 500,
+      "ease": "easeout"
+    },
+    {
+      "time_ms": 55599,
+      "action": "move_y",
+      "target": "cta_addr",
+      "value": -28,
+      "duration_ms": 750,
+      "ease": "backout"
+    },
+    {
+      "time_ms": 55749,
+      "action": "fade_in",
+      "target": "mls",
+      "duration_ms": 500,
+      "ease": "easeout"
+    }
+  ],
+  "effects": [
+    {
+      "type": "color_grade",
+      "contrast": 1.06,
+      "saturation": 1.07,
+      "temperature": 0.035,
+      "exposure": 0.02
+    },
+    {
+      "type": "vibrance",
+      "amount": 0.18
+    },
+    {
+      "type": "vignette",
+      "amount": 0.3,
+      "radius": 0.68,
+      "softness": 0.62,
+      "color": "#000000"
+    },
+    {
+      "type": "grain",
+      "amount": 0.012
+    }
+  ]
+}
