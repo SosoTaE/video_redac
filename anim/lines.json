@@ -1,0 +1,112 @@
+{
+  "_comment": "`line` with `trim`: edges that draw themselves. Previously each was a hand-rotated rect.",
+  "project": {
+    "width": 900,
+    "height": 560,
+    "fps": 60,
+    "bg_color": "#0A0A0F",
+    "duration_ms": 4000
+  },
+  "groups": [
+    {
+      "id": "net",
+      "pivot_x": "center",
+      "pivot_y": "center"
+    }
+  ],
+  "objects": [
+    {
+      "id": "edge",
+      "type": "line",
+      "x1": 450,
+      "y1": 80,
+      "x2": 450,
+      "y2": 480,
+      "width": 3,
+      "cap": "round",
+      "color": "#3D5A80",
+      "group": "net",
+      "trim": [
+        {
+          "t": 0,
+          "v": 0
+        },
+        {
+          "t": 1.6,
+          "v": 1,
+          "ease": "cubicinout"
+        }
+      ],
+      "repeat": {
+        "count": 12,
+        "layout": "stack",
+        "rotate_step": 15
+      }
+    },
+    {
+      "id": "node",
+      "type": "circle",
+      "radius": 13,
+      "x": "center",
+      "y": "center",
+      "anchor": "center",
+      "color": "#0A0A0F",
+      "stroke": "#79C0FF",
+      "stroke_width": 3,
+      "group": "net",
+      "repeat": {
+        "count": 12,
+        "layout": "radial",
+        "radius": 200,
+        "stagger_ms": 60,
+        "color_cycle": [
+          "#79C0FF"
+        ]
+      }
+    },
+    {
+      "id": "core",
+      "type": "circle",
+      "radius": 34,
+      "x": "center",
+      "y": "center",
+      "anchor": "center",
+      "color": "#161B22",
+      "stroke": "#FFD166",
+      "stroke_width": 4,
+      "tint": "#FFD166",
+      "tint_amount": [
+        {
+          "t": 1.6,
+          "v": 0
+        },
+        {
+          "t": 2.2,
+          "v": 0.9
+        },
+        {
+          "t": 3.0,
+          "v": 0
+        }
+      ]
+    }
+  ],
+  "timeline": [
+    {
+      "time_ms": 0,
+      "duration_ms": 4000,
+      "action": "rotate",
+      "target": "net",
+      "value": 60,
+      "ease": "cubicinout"
+    },
+    {
+      "time_ms": 400,
+      "duration_ms": 500,
+      "action": "scale",
+      "target": "node",
+      "value": 1.4,
+      "ease": "backout"
+    }
+  ]
+}

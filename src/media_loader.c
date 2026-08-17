@@ -872,22 +872,272 @@ bool media_render_shape_widget(ShapeWidget *w)
     cairo_set_source_rgba(cr, w->color.r / 255.0, w->color.g / 255.0,
                               w->color.b / 255.0, w->color.a / 255.0);
 
+    /*
+     * The outline is inset by half its width so it stays inside the texture.
+     * Cairo centres a stroke on its path, so without this the outer half would
+     * be clipped away and the ring would look thin on one side.
+     */
+    double sw   = (w->stroke_width > 0.0f && w->stroke_color.a > 0) ? w->stroke_width : 0.0;
+    double half = sw * 0.5;
+
     if (w->base.kind == WIDGET_CIRCLE) {
         /* An ellipse is a unit circle plus a scale, so w != h also works. */
         cairo_save(cr);
         cairo_translate(cr, iw / 2.0, ih / 2.0);
-        cairo_scale(cr, iw / 2.0, ih / 2.0);
+        cairo_scale(cr, (iw - sw) / 2.0, (ih - sw) / 2.0);
         cairo_arc(cr, 0.0, 0.0, 1.0, 0.0, 2.0 * 3.14159265358979323846);
         cairo_restore(cr);
-        cairo_fill(cr);
     } else {
-        rounded_rect_path(cr, 0, 0, iw, ih, w->corner_radius);
-        cairo_fill(cr);
+        rounded_rect_path(cr, half, half, iw - sw, ih - sw, w->corner_radius);
+    }
+
+    if (w->filled) {
+        /* _preserve, so the same path can then be stroked. */
+        if (sw > 0.0) {
+            cairo_fill_preserve(cr);
+        } else {
+            cairo_fill(cr);
+        }
+    }
+
+    if (sw > 0.0) {
+        cairo_set_source_rgba(cr, w->stroke_color.r / 255.0, w->stroke_color.g / 255.0,
+                                  w->stroke_color.b / 255.0, w->stroke_color.a / 255.0);
+        cairo_set_line_width(cr, sw);
+        cairo_stroke(cr);
+    } else if (!w->filled) {
+        cairo_new_path(cr);   /* nothing to draw — do not leave a dangling path */
     }
 
     cairo_destroy(cr);
     bool ok = surface_to_rgba(surface, &w->base.tex);
     cairo_surface_destroy(surface);
+    return ok;
+}
+
+bool media_render_line_widget(LineWidget *w)
+{
+    if (w == NULL) {
+        return false;
+    }
+
+    memset(&w->base.tex, 0, sizeof w->base.tex);
+
+    float dx  = w->x2 - w->x1;
+    float dy  = w->y2 - w->y1;
+    float len = sqrtf(dx * dx + dy * dy);
+
+    /* One extra pixel each way so antialiasing is not clipped. */
+    int iw = (int)ceilf(len + w->width) + 2;
+    int ih = (int)ceilf(w->width) + 2;
+    if (iw < 1) iw = 1;
+    if (ih < 1) ih = 1;
+
+    cairo_surface_t *surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, iw, ih);
+    if (cairo_surface_status(surface) != CAIRO_STATUS_SUCCESS) {
+        cairo_surface_destroy(surface);
+        return false;
+    }
+
+    cairo_t *cr = cairo_create(surface);
+    cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
+    cairo_set_source_rgba(cr, 0, 0, 0, 0);
+    cairo_paint(cr);
+    cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
+
+    cairo_set_source_rgba(cr, w->color.r / 255.0, w->color.g / 255.0,
+                              w->color.b / 255.0, w->color.a / 255.0);
+    cairo_set_line_width(cr, w->width);
+    cairo_set_line_cap(cr, (w->cap == 1) ? CAIRO_LINE_CAP_ROUND
+                         : (w->cap == 2) ? CAIRO_LINE_CAP_SQUARE
+                                         : CAIRO_LINE_CAP_BUTT);
+
+    /*
+     * Always drawn along +x. The segment's real direction is base_rotation,
+     * applied by the compositor — which is exactly what lets `trim` stay a
+     * simple x threshold in texture space.
+     */
+    double y0 = ih * 0.5;
+    double x0 = (iw - len) * 0.5;
+    cairo_move_to(cr, x0, y0);
+    cairo_line_to(cr, x0 + len, y0);
+    cairo_stroke(cr);
+
+    cairo_destroy(cr);
+    bool ok = surface_to_rgba(surface, &w->base.tex);
+    cairo_surface_destroy(surface);
+
+    if (!ok) {
+        return false;
+    }
+
+    /*
+     * `trim` reuses the typewriter machinery verbatim: one "line" of text whose
+     * character boundaries are the two ends of the segment. The compositor then
+     * clips at `reveal × length` with no code of its own — which is why a line
+     * that draws itself needed no new kernel.
+     */
+    /*
+     * The cutoff is quantised to "characters", so the segment is divided into
+     * sub-steps — one per pixel of length, capped. A single step would make
+     * trim binary: the budget would be 0 or 1 and the line would snap from
+     * invisible to complete with nothing in between.
+     */
+    int steps = (int)ceilf(len);
+    if (steps < 2)   steps = 2;
+    if (steps > 1024) steps = 1024;   /* a pixel of granularity is already invisible */
+
+    GlyphMetrics *g = &w->base.glyphs;
+    g->line_count  = 1;
+    g->line_start  = (int *)calloc(2, sizeof(int));
+    g->char_x      = (float *)calloc((size_t)steps + 1, sizeof(float));
+    g->h_cutoff    = (float *)calloc((size_t)VR_PIPELINE_DEPTH, sizeof(float));
+    if (g->line_start == NULL || g->char_x == NULL || g->h_cutoff == NULL) {
+        return false;
+    }
+    g->line_start[0] = 0;
+    g->line_start[1] = steps + 1;
+    for (int k = 0; k <= steps; k++) {
+        g->char_x[k] = (float)(x0 + len * (double)k / (double)steps);
+    }
+    g->total_chars   = steps;
+    g->pad_y         = 0.0f;
+    g->line_height   = (float)ih;
+
+    return true;
+}
+
+/*
+ * The path's bounding box.
+ *
+ * A cubic never leaves the convex hull of its four points, so taking the extent
+ * of every control point is a correct — if slightly generous — bound. Being
+ * generous costs a few transparent pixels; being wrong would clip the curve.
+ */
+static void path_bounds(const PathWidget *w, float *minx, float *miny,
+                        float *maxx, float *maxy)
+{
+    *minx = *miny =  1e30f;
+    *maxx = *maxy = -1e30f;
+
+    for (size_t i = 0; i < w->seg_count; i++) {
+        const PathSeg *s = &w->segs[i];
+        int n = (s->op == 2) ? 3 : (s->op == 3) ? 0 : 1;
+
+        for (int k = 0; k < n; k++) {
+            float x = s->c[k * 2], y = s->c[k * 2 + 1];
+            if (x < *minx) *minx = x;
+            if (y < *miny) *miny = y;
+            if (x > *maxx) *maxx = x;
+            if (y > *maxy) *maxy = y;
+        }
+    }
+
+    if (*minx > *maxx) {   /* no drawable segment at all */
+        *minx = *miny = 0.0f;
+        *maxx = *maxy = 1.0f;
+    }
+}
+
+bool media_render_path_widget(PathWidget *w)
+{
+    if (w == NULL) {
+        return false;
+    }
+
+    memset(&w->base.tex, 0, sizeof w->base.tex);
+
+    if (w->seg_count == 0) {
+        /* An unreadable path parsed to nothing; leave a 1x1 transparent
+         * texture so the rest of the pipeline has something valid to skip. */
+        w->base.base_w = w->base.base_h = 1.0f;
+        return true;
+    }
+
+    float minx, miny, maxx, maxy;
+    path_bounds(w, &minx, &miny, &maxx, &maxy);
+
+    /* Room for the stroke, its joins, and a pixel of antialiasing. Mitres can
+     * reach well past half a width, hence the whole width rather than half. */
+    float pad = w->width + 2.0f;
+
+    int iw = (int)ceilf(maxx - minx + 2.0f * pad);
+    int ih = (int)ceilf(maxy - miny + 2.0f * pad);
+    if (iw < 1) iw = 1;
+    if (ih < 1) ih = 1;
+
+    cairo_surface_t *surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, iw, ih);
+    if (cairo_surface_status(surface) != CAIRO_STATUS_SUCCESS) {
+        cairo_surface_destroy(surface);
+        return false;
+    }
+
+    cairo_t *cr = cairo_create(surface);
+    cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
+    cairo_set_source_rgba(cr, 0, 0, 0, 0);
+    cairo_paint(cr);
+    cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
+
+    /* Draw in texture space: the bounding box's top-left becomes the origin. */
+    cairo_translate(cr, pad - minx, pad - miny);
+
+    for (size_t i = 0; i < w->seg_count; i++) {
+        const PathSeg *s = &w->segs[i];
+        switch (s->op) {
+            case 0: cairo_move_to(cr, s->c[0], s->c[1]); break;
+            case 1: cairo_line_to(cr, s->c[0], s->c[1]); break;
+            case 2: cairo_curve_to(cr, s->c[0], s->c[1], s->c[2], s->c[3],
+                                       s->c[4], s->c[5]); break;
+            case 3: cairo_close_path(cr); break;
+            default: break;
+        }
+    }
+    if (w->closed) {
+        cairo_close_path(cr);
+    }
+
+    if (w->filled) {
+        cairo_set_source_rgba(cr, w->fill_color.r / 255.0, w->fill_color.g / 255.0,
+                                  w->fill_color.b / 255.0, w->fill_color.a / 255.0);
+        if (w->width > 0.0f) {
+            cairo_fill_preserve(cr);
+        } else {
+            cairo_fill(cr);
+        }
+    }
+
+    if (w->width > 0.0f) {
+        cairo_set_source_rgba(cr, w->color.r / 255.0, w->color.g / 255.0,
+                                  w->color.b / 255.0, w->color.a / 255.0);
+        cairo_set_line_width(cr, w->width);
+        cairo_set_line_cap(cr, (w->cap == 1) ? CAIRO_LINE_CAP_ROUND
+                             : (w->cap == 2) ? CAIRO_LINE_CAP_SQUARE
+                                             : CAIRO_LINE_CAP_BUTT);
+        cairo_set_line_join(cr, (w->join == 1) ? CAIRO_LINE_JOIN_ROUND
+                              : (w->join == 2) ? CAIRO_LINE_JOIN_BEVEL
+                                               : CAIRO_LINE_JOIN_MITER);
+        cairo_stroke(cr);
+    } else {
+        cairo_new_path(cr);
+    }
+
+    cairo_destroy(cr);
+    bool ok = surface_to_rgba(surface, &w->base.tex);
+    cairo_surface_destroy(surface);
+
+    /*
+     * The path's coordinates are absolute canvas positions, so the widget sits
+     * where its bounding box says — an explicit x/y would fight the geometry
+     * rather than complement it.
+     */
+    w->base.x = minx - pad;
+    w->base.y = miny - pad;
+    w->base.auto_center_x = false;
+    w->base.has_track_x   = false;
+    w->base.has_track_y   = false;
+    free(w->base.x_expr); w->base.x_expr = NULL;
+    free(w->base.y_expr); w->base.y_expr = NULL;
+
     return ok;
 }
 
@@ -1041,6 +1291,12 @@ bool media_prepare_textures(EditorContext *ctx)
             case WIDGET_CIRCLE:
                 ok = media_render_shape_widget((ShapeWidget *)b);
                 break;
+            case WIDGET_LINE:
+                ok = media_render_line_widget((LineWidget *)b);
+                break;
+            case WIDGET_PATH:
+                ok = media_render_path_widget((PathWidget *)b);
+                break;
             default:
                 fprintf(stderr, "warning: '%s' — unknown type, skipped.\n",
                         b->id ? b->id : "(null)");
@@ -1110,6 +1366,11 @@ bool media_prepare_textures(EditorContext *ctx)
                         b->id ? b->id : "(null)", b->y_expr);
             }
         }
+
+        /* A `repeat` displacement lands on top of the resolved position, so
+         * that "the twelfth copy, 240 px out" still honours "center". */
+        b->x += b->repeat_dx;
+        b->y += b->repeat_dy;
 
         /* auto-center already yields a final coordinate — anchoring skips it. */
         b->anchor_off_x = b->auto_center_x ? 0.0f : b->anchor_x * b->base_w;

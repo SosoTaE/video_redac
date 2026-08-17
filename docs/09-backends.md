@@ -70,10 +70,11 @@ layout, and defines the intrinsics the device code uses:
 pixel on one backend and a black one on the other — a difference that only shows
 up on the rare frame that generates a NaN.
 
-The exported per-pixel entry points are `vr_px_composite`, `vr_px_nv12`,
-`vr_px_transition`, `vr_px_fx_point`, `vr_px_fx_blur`, `vr_px_fx_pixelate`,
-`vr_px_fx_rgb_split` and `vr_px_fx_glitch`. Each CUDA kernel is now a five-line
-wrapper: map a thread to a pixel, bounds-check, call the shared function.
+The exported per-pixel entry points are `vr_px_composite`, `vr_px_highlight`,
+`vr_px_nv12`, `vr_px_transition`, `vr_px_fx_point`, `vr_px_fx_blur`,
+`vr_px_fx_pixelate`, `vr_px_fx_rgb_split` and `vr_px_fx_glitch`. Each CUDA
+kernel is now a five-line wrapper: map a thread to a pixel, bounds-check, call
+the shared function.
 
 ### `render_common.c` — the per-frame decisions
 
@@ -85,6 +86,7 @@ Everything a frame's appearance depends on, none of it aware of a device:
 | `vr_compute_reveal_cutoffs` | typewriter progress → one x threshold per line |
 | `vr_select_scenes` | which scene, or which pair mid-transition |
 | `vr_composite_setup` | inverse matrix, destination centre, clipped bounding box |
+| `vr_highlight_setup` | the highlight band's line range, colour and stencil |
 | `vr_effect_sample` | Tracks → the flat `EffectGPU` POD |
 | `vr_transition_preset` / `vr_transition_apply_inline` | the 17 presets, then the JSON's overrides |
 | `vr_open_ffmpeg_pipe` | starts the encoder, with the colour tagging both backends need |
@@ -135,6 +137,35 @@ The preset has to travel with the encoder. NVENC speaks `p1`..`p7`, x264 speaks
 hard failure (`x264 [error]: invalid preset 'p5'`). So a project's preset is
 honoured only while the encoder stays in the same family; across a fallback it is
 dropped, with a note.
+
+---
+
+## Does the split actually pay off?
+
+The `highlight` action was added *after* the split, as a test of the claim. It
+needed a new per-pixel operation, new parameters and a new pass between the
+panel and the glyphs — a realistic feature, not a trivial one.
+
+What it cost:
+
+| File | Added | What |
+|---|---|---|
+| `pixel_ops.h` | ~60 lines | `vr_px_highlight` + `HighlightParams` |
+| `render_common.c` | ~35 lines | `vr_highlight_setup` |
+| `types.h`, `parser.c` | ~40 lines | fields and JSON parsing |
+| `renderer.cu` | **11 lines** | a kernel wrapper + a launch |
+| `renderer_cpu.c` | **9 lines** | two nested loops |
+
+Twenty lines of backend code for a feature that draws pixels, and the two
+backends' output was **bit-identical** (155,520,000 bytes compared, 0 differing)
+on the first run that compiled.
+
+Two details fell out of the shared design rather than being implemented twice:
+
+- The band reuses `CompositeParams`, so it is back-projected through the same
+  inverse matrix as the text and inherits position, scale and rotation for free.
+- It samples the code panel's alpha as a stencil, so it follows the panel's
+  rounded corners — one texture read, written once.
 
 ---
 

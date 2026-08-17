@@ -11,6 +11,8 @@
 
 #include "parser.h"
 
+#include <ctype.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,6 +25,10 @@
 #include "layout.h"
 #include "media_loader.h"
 #include "renderer.h"
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 /* Scratch memory for one frame. 4 MiB comfortably holds several thousand
  * WidgetRuntime entries; change it here if that ever stops being true. */
@@ -367,10 +373,90 @@ static void apply_styles(cJSON *obj, const cJSON *styles)
 /* ------------------------------------------------------------------------- */
 
 /*
+ * Keys must be in ascending time order — track_sample relies on it. The JSON
+ * author may get that wrong, so we sort here (insertion sort: there are only a
+ * handful of keys and they are almost always sorted already).
+ *
+ * Called twice for a track that mixes absolute and relative times: once during
+ * parsing, and again after resolution, because "50%" and 2.0 cannot be ordered
+ * against each other until the percentage has become seconds.
+ */
+static void sort_keys(Keyframe *keys, int count)
+{
+    for (int i = 1; i < count; i++) {
+        Keyframe cur = keys[i];
+        int      j   = i - 1;
+        while (j >= 0 && keys[j].t > cur.t) {
+            keys[j + 1] = keys[j];
+            j--;
+        }
+        keys[j + 1] = cur;
+    }
+}
+
+/*
+ * A keyframe's time, in seconds or as a fraction of the scene.
+ *
+ *     {"t": 1.2}     → 1.2 seconds
+ *     {"t": "50%"}   → halfway through the owning scene
+ *
+ * The percentage form exists because absolute times make a scene's duration
+ * impossible to change: retiming a six-second clip to eight meant editing every
+ * keyframe by hand. `*out_relative` tells the caller the value still needs
+ * resolving — see resolve_relative_times().
+ */
+static float read_key_time(const cJSON *k, bool *out_relative)
+{
+    *out_relative = false;
+
+    const cJSON *it = cJSON_GetObjectItemCaseSensitive(k, "t");
+    if (cJSON_IsNumber(it)) {
+        return (float)it->valuedouble;
+    }
+    if (cJSON_IsString(it) && it->valuestring != NULL) {
+        char  *end = NULL;
+        double v   = strtod(it->valuestring, &end);
+
+        if (end != it->valuestring) {
+            while (*end == ' ') {
+                end++;
+            }
+            if (*end == '%') {
+                *out_relative = true;
+                return (float)(v / 100.0);
+            }
+            /* A plain numeric string ("1.2") — accept it as seconds. */
+            if (*end == '\0') {
+                return (float)v;
+            }
+        }
+        fprintf(stderr, "warning: keyframe time '%s' not understood — using 0.\n",
+                it->valuestring);
+    }
+    return 0.0f;
+}
+
+/* The largest value a track reaches, or `fallback` if it has no keys. */
+static float track_peak(const Track *tr, float fallback)
+{
+    if (tr->keys == NULL || tr->count <= 0) {
+        return fallback;
+    }
+    float m = tr->keys[0].v;
+    for (int i = 1; i < tr->count; i++) {
+        if (tr->keys[i].v > m) {
+            m = tr->keys[i].v;
+        }
+    }
+    return m;
+}
+
+/*
  * A field may be either a number or an array of keyframes:
  *
  *     "opacity": 0.5
  *     "opacity": [ {"t": 0, "v": 0}, {"t": 1.2, "v": 1, "ease": "backout"} ]
+ *     "opacity": [ {"t": "0%", "v": 0}, {"t": "100%", "v": 1} ]
  *
  * Returns true only when a real animation was built.
  */
@@ -405,7 +491,7 @@ static bool parse_track(const cJSON *item, Track *tr, float fallback)
         if (!cJSON_IsObject(k)) {
             continue;
         }
-        keys[idx].t    = json_float(k, "t", 0.0f);
+        keys[idx].t    = read_key_time(k, &keys[idx].t_relative);
         keys[idx].v    = json_float(k, "v", 0.0f);
         keys[idx].ease = easing_from_name(json_str(k, "ease", NULL));
         idx++;
@@ -416,20 +502,7 @@ static bool parse_track(const cJSON *item, Track *tr, float fallback)
         return false;
     }
 
-    /*
-     * Keys must be in ascending time order — track_sample relies on it. The
-     * JSON author may get that wrong, so we sort here (insertion sort: there
-     * are only a handful of keys and they are almost always sorted already).
-     */
-    for (int i = 1; i < idx; i++) {
-        Keyframe cur = keys[i];
-        int      j   = i - 1;
-        while (j >= 0 && keys[j].t > cur.t) {
-            keys[j + 1] = keys[j];
-            j--;
-        }
-        keys[j + 1] = cur;
-    }
+    sort_keys(keys, idx);
 
     tr->keys  = keys;
     tr->count = idx;
@@ -563,6 +636,16 @@ static void parse_widget_base(WidgetBase *base, const cJSON *obj, WidgetKind kin
     base->id      = dup_string(json_str(obj, "id", "unnamed"));
     base->z_order = z;
 
+    /* Injected by repeat_expand(); absent on hand-written objects. */
+    base->repeat_dx = json_float(obj, "_repeat_dx", 0.0f);
+    base->repeat_dy = json_float(obj, "_repeat_dy", 0.0f);
+
+    /* Added to base_rotation, so it composes with a line's own angle. */
+    base->base_rotation = json_float(obj, "_repeat_rot", 0.0f) * (float)(M_PI / 180.0);
+
+    base->group_name  = dup_string(json_str(obj, "group", NULL));
+    base->group_index = -1;   /* resolved once the widget index exists */
+
     /* --- anchoring ("anchor": "center", "bottomright", …) ---------------- */
     const char *anchor_name = json_str(obj, "anchor", NULL);
     if (anchor_name != NULL) {
@@ -612,6 +695,24 @@ static void parse_widget_base(WidgetBase *base, const cJSON *obj, WidgetKind kin
     parse_track(cJSON_GetObjectItemCaseSensitive(obj, "opacity"),  &base->tr_opacity, 1.0f);
     parse_track(cJSON_GetObjectItemCaseSensitive(obj, "scale"),    &base->tr_scale, 1.0f);
     parse_track(cJSON_GetObjectItemCaseSensitive(obj, "rotation"), &base->tr_rotation, 0.0f);
+
+    /*
+     * Size and tint tracks.
+     *
+     * "w"/"h" are read here only as *animations*: a plain number is the
+     * object's own width/height and is handled by each type's parser (a
+     * rectangle's `w` sets its texture size). Only an array means "animate the
+     * destination size", so a static `"w": 200` keeps its existing meaning.
+     */
+    base->has_track_w = parse_track(cJSON_GetObjectItemCaseSensitive(obj, "w"), &base->tr_w, 0.0f);
+    base->has_track_h = parse_track(cJSON_GetObjectItemCaseSensitive(obj, "h"), &base->tr_h, 0.0f);
+
+    base->has_track_trim = json_has(obj, "trim");
+    parse_track(cJSON_GetObjectItemCaseSensitive(obj, "trim"), &base->tr_trim, 1.0f);
+
+    base->tint_color     = json_color(obj, "tint", (Color){ 255, 255, 255, 255 });
+    base->has_track_tint = json_has(obj, "tint_amount");
+    parse_track(cJSON_GetObjectItemCaseSensitive(obj, "tint_amount"), &base->tr_tint, 0.0f);
 
     /*
      * "has_track_*" means "the JSON specified this property", not "it is
@@ -764,11 +865,357 @@ static bool parse_shape_object(EditorContext *ctx, const cJSON *obj, int z, Widg
         w->h = json_float(obj, "h", json_float(obj, "height", 100.0f));
     }
 
+    /*
+     * An animated w/h leaves the texture without a size, since the JSON field
+     * is an array rather than a number. Rasterize at the animation's *peak*:
+     * the texture is then downscaled at smaller values, never upscaled, so the
+     * shape stays sharp at its largest.
+     *
+     * (A rounded rectangle's corners do squash slightly at other sizes — the
+     * price of not re-rasterizing every frame.)
+     */
+    if (w->base.has_track_w) {
+        w->w = track_peak(&w->base.tr_w, w->w);
+    }
+    if (w->base.has_track_h) {
+        w->h = track_peak(&w->base.tr_h, w->h);
+    }
+
     w->corner_radius = json_int(obj, "corner_radius", 0);
+
+    /*
+     * An outline. `stroke` alone implies a 2 px line, because a colour with no
+     * width would silently draw nothing — the same trap the transparent-fill
+     * workaround fell into.
+     */
+    w->stroke_color = json_color(obj, "stroke", (Color){ 255, 255, 255, 0 });
+    w->stroke_width = json_float(obj, "stroke_width",
+                                 (w->stroke_color.a > 0) ? 2.0f : 0.0f);
+
+    /* "fill": "none" → outline only. */
+    const char *fill = json_str(obj, "fill", NULL);
+    w->filled = !(fill != NULL && strcmp(fill, "none") == 0);
 
     if (w->w < 1.0f) w->w = 1.0f;
     if (w->h < 1.0f) w->h = 1.0f;
     if (w->corner_radius < 0) w->corner_radius = 0;
+    return true;
+}
+
+/*
+ * A straight segment.
+ *
+ * The texture is drawn horizontally, `width` longer than the segment so round
+ * and square caps have room, and the real angle becomes base_rotation. The
+ * object's centre is placed at the segment's midpoint, which is the point the
+ * compositor rotates about — so the drawn line lands exactly on (x1,y1)-(x2,y2).
+ */
+static bool parse_line_object(EditorContext *ctx, const cJSON *obj, int z)
+{
+    LineWidget *w = (LineWidget *)array_push((void **)&ctx->lines, &ctx->line_count,
+                                             &ctx->line_cap, sizeof(LineWidget));
+    if (w == NULL) {
+        return false;
+    }
+
+    parse_widget_base(&w->base, obj, WIDGET_LINE, z);
+
+    w->x1 = json_float(obj, "x1", 0.0f);
+    w->y1 = json_float(obj, "y1", 0.0f);
+    w->x2 = json_float(obj, "x2", 100.0f);
+    w->y2 = json_float(obj, "y2", 0.0f);
+
+    w->width = json_float(obj, "width", json_float(obj, "stroke_width", 2.0f));
+    if (w->width < 0.1f) {
+        w->width = 0.1f;
+    }
+    w->color = json_color(obj, "color", json_color(obj, "stroke",
+                                                   (Color){ 255, 255, 255, 255 }));
+
+    const char *cap = json_str(obj, "cap", "butt");
+    w->cap = (strcmp(cap, "round") == 0) ? 1 : (strcmp(cap, "square") == 0) ? 2 : 0;
+
+    float dx  = w->x2 - w->x1;
+    float dy  = w->y2 - w->y1;
+    float len = sqrtf(dx * dx + dy * dy);
+
+    w->base.base_rotation += atan2f(dy, dx);   /* += : a repeat may have set one */
+
+    /*
+     * A line's position is its endpoints, not an x/y — so the usual position
+     * handling is overridden here. The midpoint is what the rotation pivots
+     * about, and the texture is centred on it.
+     */
+    float tex_w = len + w->width;    /* caps need half a width at each end */
+    float tex_h = w->width;
+
+    w->base.x = (w->x1 + w->x2) * 0.5f - tex_w * 0.5f;
+    w->base.y = (w->y1 + w->y2) * 0.5f - tex_h * 0.5f;
+    w->base.auto_center_x = false;
+    w->base.has_track_x   = false;
+    w->base.has_track_y   = false;
+    free(w->base.x_expr); w->base.x_expr = NULL;
+    free(w->base.y_expr); w->base.y_expr = NULL;
+
+    return true;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Path parsing (SVG `d`, or a list of points)                                */
+/* ------------------------------------------------------------------------- */
+
+static bool path_push(PathWidget *w, uint8_t op, const float *c, int n)
+{
+    PathSeg *seg = (PathSeg *)array_push((void **)&w->segs, &w->seg_count,
+                                         &w->seg_cap, sizeof(PathSeg));
+    if (seg == NULL) {
+        return false;
+    }
+    memset(seg, 0, sizeof *seg);
+    seg->op = op;
+    for (int i = 0; i < n; i++) {
+        seg->c[i] = c[i];
+    }
+    return true;
+}
+
+/* Skips whitespace and the commas SVG allows between any two numbers. */
+static void d_skip(const char **p)
+{
+    while (**p == ' ' || **p == ',' || **p == '\t' || **p == '\n' || **p == '\r') {
+        (*p)++;
+    }
+}
+
+static bool d_number(const char **p, float *out)
+{
+    d_skip(p);
+    char *end = NULL;
+    double v = strtod(*p, &end);
+    if (end == *p) {
+        return false;
+    }
+    *p   = end;
+    *out = (float)v;
+    return true;
+}
+
+/*
+ * An SVG path string → PathSegs.
+ *
+ * Supports M L H V C S Q T Z in both cases (upper = absolute, lower =
+ * relative), which covers everything a drawing tool emits for a plotted curve.
+ * Arcs (A) are deliberately absent: they need a parameter conversion of their
+ * own and nothing in this project has asked for one.
+ *
+ * Quadratics become cubics on the way in, so the rest of the pipeline sees one
+ * curve type.
+ */
+static bool parse_path_d(PathWidget *w, const char *d)
+{
+    float cx = 0.0f, cy = 0.0f;   /* current point */
+    float sx = 0.0f, sy = 0.0f;   /* start of the current subpath */
+    float px = 0.0f, py = 0.0f;   /* previous cubic control, for S */
+    float qx = 0.0f, qy = 0.0f;   /* previous quadratic control, for T */
+    char  prev = 0;
+
+    const char *p = d;
+    while (*p != '\0') {
+        d_skip(&p);
+        if (*p == '\0') {
+            break;
+        }
+
+        char cmd;
+        if (isalpha((unsigned char)*p)) {
+            cmd = *p++;
+        } else if (prev != 0) {
+            /* A repeated coordinate set continues the previous command; after
+             * a moveto it means lineto, as the SVG grammar specifies. */
+            cmd = (prev == 'M') ? 'L' : (prev == 'm') ? 'l' : prev;
+        } else {
+            return false;
+        }
+
+        bool  rel = (cmd >= 'a' && cmd <= 'z');
+        char  up  = (char)toupper((unsigned char)cmd);
+        float a[6];
+
+        switch (up) {
+            case 'M':
+                if (!d_number(&p, &a[0]) || !d_number(&p, &a[1])) return false;
+                if (rel) { a[0] += cx; a[1] += cy; }
+                cx = sx = a[0]; cy = sy = a[1];
+                px = cx; py = cy; qx = cx; qy = cy;
+                if (!path_push(w, 0, a, 2)) return false;
+                break;
+
+            case 'L':
+                if (!d_number(&p, &a[0]) || !d_number(&p, &a[1])) return false;
+                if (rel) { a[0] += cx; a[1] += cy; }
+                cx = a[0]; cy = a[1];
+                px = cx; py = cy; qx = cx; qy = cy;
+                if (!path_push(w, 1, a, 2)) return false;
+                break;
+
+            case 'H':
+                if (!d_number(&p, &a[0])) return false;
+                if (rel) a[0] += cx;
+                a[1] = cy; cx = a[0];
+                px = cx; py = cy; qx = cx; qy = cy;
+                if (!path_push(w, 1, a, 2)) return false;
+                break;
+
+            case 'V':
+                if (!d_number(&p, &a[1])) return false;
+                if (rel) a[1] += cy;
+                a[0] = cx; cy = a[1];
+                px = cx; py = cy; qx = cx; qy = cy;
+                if (!path_push(w, 1, a, 2)) return false;
+                break;
+
+            case 'C':
+                for (int i = 0; i < 6; i++) {
+                    if (!d_number(&p, &a[i])) return false;
+                }
+                if (rel) {
+                    a[0] += cx; a[1] += cy; a[2] += cx; a[3] += cy; a[4] += cx; a[5] += cy;
+                }
+                px = a[2]; py = a[3];
+                cx = a[4]; cy = a[5]; qx = cx; qy = cy;
+                if (!path_push(w, 2, a, 6)) return false;
+                break;
+
+            case 'S': {
+                /* The first control point mirrors the previous one. */
+                float m0 = 2.0f * cx - px, m1 = 2.0f * cy - py;
+                if (!d_number(&p, &a[2]) || !d_number(&p, &a[3]) ||
+                    !d_number(&p, &a[4]) || !d_number(&p, &a[5])) return false;
+                if (rel) { a[2] += cx; a[3] += cy; a[4] += cx; a[5] += cy; }
+                a[0] = m0; a[1] = m1;
+                px = a[2]; py = a[3];
+                cx = a[4]; cy = a[5]; qx = cx; qy = cy;
+                if (!path_push(w, 2, a, 6)) return false;
+                break;
+            }
+
+            case 'Q':
+            case 'T': {
+                float ctrlx, ctrly, ex, ey;
+                if (up == 'Q') {
+                    float t[4];
+                    for (int i = 0; i < 4; i++) {
+                        if (!d_number(&p, &t[i])) return false;
+                    }
+                    if (rel) { t[0] += cx; t[1] += cy; t[2] += cx; t[3] += cy; }
+                    ctrlx = t[0]; ctrly = t[1]; ex = t[2]; ey = t[3];
+                } else {
+                    ctrlx = 2.0f * cx - qx;
+                    ctrly = 2.0f * cy - qy;
+                    if (!d_number(&p, &ex) || !d_number(&p, &ey)) return false;
+                    if (rel) { ex += cx; ey += cy; }
+                }
+
+                /* Quadratic → cubic: the controls sit two thirds of the way
+                 * from each endpoint toward the quadratic's control point. */
+                a[0] = cx + 2.0f / 3.0f * (ctrlx - cx);
+                a[1] = cy + 2.0f / 3.0f * (ctrly - cy);
+                a[2] = ex + 2.0f / 3.0f * (ctrlx - ex);
+                a[3] = ey + 2.0f / 3.0f * (ctrly - ey);
+                a[4] = ex; a[5] = ey;
+
+                qx = ctrlx; qy = ctrly;
+                px = a[2];  py = a[3];
+                cx = ex;    cy = ey;
+                if (!path_push(w, 2, a, 6)) return false;
+                break;
+            }
+
+            case 'Z':
+                cx = sx; cy = sy;
+                px = cx; py = cy; qx = cx; qy = cy;
+                if (!path_push(w, 3, a, 0)) return false;
+                break;
+
+            default:
+                fprintf(stderr, "warning: path command '%c' is not supported — path truncated.\n", cmd);
+                return w->seg_count > 0;
+        }
+        prev = cmd;
+    }
+    return w->seg_count > 0;
+}
+
+/* A plain "points": [[x,y], …] polyline — the common case, without a d-string. */
+static bool parse_path_points(PathWidget *w, const cJSON *pts)
+{
+    const cJSON *pt = NULL;
+    bool first = true;
+
+    cJSON_ArrayForEach(pt, pts) {
+        float a[2];
+        if (cJSON_IsArray(pt) && cJSON_GetArraySize(pt) >= 2) {
+            a[0] = (float)cJSON_GetArrayItem(pt, 0)->valuedouble;
+            a[1] = (float)cJSON_GetArrayItem(pt, 1)->valuedouble;
+        } else if (cJSON_IsObject(pt)) {
+            a[0] = json_float(pt, "x", 0.0f);
+            a[1] = json_float(pt, "y", 0.0f);
+        } else {
+            continue;
+        }
+        if (!path_push(w, first ? 0 : 1, a, 2)) {
+            return false;
+        }
+        first = false;
+    }
+    return w->seg_count > 0;
+}
+
+static bool parse_path_object(EditorContext *ctx, const cJSON *obj, int z)
+{
+    PathWidget *w = (PathWidget *)array_push((void **)&ctx->paths, &ctx->path_count,
+                                             &ctx->path_cap, sizeof(PathWidget));
+    if (w == NULL) {
+        return false;
+    }
+
+    parse_widget_base(&w->base, obj, WIDGET_PATH, z);
+
+    w->width      = json_float(obj, "width", json_float(obj, "stroke_width", 2.0f));
+    w->color      = json_color(obj, "stroke", json_color(obj, "color",
+                                                         (Color){ 255, 255, 255, 255 }));
+    w->fill_color = json_color(obj, "fill", (Color){ 0, 0, 0, 0 });
+
+    const char *fill = json_str(obj, "fill", NULL);
+    w->filled = (fill != NULL && strcmp(fill, "none") != 0);
+    w->closed = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(obj, "closed"));
+
+    const char *cap = json_str(obj, "cap", "butt");
+    w->cap = (strcmp(cap, "round") == 0) ? 1 : (strcmp(cap, "square") == 0) ? 2 : 0;
+    const char *join = json_str(obj, "join", "miter");
+    w->join = (strcmp(join, "round") == 0) ? 1 : (strcmp(join, "bevel") == 0) ? 2 : 0;
+
+    const char  *d   = json_str(obj, "d", NULL);
+    const cJSON *pts = cJSON_GetObjectItemCaseSensitive(obj, "points");
+
+    bool ok;
+    if (d != NULL) {
+        ok = parse_path_d(w, d);
+        if (!ok) {
+            fprintf(stderr, "warning: path '%s' — could not read its \"d\".\n",
+                    w->base.id ? w->base.id : "(unnamed)");
+        }
+    } else if (cJSON_IsArray(pts)) {
+        ok = parse_path_points(w, pts);
+    } else {
+        fprintf(stderr, "warning: path '%s' has neither \"d\" nor \"points\".\n",
+                w->base.id ? w->base.id : "(unnamed)");
+        ok = false;
+    }
+
+    /* An unreadable path stays as an empty widget rather than failing the whole
+     * parse — one bad curve should not cost the author the entire render. */
+    (void)ok;
     return true;
 }
 
@@ -935,10 +1382,39 @@ static ActionType action_from_string(const char *s)
         strcmp(s, "zoom")      == 0)     return ACTION_SCALE;
     if (strcmp(s, "rotate")    == 0)     return ACTION_ROTATE;
     if (strcmp(s, "highlight") == 0)     return ACTION_HIGHLIGHT;
+    if (strcmp(s, "orbit") == 0)        return ACTION_ORBIT;
+    if (strcmp(s, "emit") == 0)         return ACTION_EMIT;
+    if (strcmp(s, "animate") == 0 ||
+        strcmp(s, "tween") == 0)        return ACTION_ANIMATE;
     return ACTION_UNKNOWN;
 }
 
-static bool parse_timeline_event(Scene *scene, const cJSON *obj)
+/*
+ * A coordinate that may be a number or a layout expression ("center", "60%-20").
+ *
+ * Unlike a widget's position this never depends on the object's own size — it
+ * is a point on the canvas — so it can be resolved here rather than deferred
+ * until after rasterization.
+ */
+static float json_canvas_coord(const cJSON *obj, const char *key,
+                               float canvas, LayoutAxis axis, float fallback)
+{
+    const cJSON *it = cJSON_GetObjectItemCaseSensitive(obj, key);
+    if (cJSON_IsNumber(it)) {
+        return (float)it->valuedouble;
+    }
+    if (cJSON_IsString(it) && it->valuestring != NULL) {
+        float pos = 0.0f, anchor = 0.0f;
+        if (layout_eval(it->valuestring, canvas, axis, &pos, &anchor)) {
+            return pos;
+        }
+        fprintf(stderr, "warning: '%s': \'%s\' not understood — using %.0f.\n",
+                key, it->valuestring, (double)fallback);
+    }
+    return fallback;
+}
+
+static bool parse_timeline_event(const EditorContext *ctx, Scene *scene, const cJSON *obj)
 {
     TimelineEvent *e = (TimelineEvent *)array_push((void **)&scene->events, &scene->event_count,
                                                    &scene->event_cap, sizeof(TimelineEvent));
@@ -953,6 +1429,7 @@ static bool parse_timeline_event(Scene *scene, const cJSON *obj)
     e->action       = action_from_string(action_name);
     e->target_id    = dup_string(json_str(obj, "target", ""));
     e->target_index = -1; /* resolved in resolve_timeline_targets() */
+    e->target_group = -1;
 
     /* SCALE's neutral value is 1.0, not 0 — which would make the object vanish. */
     e->value = json_float(obj, "value", (e->action == ACTION_SCALE) ? 1.0f : 0.0f);
@@ -970,6 +1447,126 @@ static bool parse_timeline_event(Scene *scene, const cJSON *obj)
     } else {
         e->value_x = json_float(obj, "value_x", 0.0f);
         e->value_y = json_float(obj, "value_y", 0.0f);
+    }
+
+    /*
+     * HIGHLIGHT: which lines to mark, and in what colour.
+     *
+     * Lines are 1-based in the JSON, because that is what an editor's gutter
+     * shows and what anyone reading the code block will count. A single "line"
+     * is shorthand for a one-line range.
+     */
+    if (e->action == ACTION_HIGHLIGHT) {
+        int from = json_int(obj, "line", json_int(obj, "from", 1));
+        int to   = json_int(obj, "to", json_has(obj, "line") ? from : from);
+
+        e->hl_from = (from > 0) ? from - 1 : 0;
+        e->hl_to   = (to   > 0) ? to   - 1 : e->hl_from;
+        if (e->hl_to < e->hl_from) {
+            int swap = e->hl_from; e->hl_from = e->hl_to; e->hl_to = swap;
+        }
+
+        Color fallback = { 0xFF, 0xD1, 0x66, 0x40 }; /* a soft amber, ~25% opaque */
+        e->hl_color = json_color(obj, "color", fallback);
+    }
+
+    /*
+     * ORBIT: centre, radii, and the arc travelled.
+     *
+     * `sweep` rather than an end angle, because "go round one and a half times"
+     * is 540 while an end angle of 180 would be ambiguous about how many turns
+     * to take on the way.
+     */
+    if (e->action == ACTION_ORBIT) {
+        float cw = (float)ctx->config.width;
+        float ch = (float)ctx->config.height;
+
+        e->orbit_cx = json_canvas_coord(obj, "cx", cw, LAYOUT_AXIS_X, cw * 0.5f);
+        e->orbit_cy = json_canvas_coord(obj, "cy", ch, LAYOUT_AXIS_Y, ch * 0.5f);
+
+        e->orbit_r0 = json_float(obj, "radius", 100.0f);
+        /* A second radius turns the circle into a spiral; absent → a circle. */
+        e->orbit_r1 = json_float(obj, "radius_to", e->orbit_r0);
+
+        e->orbit_a0    = json_float(obj, "from_angle", 0.0f);
+        e->orbit_sweep = json_has(obj, "sweep")
+                             ? json_float(obj, "sweep", 360.0f)
+                             : json_float(obj, "to_angle", e->orbit_a0 + 360.0f) - e->orbit_a0;
+
+        e->orbit_orient = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(obj, "orient"));
+    }
+
+    /*
+     * ANIMATE: which property, and the track driving it.
+     *
+     * Two spellings, because both are natural in different places:
+     *   "keys":  [ {"t":0,"v":0}, {"t":1.2,"v":300} ]   full control
+     *   "from"/"to"                                      the common two-key case
+     */
+    if (e->action == ACTION_ANIMATE) {
+        static const struct { const char *name; AnimProp prop; } kProps[] = {
+            { "x", PROP_X }, { "y", PROP_Y },
+            { "opacity", PROP_OPACITY }, { "alpha", PROP_OPACITY },
+            { "scale", PROP_SCALE },
+            { "rotation", PROP_ROTATION }, { "rotate", PROP_ROTATION },
+            { "w", PROP_W }, { "width", PROP_W },
+            { "h", PROP_H }, { "height", PROP_H },
+            { "tint", PROP_TINT }, { "tint_amount", PROP_TINT },
+            { "trim", PROP_TRIM },
+        };
+
+        const char *pname = json_str(obj, "property", json_str(obj, "prop", NULL));
+        e->anim_prop = PROP_NONE;
+        for (size_t k = 0; pname != NULL && k < sizeof kProps / sizeof kProps[0]; k++) {
+            if (strcmp(pname, kProps[k].name) == 0) {
+                e->anim_prop = kProps[k].prop;
+                break;
+            }
+        }
+        if (e->anim_prop == PROP_NONE) {
+            fprintf(stderr, "warning: animate (t=%d ms) — unknown property '%s'.\n",
+                    e->time_ms, pname ? pname : "(missing)");
+        }
+
+        const cJSON *keys = cJSON_GetObjectItemCaseSensitive(obj, "keys");
+        if (cJSON_IsArray(keys)) {
+            e->has_keys = parse_track(keys, &e->anim_track, 0.0f);
+
+            /* Without an explicit duration, the last key ends the event. */
+            if (e->duration_ms <= 0 && e->anim_track.count > 0) {
+                e->duration_ms =
+                    (int)(e->anim_track.keys[e->anim_track.count - 1].t * 1000.0f);
+            }
+        } else if (json_has(obj, "from") || json_has(obj, "to")) {
+            /* The two-key shorthand, built into the same track so evaluation
+             * has exactly one path. */
+            Keyframe *k2 = (Keyframe *)calloc(2, sizeof(Keyframe));
+            if (k2 == NULL) {
+                return false;
+            }
+            float dur = (e->duration_ms > 0) ? (float)e->duration_ms * 0.001f : 1.0f;
+            k2[0].t = 0.0f;   k2[0].v = json_float(obj, "from", 0.0f); k2[0].ease = e->ease;
+            k2[1].t = dur;    k2[1].v = json_float(obj, "to", 0.0f);   k2[1].ease = e->ease;
+
+            e->anim_track.keys     = k2;
+            e->anim_track.count    = 2;
+            e->anim_track.constant = k2[1].v;
+            e->has_keys            = true;
+            if (e->duration_ms <= 0) {
+                e->duration_ms = 1000;
+            }
+        } else {
+            fprintf(stderr, "warning: animate (t=%d ms) has neither \"keys\" nor \"from\"/\"to\".\n",
+                    e->time_ms);
+        }
+    }
+
+    if (e->action == ACTION_EMIT) {
+        e->emit_vx      = json_float(obj, "vx", 0.0f);
+        e->emit_vy      = json_float(obj, "vy", 0.0f);
+        e->emit_gravity = json_float(obj, "gravity", 0.0f);
+        e->emit_fade    = json_float(obj, "fade", 0.35f);
+        e->emit_spin    = json_float(obj, "spin", 0.0f);
     }
 
     if (e->action == ACTION_UNKNOWN) {
@@ -1077,48 +1674,91 @@ static int parse_mask(const cJSON *node, Track slots[4])
     return 2;
 }
 
-static bool parse_transitions(EditorContext *ctx, const cJSON *arr)
+/*
+ * One transition object → one Transition.
+ *
+ * `item` may be NULL, which yields the historical default: a hard cut of zero
+ * duration. That is what makes the padding below able to treat "no default was
+ * given" as just another call.
+ */
+static void parse_transition_one(Transition *tr, const cJSON *item)
 {
-    if (!cJSON_IsArray(arr)) {
-        return true;
+    const char *use = json_str(item, "use", NULL);
+    if (use == NULL) {
+        use = json_str(item, "type", NULL);
+    }
+    tr->type = transition_from_name(use);
+
+    /* "duration" is in seconds (videogen's convention), "duration_ms" in ms. */
+    if (json_has(item, "duration_ms")) {
+        tr->duration_ms = json_int(item, "duration_ms", 600);
+    } else {
+        tr->duration_ms = (int)(json_float(item, "duration", 0.6f) * 1000.0f);
+    }
+    if (tr->duration_ms < 0) {
+        tr->duration_ms = 0;
     }
 
+    tr->has_from = parse_transition_side(cJSON_GetObjectItemCaseSensitive(item, "from"),
+                                         &tr->from_opacity, &tr->from_x, &tr->from_y,
+                                         &tr->from_scale, &tr->from_rotate, 1.0f, 1.0f);
+    tr->has_to   = parse_transition_side(cJSON_GetObjectItemCaseSensitive(item, "to"),
+                                         &tr->to_opacity, &tr->to_x, &tr->to_y,
+                                         &tr->to_scale, &tr->to_rotate, 1.0f, 1.0f);
+
+    tr->from_mask_shape = parse_mask(cJSON_GetObjectItemCaseSensitive(item, "fromMask"),
+                                     tr->from_mask);
+    tr->to_mask_shape   = parse_mask(cJSON_GetObjectItemCaseSensitive(item, "toMask"),
+                                     tr->to_mask);
+}
+
+/*
+ * The transition list, with a project-wide default.
+ *
+ * Three ways to say the same thing, in increasing order of specificity:
+ *
+ *   "transition":  {...}          the default for every gap between scenes
+ *   "transitions": [ ..., null ]  a null entry falls back to that default
+ *   "transitions": [ {...} ]      this gap, explicitly
+ *
+ * The motivation is concrete: listing_scenes.json carried fifteen transition
+ * objects, all of them byte-identical. One `"transition"` key replaces the lot.
+ *
+ * Note that the default is re-parsed for each slot rather than struct-copied.
+ * A Transition owns malloc'd Keyframe arrays, so copying it by value would give
+ * several entries the same `keys` pointer and free it several times over.
+ */
+static bool parse_transitions(EditorContext *ctx, const cJSON *arr, const cJSON *def)
+{
     const cJSON *item = NULL;
-    cJSON_ArrayForEach(item, arr) {
-        Transition *tr = (Transition *)array_push((void **)&ctx->transitions,
-                                                  &ctx->transition_count,
-                                                  &ctx->transition_cap, sizeof(Transition));
-        if (tr == NULL) {
-            return false;
-        }
 
-        const char *use = json_str(item, "use", NULL);
-        if (use == NULL) {
-            use = json_str(item, "type", NULL);
+    if (cJSON_IsArray(arr)) {
+        cJSON_ArrayForEach(item, arr) {
+            Transition *tr = (Transition *)array_push((void **)&ctx->transitions,
+                                                      &ctx->transition_count,
+                                                      &ctx->transition_cap, sizeof(Transition));
+            if (tr == NULL) {
+                return false;
+            }
+            /* A non-object entry (null, mostly) means "whatever the default is". */
+            parse_transition_one(tr, cJSON_IsObject(item) ? item : def);
         }
-        tr->type = transition_from_name(use);
+    }
 
-        /* "duration" is in seconds (videogen's convention), "duration_ms" in ms. */
-        if (json_has(item, "duration_ms")) {
-            tr->duration_ms = json_int(item, "duration_ms", 600);
-        } else {
-            tr->duration_ms = (int)(json_float(item, "duration", 0.6f) * 1000.0f);
+    /*
+     * Pad the remaining gaps with the default. Without a default this loop does
+     * nothing and the gaps stay hard cuts, exactly as before.
+     */
+    if (def != NULL && ctx->scene_count > 1) {
+        while (ctx->transition_count < ctx->scene_count - 1) {
+            Transition *tr = (Transition *)array_push((void **)&ctx->transitions,
+                                                      &ctx->transition_count,
+                                                      &ctx->transition_cap, sizeof(Transition));
+            if (tr == NULL) {
+                return false;
+            }
+            parse_transition_one(tr, def);
         }
-        if (tr->duration_ms < 0) {
-            tr->duration_ms = 0;
-        }
-
-        tr->has_from = parse_transition_side(cJSON_GetObjectItemCaseSensitive(item, "from"),
-                                             &tr->from_opacity, &tr->from_x, &tr->from_y,
-                                             &tr->from_scale, &tr->from_rotate, 1.0f, 1.0f);
-        tr->has_to   = parse_transition_side(cJSON_GetObjectItemCaseSensitive(item, "to"),
-                                             &tr->to_opacity, &tr->to_x, &tr->to_y,
-                                             &tr->to_scale, &tr->to_rotate, 1.0f, 1.0f);
-
-        tr->from_mask_shape = parse_mask(cJSON_GetObjectItemCaseSensitive(item, "fromMask"),
-                                         tr->from_mask);
-        tr->to_mask_shape   = parse_mask(cJSON_GetObjectItemCaseSensitive(item, "toMask"),
-                                         tr->to_mask);
     }
     return true;
 }
@@ -1142,7 +1782,8 @@ static int compare_by_z(const void *a, const void *b)
  */
 static bool ctx_build_widget_index(EditorContext *ctx)
 {
-    size_t total = ctx->text_count + ctx->code_count + ctx->image_count + ctx->shape_count;
+    size_t total = ctx->text_count + ctx->code_count + ctx->image_count + ctx->shape_count +
+                       ctx->line_count + ctx->path_count;
     if (total == 0) {
         ctx->widgets      = NULL;
         ctx->widget_count = 0;
@@ -1167,6 +1808,12 @@ static bool ctx_build_widget_index(EditorContext *ctx)
     for (size_t i = 0; i < ctx->shape_count; i++) {
         ctx->widgets[n++] = &ctx->shapes[i].base;
     }
+    for (size_t i = 0; i < ctx->line_count; i++) {
+        ctx->widgets[n++] = &ctx->lines[i].base;
+    }
+    for (size_t i = 0; i < ctx->path_count; i++) {
+        ctx->widgets[n++] = &ctx->paths[i].base;
+    }
     ctx->widget_count = n;
 
     /* JSON order = drawing order (painter's algorithm). */
@@ -1178,10 +1825,40 @@ static bool ctx_build_widget_index(EditorContext *ctx)
  * Targets are resolved *within* a scene, and the index is scene-local too.
  * That is what lets the same id exist independently in different scenes.
  */
+/* A group id → its scene-local index, or -1. */
+static int find_group(const Scene *sc, const char *name)
+{
+    if (name == NULL) {
+        return -1;
+    }
+    for (size_t g = 0; g < sc->group_count; g++) {
+        if (sc->groups[g].id != NULL && strcmp(sc->groups[g].id, name) == 0) {
+            return (int)g;
+        }
+    }
+    return -1;
+}
+
 static void resolve_timeline_targets(EditorContext *ctx)
 {
     for (size_t si = 0; si < ctx->scene_count; si++) {
         Scene *sc = &ctx->scenes[si];
+
+        /* Widgets → their group. Done here rather than while parsing, because
+         * this is the first point at which the widget index exists. */
+        for (size_t w = 0; w < sc->widget_count; w++) {
+            WidgetBase *b = ctx->widgets[sc->first_widget + w];
+            if (b->group_name == NULL) {
+                continue;
+            }
+            b->group_index = find_group(sc, b->group_name);
+            if (b->group_index < 0) {
+                fprintf(stderr, "warning: scene '%s' — object '%s' names group '%s', "
+                                "which does not exist.\n",
+                        sc->id ? sc->id : "(unnamed)",
+                        b->id ? b->id : "(null)", b->group_name);
+            }
+        }
 
         for (size_t i = 0; i < sc->event_count; i++) {
             TimelineEvent *e = &sc->events[i];
@@ -1194,11 +1871,107 @@ static void resolve_timeline_targets(EditorContext *ctx)
                 }
             }
 
-            if (e->target_index < 0 && e->action != ACTION_UNKNOWN) {
+            /* Not an object — perhaps a group. A name cannot be both: objects
+             * are searched first, so an accidental clash is at least
+             * deterministic rather than order-dependent. */
+            if (e->target_index < 0) {
+                e->target_group = find_group(sc, e->target_id);
+            }
+
+            if (e->target_index < 0 && e->target_group < 0 && e->action != ACTION_UNKNOWN) {
                 fprintf(stderr, "warning: scene '%s' — target '%s' not found.\n",
                         sc->id ? sc->id : "(unnamed)",
                         e->target_id ? e->target_id : "(null)");
             }
+        }
+    }
+}
+
+/* ------------------------------------------------------------------------- */
+/* Resolving relative keyframe times                                          */
+/* ------------------------------------------------------------------------- */
+
+/* One track: fractions → seconds, then re-sort if anything moved. */
+static void resolve_track(Track *tr, float duration_sec)
+{
+    if (tr->keys == NULL || tr->count <= 0) {
+        return;
+    }
+
+    bool touched = false;
+    for (int i = 0; i < tr->count; i++) {
+        if (tr->keys[i].t_relative) {
+            tr->keys[i].t         *= duration_sec;
+            tr->keys[i].t_relative = false;
+            touched                = true;
+        }
+    }
+
+    /* Only now can a "50%" key be ordered against a literal 2.0. */
+    if (touched) {
+        sort_keys(tr->keys, tr->count);
+    }
+}
+
+static void resolve_effect_times(struct Effect *list, size_t count, float duration_sec)
+{
+    for (size_t i = 0; i < count; i++) {
+        for (int p = 0; p < FXP_MAX; p++) {
+            resolve_track(&list[i].param[p], duration_sec);
+        }
+    }
+}
+
+/*
+ * Turns every "50%" keyframe time into seconds.
+ *
+ * Must run after compute_scene_times(), because that is the first moment every
+ * scene's duration is final — in flat mode the single scene inherits the
+ * project's duration, which is only applied at the very end of parsing.
+ *
+ * What a percentage is relative to depends on what owns the track:
+ *
+ *   widget property tracks    the widget's scene       (time is scene-local)
+ *   scene effect tracks       that scene
+ *   project effect tracks     the whole film           (applied to finished frames)
+ *   transition from/to        nothing — already progress in [0,1]
+ *
+ * That last case is why transitions are handled by clearing the flag rather
+ * than scaling: there "50%" already *means* 0.5, and multiplying by a duration
+ * would push the key far outside the range the sampler uses.
+ */
+static void resolve_relative_times(EditorContext *ctx)
+{
+    for (size_t si = 0; si < ctx->scene_count; si++) {
+        Scene *sc  = &ctx->scenes[si];
+        float  sec = (float)sc->duration_ms * 0.001f;
+
+        for (size_t w = 0; w < sc->widget_count; w++) {
+            WidgetBase *b = ctx->widgets[sc->first_widget + w];
+            resolve_track(&b->tr_x,        sec);
+            resolve_track(&b->tr_y,        sec);
+            resolve_track(&b->tr_opacity,  sec);
+            resolve_track(&b->tr_scale,    sec);
+            resolve_track(&b->tr_rotation, sec);
+        }
+
+        resolve_effect_times(sc->effects, sc->effect_count, sec);
+    }
+
+    resolve_effect_times(ctx->effects, ctx->effect_count,
+                         (float)ctx->config.duration_ms * 0.001f);
+
+    for (size_t i = 0; i < ctx->transition_count; i++) {
+        Transition *tr = &ctx->transitions[i];
+        Track      *all[] = {
+            &tr->from_opacity, &tr->from_x, &tr->from_y, &tr->from_scale, &tr->from_rotate,
+            &tr->to_opacity,   &tr->to_x,   &tr->to_y,   &tr->to_scale,   &tr->to_rotate,
+            &tr->from_mask[0], &tr->from_mask[1], &tr->from_mask[2], &tr->from_mask[3],
+            &tr->to_mask[0],   &tr->to_mask[1],   &tr->to_mask[2],   &tr->to_mask[3],
+        };
+        /* A duration of 1.0 leaves the fraction untouched — see above. */
+        for (size_t k = 0; k < sizeof all / sizeof all[0]; k++) {
+            resolve_track(all[k], 1.0f);
         }
     }
 }
@@ -1241,6 +2014,392 @@ static void compute_scene_times(EditorContext *ctx)
 
 
 /* ------------------------------------------------------------------------- */
+/* `repeat` — one object description, many objects                            */
+/* ------------------------------------------------------------------------- */
+
+/*
+ * A repeated template, remembered so the timeline can be expanded to match.
+ *
+ * When the author writes an event targeting "dot", they mean all sixteen dots,
+ * not a widget that no longer exists under that name. So the ids the expansion
+ * produced have to be recoverable when the timeline is read a moment later.
+ */
+typedef struct {
+    char *template_id;   /* the id as written, e.g. "dot"     */
+    int   count;
+    int   stagger_ms;    /* per-copy delay applied to events  */
+} RepeatGroup;
+
+typedef struct {
+    RepeatGroup *items;
+    size_t       count, cap;
+} RepeatTable;
+
+static void repeat_table_free(RepeatTable *t)
+{
+    for (size_t i = 0; i < t->count; i++) {
+        free(t->items[i].template_id);
+    }
+    free(t->items);
+    t->items = NULL;
+    t->count = t->cap = 0;
+}
+
+static const RepeatGroup *repeat_lookup(const RepeatTable *t, const char *id)
+{
+    if (id == NULL) {
+        return NULL;
+    }
+    for (size_t i = 0; i < t->count; i++) {
+        if (strcmp(t->items[i].template_id, id) == 0) {
+            return &t->items[i];
+        }
+    }
+    return NULL;
+}
+
+/*
+ * Places copy `i` of `count` according to the `layout` given.
+ *
+ * The result is a *displacement*, not a position: it is added on top of
+ * whatever the template's own x/y resolve to, so `"x": "center"` and a radial
+ * repeat compose instead of fighting.
+ */
+static void repeat_offset(const cJSON *rep, int i, int count,
+                          float *dx, float *dy, float *rot_deg)
+{
+    const char *layout = json_str(rep, "layout", "radial");
+
+    *dx = 0.0f;
+    *dy = 0.0f;
+
+    /*
+     * Per-copy rotation.
+     *
+     * Displacement alone cannot make a fan of spokes: twelve lines with the
+     * same endpoints land on top of one another however they are moved. Either
+     * a fixed step per copy, or `orient` to face along the radial direction.
+     */
+    float step = json_float(rep, "rotate_step", 0.0f);
+    *rot_deg = step * (float)i;
+
+    if (strcmp(layout, "radial") == 0) {
+        float radius = json_float(rep, "radius", 200.0f);
+        float a0     = json_float(rep, "angle_start", 0.0f);
+        /* A full turn by default, so `count` copies land evenly around it. */
+        float sweep  = json_float(rep, "sweep", 360.0f);
+        float ang    = (a0 + sweep * (float)i / (float)count) * (float)(M_PI / 180.0);
+
+        *dx = radius * cosf(ang);
+        *dy = radius * sinf(ang);
+
+    } else if (strcmp(layout, "grid") == 0) {
+        int   cols = json_int(rep, "cols", 4);
+        float sx   = json_float(rep, "spacing_x", 100.0f);
+        float sy   = json_float(rep, "spacing_y", 100.0f);
+        if (cols < 1) {
+            cols = 1;
+        }
+        int rows = (count + cols - 1) / cols;
+
+        /* Centred on the template's position — a grid that grows to one side
+         * would make "x": "center" mean something different for every count. */
+        *dx = ((float)(i % cols) - (float)(cols - 1) * 0.5f) * sx;
+        *dy = ((float)(i / cols) - (float)(rows - 1) * 0.5f) * sy;
+
+    } else if (strcmp(layout, "line") == 0) {
+        float sx = json_float(rep, "spacing_x", 100.0f);
+        float sy = json_float(rep, "spacing_y", 0.0f);
+        *dx = ((float)i - (float)(count - 1) * 0.5f) * sx;
+        *dy = ((float)i - (float)(count - 1) * 0.5f) * sy;
+
+    } else if (strcmp(layout, "stack") != 0) {
+        fprintf(stderr, "warning: unknown repeat layout '%s' — using 'stack'.\n", layout);
+    }
+
+    /* `orient` turns each copy to match its own angle around the circle, which
+     * is what makes spokes out of a stack of identical lines. */
+    if (cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(rep, "orient"))) {
+        float a0    = json_float(rep, "angle_start", 0.0f);
+        float sweep = json_float(rep, "sweep", 360.0f);
+        *rot_deg += a0 + sweep * (float)i / (float)count;
+    }
+    /* "stack": every copy sits at the template's position. Useful when the
+     * spread comes from the timeline (a staggered fan-out) rather than here. */
+}
+
+/*
+ * Expands one template into `count` sibling objects, appended to `out`.
+ *
+ * This runs entirely at parse time: the renderer never learns that a repeat
+ * existed, and every copy is an ordinary object. That keeps a frame a pure
+ * function of time — the property --range and the two backends depend on.
+ */
+static bool repeat_expand(const cJSON *tmpl, const cJSON *rep, cJSON *out, RepeatTable *table)
+{
+    int count = json_int(rep, "count", 0);
+    if (count < 1) {
+        fprintf(stderr, "warning: repeat.count = %d — object skipped.\n", count);
+        return true;
+    }
+    if (count > 4096) {
+        fprintf(stderr, "warning: repeat.count = %d capped at 4096.\n", count);
+        count = 4096;
+    }
+
+    const char *base_id = json_str(tmpl, "id", NULL);
+    const cJSON *cycle  = cJSON_GetObjectItemCaseSensitive(rep, "color_cycle");
+    int          ncol   = cJSON_IsArray(cycle) ? cJSON_GetArraySize(cycle) : 0;
+    int          stagger = json_int(rep, "stagger_ms", 0);
+
+    for (int i = 0; i < count; i++) {
+        cJSON *copy = cJSON_Duplicate(tmpl, 1);
+        if (copy == NULL) {
+            return false;
+        }
+        cJSON_DeleteItemFromObjectCaseSensitive(copy, "repeat");
+
+        /* Unique ids so the validator's duplicate check stays meaningful and
+         * a single copy can still be addressed directly if wanted. */
+        if (base_id != NULL) {
+            char id[256];
+            snprintf(id, sizeof id, "%s#%d", base_id, i);
+            cJSON_DeleteItemFromObjectCaseSensitive(copy, "id");
+            cJSON_AddStringToObject(copy, "id", id);
+        }
+
+        float dx, dy, rot;
+        repeat_offset(rep, i, count, &dx, &dy, &rot);
+        cJSON_AddNumberToObject(copy, "_repeat_dx", dx);
+        cJSON_AddNumberToObject(copy, "_repeat_dy", dy);
+        cJSON_AddNumberToObject(copy, "_repeat_rot", rot);
+
+        if (ncol > 0) {
+            const cJSON *c = cJSON_GetArrayItem(cycle, i % ncol);
+            if (cJSON_IsString(c) && c->valuestring != NULL) {
+                /* Shapes read "color", code blocks "fg"; setting the one the
+                 * template already uses avoids inventing a key it ignores. */
+                const char *key = json_has(copy, "fg") ? "fg" : "color";
+                cJSON_DeleteItemFromObjectCaseSensitive(copy, key);
+                cJSON_AddStringToObject(copy, key, c->valuestring);
+            }
+        }
+
+        cJSON_AddItemToArray(out, copy);
+    }
+
+    if (base_id != NULL) {
+        RepeatGroup *g = (RepeatGroup *)array_push((void **)&table->items, &table->count,
+                                                   &table->cap, sizeof(RepeatGroup));
+        if (g == NULL) {
+            return false;
+        }
+        g->template_id = dup_string(base_id);
+        g->count       = count;
+        g->stagger_ms  = stagger;
+    }
+    return true;
+}
+
+/* ------------------------------------------------------------------------- */
+/* `emitter` — one description, a burst of particles                          */
+/* ------------------------------------------------------------------------- */
+
+/*
+ * A deterministic pseudo-random stream.
+ *
+ * rand() is deliberately avoided: it would make a render depend on libc and on
+ * how many times anything else happened to call it, so the same project could
+ * produce different frames on two machines. This hash is fixed, seeded from the
+ * JSON, and therefore reproducible everywhere — the same property --range and
+ * the two backends already rely on.
+ */
+static float emit_rand(unsigned int *state)
+{
+    unsigned int x = (*state += 0x9E3779B9u);
+    x ^= x >> 16; x *= 0x7feb352dU;
+    x ^= x >> 15; x *= 0x846ca68bU;
+    x ^= x >> 16;
+    return (float)(x & 0x00FFFFFFU) / (float)0x01000000U;
+}
+
+/* A number, or a [min,max] pair sampled uniformly. */
+static float emit_range(const cJSON *obj, const char *key, float lo, float hi,
+                        unsigned int *state)
+{
+    const cJSON *it = cJSON_GetObjectItemCaseSensitive(obj, key);
+
+    if (cJSON_IsNumber(it)) {
+        return (float)it->valuedouble;
+    }
+    if (cJSON_IsArray(it) && cJSON_GetArraySize(it) >= 2) {
+        float a = (float)cJSON_GetArrayItem(it, 0)->valuedouble;
+        float b = (float)cJSON_GetArrayItem(it, 1)->valuedouble;
+        return a + (b - a) * emit_rand(state);
+    }
+    return lo + (hi - lo) * emit_rand(state);
+}
+
+/*
+ * Expands an emitter into `count` particles: one object each, plus one `emit`
+ * event each carrying that particle's velocity and lifetime.
+ *
+ * Why events rather than keyframes: a ballistic path is a closed form, so the
+ * renderer needs five numbers per particle instead of a keyframe array. A
+ * seven-hundred-particle burst therefore costs about 28 KB of events, and any
+ * frame in the middle of it can still be rendered on its own.
+ */
+static bool emitter_expand(const cJSON *tmpl, const cJSON *em, cJSON *out,
+                           cJSON *events, int canvas_w, int canvas_h)
+{
+    int count = json_int(em, "count", 0);
+    if (count < 1) {
+        fprintf(stderr, "warning: emitter.count = %d — object skipped.\n", count);
+        return true;
+    }
+    if (count > 4096) {
+        fprintf(stderr, "warning: emitter.count = %d capped at 4096.\n", count);
+        count = 4096;
+    }
+
+    unsigned int state = (unsigned int)json_int(em, "seed", 1) * 2654435761u + 12345u;
+
+    const char *base_id = json_str(tmpl, "id", NULL);
+    const cJSON *cycle  = cJSON_GetObjectItemCaseSensitive(em, "color_cycle");
+    int          ncol   = cJSON_IsArray(cycle) ? cJSON_GetArraySize(cycle) : 0;
+
+    float ox = json_canvas_coord(em, "cx", (float)canvas_w, LAYOUT_AXIS_X, canvas_w * 0.5f);
+    float oy = json_canvas_coord(em, "cy", (float)canvas_h, LAYOUT_AXIS_Y, canvas_h * 0.5f);
+
+    int   emit_ms  = json_int(em, "emit_ms", 0);       /* how long spawning lasts */
+    int   start_ms = json_int(em, "start_ms", 0);
+    float gravity  = json_float(em, "gravity", 0.0f);
+    float fade     = json_float(em, "fade", 0.35f);
+
+    for (int i = 0; i < count; i++) {
+        cJSON *copy = cJSON_Duplicate(tmpl, 1);
+        if (copy == NULL) {
+            return false;
+        }
+        cJSON_DeleteItemFromObjectCaseSensitive(copy, "emitter");
+
+        char id[256];
+        snprintf(id, sizeof id, "%s@%d", base_id ? base_id : "p", i);
+        cJSON_DeleteItemFromObjectCaseSensitive(copy, "id");
+        cJSON_AddStringToObject(copy, "id", id);
+
+        /*
+         * --- spawn ---
+         *
+         * `spread` is a disc; `spread_x`/`spread_y` override each axis so an
+         * emitter can be a line rather than a circle. A strip along the bottom
+         * of the frame is a common enough case that a radial-only spread would
+         * scatter half the particles off-canvas to achieve it.
+         */
+        float sa = emit_rand(&state) * 6.28318530718f;
+        float sr = sqrtf(emit_rand(&state));       /* even coverage of the area */
+
+        float spread = emit_range(em, "spread", 0.0f, 0.0f, &state);
+        float sx_r   = json_has(em, "spread_x")
+                           ? emit_range(em, "spread_x", 0.0f, 0.0f, &state) : spread;
+        float sy_r   = json_has(em, "spread_y")
+                           ? emit_range(em, "spread_y", 0.0f, 0.0f, &state) : spread;
+
+        cJSON_DeleteItemFromObjectCaseSensitive(copy, "x");
+        cJSON_DeleteItemFromObjectCaseSensitive(copy, "y");
+        cJSON_AddNumberToObject(copy, "x", ox + sx_r * sr * cosf(sa));
+        cJSON_AddNumberToObject(copy, "y", oy + sy_r * sr * sinf(sa));
+
+        /* --- velocity --- */
+        float ang   = emit_range(em, "angle", 0.0f, 360.0f, &state) * (float)(M_PI / 180.0);
+        float speed = emit_range(em, "speed", 100.0f, 300.0f, &state);
+        float life  = emit_range(em, "life", 1.0f, 2.0f, &state);
+        if (life < 0.05f) {
+            life = 0.05f;
+        }
+
+        /* --- per-particle size and colour --- */
+        const cJSON *sj = cJSON_GetObjectItemCaseSensitive(em, "size_jitter");
+        if (sj != NULL) {
+            float k = emit_range(em, "size_jitter", 1.0f, 1.0f, &state);
+            cJSON_DeleteItemFromObjectCaseSensitive(copy, "scale");
+            cJSON_AddNumberToObject(copy, "scale", k);
+        }
+        if (ncol > 0) {
+            int c = (int)(emit_rand(&state) * (float)ncol);
+            if (c >= ncol) c = ncol - 1;
+            const cJSON *cc = cJSON_GetArrayItem(cycle, c);
+            if (cJSON_IsString(cc) && cc->valuestring != NULL) {
+                const char *key = json_has(copy, "fg") ? "fg" : "color";
+                cJSON_DeleteItemFromObjectCaseSensitive(copy, key);
+                cJSON_AddStringToObject(copy, key, cc->valuestring);
+            }
+        }
+
+        cJSON_AddItemToArray(out, copy);
+
+        /* --- the particle's own event --- */
+        cJSON *ev = cJSON_CreateObject();
+        if (ev == NULL) {
+            return false;
+        }
+        cJSON_AddStringToObject(ev, "action", "emit");
+        cJSON_AddStringToObject(ev, "target", id);
+        cJSON_AddNumberToObject(ev, "time_ms",
+                                start_ms + (int)(emit_rand(&state) * (float)emit_ms));
+        cJSON_AddNumberToObject(ev, "duration_ms", (int)(life * 1000.0f));
+        cJSON_AddNumberToObject(ev, "vx", cosf(ang) * speed);
+        cJSON_AddNumberToObject(ev, "vy", sinf(ang) * speed);
+        cJSON_AddNumberToObject(ev, "gravity", gravity);
+        cJSON_AddNumberToObject(ev, "fade", fade);
+        cJSON_AddNumberToObject(ev, "spin", emit_range(em, "spin", 0.0f, 0.0f, &state));
+        cJSON_AddItemToArray(events, ev);
+    }
+    return true;
+}
+
+/*
+ * Walks an "objects" array and returns a new array with every `repeat`
+ * expanded. Objects without a `repeat` are copied through untouched.
+ *
+ * The caller owns the result and must cJSON_Delete it.
+ */
+static cJSON *repeat_expand_all(const cJSON *objects, RepeatTable *table,
+                                cJSON *emitted_events, int canvas_w, int canvas_h)
+{
+    cJSON *out = cJSON_CreateArray();
+    if (out == NULL) {
+        return NULL;
+    }
+
+    const cJSON *obj = NULL;
+    cJSON_ArrayForEach(obj, objects) {
+        const cJSON *rep = cJSON_GetObjectItemCaseSensitive(obj, "repeat");
+        const cJSON *em  = cJSON_GetObjectItemCaseSensitive(obj, "emitter");
+
+        if (cJSON_IsObject(em)) {
+            if (!emitter_expand(obj, em, out, emitted_events, canvas_w, canvas_h)) {
+                cJSON_Delete(out);
+                return NULL;
+            }
+        } else if (cJSON_IsObject(rep)) {
+            if (!repeat_expand(obj, rep, out, table)) {
+                cJSON_Delete(out);
+                return NULL;
+            }
+        } else {
+            cJSON *copy = cJSON_Duplicate(obj, 1);
+            if (copy == NULL) {
+                cJSON_Delete(out);
+                return NULL;
+            }
+            cJSON_AddItemToArray(out, copy);
+        }
+    }
+    return out;
+}
+
+/* ------------------------------------------------------------------------- */
 /* Parsing a scene                                                            */
 /* ------------------------------------------------------------------------- */
 
@@ -1260,7 +2419,8 @@ static bool parse_scene(EditorContext *ctx, const cJSON *node, const cJSON *styl
     }
 
     sc->id           = dup_string(json_str(node, "id", NULL));
-    sc->first_widget = ctx->text_count + ctx->code_count + ctx->image_count + ctx->shape_count;
+    sc->first_widget = ctx->text_count + ctx->code_count + ctx->image_count + ctx->shape_count +
+                       ctx->line_count + ctx->path_count;
 
     if (json_has(node, "bg_color")) {
         sc->bg_color = json_color(node, "bg_color", ctx->config.bg_color);
@@ -1271,6 +2431,59 @@ static bool parse_scene(EditorContext *ctx, const cJSON *node, const cJSON *styl
     const cJSON *objects = cJSON_GetObjectItemCaseSensitive(node, "objects");
     if (!cJSON_IsArray(objects)) {
         objects = cJSON_GetObjectItemCaseSensitive(node, "layers"); /* videogen synonym */
+    }
+
+    /* --- groups --- */
+    const cJSON *groups = cJSON_GetObjectItemCaseSensitive(node, "groups");
+    if (cJSON_IsArray(groups)) {
+        const cJSON *g = NULL;
+        cJSON_ArrayForEach(g, groups) {
+            if (sc->group_count >= VR_MAX_GROUPS) {
+                fprintf(stderr, "warning: more than %d groups in one scene — the rest ignored.\n",
+                        VR_MAX_GROUPS);
+                break;
+            }
+            GroupDef *gd = (GroupDef *)array_push((void **)&sc->groups, &sc->group_count,
+                                                  &sc->group_cap, sizeof(GroupDef));
+            if (gd == NULL) {
+                return false;
+            }
+            gd->id = dup_string(json_str(g, "id", NULL));
+
+            /* Like an orbit centre: a point on the canvas, so an expression can
+             * be resolved now — a group has no size to defer to. */
+            gd->pivot_x = json_canvas_coord(g, "pivot_x", (float)ctx->config.width,
+                                            LAYOUT_AXIS_X, (float)ctx->config.width * 0.5f);
+            gd->pivot_y = json_canvas_coord(g, "pivot_y", (float)ctx->config.height,
+                                            LAYOUT_AXIS_Y, (float)ctx->config.height * 0.5f);
+        }
+    }
+
+    /*
+     * `repeat` is expanded here, before anything else looks at the array, so
+     * the rest of the parser — and the whole renderer — only ever sees plain
+     * objects.
+     */
+    RepeatTable repeats;
+    memset(&repeats, 0, sizeof repeats);
+
+    cJSON *expanded = NULL;
+    cJSON *emitted  = cJSON_CreateArray();   /* events an emitter generated */
+    if (emitted == NULL) {
+        repeat_table_free(&repeats);
+        return false;
+    }
+
+    if (cJSON_IsArray(objects)) {
+        expanded = repeat_expand_all(objects, &repeats, emitted,
+                                     ctx->config.width, ctx->config.height);
+        if (expanded == NULL) {
+            fprintf(stderr, "error: could not expand a repeat or emitter block.\n");
+            cJSON_Delete(emitted);
+            repeat_table_free(&repeats);
+            return false;
+        }
+        objects = expanded;
     }
 
     if (cJSON_IsArray(objects)) {
@@ -1291,6 +2504,10 @@ static bool parse_scene(EditorContext *ctx, const cJSON *node, const cJSON *styl
                 ok = parse_shape_object(ctx, obj, *z, WIDGET_RECT);
             } else if (strcmp(type, "circle") == 0) {
                 ok = parse_shape_object(ctx, obj, *z, WIDGET_CIRCLE);
+            } else if (strcmp(type, "line") == 0) {
+                ok = parse_line_object(ctx, obj, *z);
+            } else if (strcmp(type, "path") == 0 || strcmp(type, "polyline") == 0) {
+                ok = parse_path_object(ctx, obj, *z);
             } else {
                 fprintf(stderr, "warning: unknown object type '%s' — skipped.\n", type);
                 continue;
@@ -1298,6 +2515,9 @@ static bool parse_scene(EditorContext *ctx, const cJSON *node, const cJSON *styl
 
             if (!ok) {
                 fprintf(stderr, "error: could not allocate an object.\n");
+                cJSON_Delete(expanded);
+                cJSON_Delete(emitted);
+                repeat_table_free(&repeats);
                 return false;
             }
             (*z)++;   /* z increases globally → a scene's objects stay adjacent in the index */
@@ -1305,7 +2525,8 @@ static bool parse_scene(EditorContext *ctx, const cJSON *node, const cJSON *styl
     }
 
     sc->widget_count = (ctx->text_count + ctx->code_count + ctx->image_count +
-                        ctx->shape_count) - sc->first_widget;
+                        ctx->shape_count + ctx->line_count +
+                        ctx->path_count) - sc->first_widget;
 
     /*
      * --- the scene's own effects ---
@@ -1317,16 +2538,89 @@ static bool parse_scene(EditorContext *ctx, const cJSON *node, const cJSON *styl
     if (!is_root &&
         !parse_effects_into(&sc->effects, &sc->effect_count, &sc->effect_cap,
                             cJSON_GetObjectItemCaseSensitive(node, "effects"))) {
+        cJSON_Delete(expanded);
+        cJSON_Delete(emitted);
+        repeat_table_free(&repeats);
         return false;
     }
 
-    /* --- timeline --- */
+    /*
+     * --- timeline ---
+     *
+     * An event aimed at a repeated template ("dot") is expanded to one event
+     * per copy ("dot#0" … "dot#15"). Without this a `repeat` would be useless
+     * for anything animated: the author would have to write sixteen events
+     * naming ids the expansion invented.
+     *
+     * `stagger_ms` delays each successive copy, which is what turns a ring of
+     * dots into a wave travelling around it.
+     */
     const cJSON *timeline = cJSON_GetObjectItemCaseSensitive(node, "timeline");
     if (cJSON_IsArray(timeline)) {
         const cJSON *ev = NULL;
         cJSON_ArrayForEach(ev, timeline) {
-            if (!parse_timeline_event(sc, ev)) {
-                fprintf(stderr, "error: could not allocate a timeline event.\n");
+            const RepeatGroup *g = repeat_lookup(&repeats, json_str(ev, "target", NULL));
+
+            if (g == NULL) {
+                if (!parse_timeline_event(ctx, sc, ev)) {
+                    fprintf(stderr, "error: could not allocate a timeline event.\n");
+                    cJSON_Delete(expanded);
+                    cJSON_Delete(emitted);
+                    repeat_table_free(&repeats);
+                    return false;
+                }
+                continue;
+            }
+
+            for (int i = 0; i < g->count; i++) {
+                cJSON *copy = cJSON_Duplicate(ev, 1);
+                if (copy == NULL) {
+                    cJSON_Delete(expanded);
+                    cJSON_Delete(emitted);
+                    repeat_table_free(&repeats);
+                    return false;
+                }
+
+                char id[256];
+                snprintf(id, sizeof id, "%s#%d", g->template_id, i);
+                cJSON_DeleteItemFromObjectCaseSensitive(copy, "target");
+                cJSON_AddStringToObject(copy, "target", id);
+
+                if (g->stagger_ms != 0) {
+                    int t = json_int(copy, "time_ms", 0) + g->stagger_ms * i;
+                    if (t < 0) {
+                        t = 0;
+                    }
+                    cJSON_DeleteItemFromObjectCaseSensitive(copy, "time_ms");
+                    cJSON_AddNumberToObject(copy, "time_ms", t);
+                }
+
+                bool ok_ev = parse_timeline_event(ctx, sc, copy);
+                cJSON_Delete(copy);
+
+                if (!ok_ev) {
+                    fprintf(stderr, "error: could not allocate a timeline event.\n");
+                    cJSON_Delete(expanded);
+                    cJSON_Delete(emitted);
+                    repeat_table_free(&repeats);
+                    return false;
+                }
+            }
+        }
+    }
+
+    /*
+     * Emitter-generated events, appended after the hand-written ones so an
+     * author's event on the same object still has the last word.
+     */
+    {
+        const cJSON *ev = NULL;
+        cJSON_ArrayForEach(ev, emitted) {
+            if (!parse_timeline_event(ctx, sc, ev)) {
+                fprintf(stderr, "error: could not allocate a particle event.\n");
+                cJSON_Delete(expanded);
+                cJSON_Delete(emitted);
+                repeat_table_free(&repeats);
                 return false;
             }
         }
@@ -1349,6 +2643,10 @@ static bool parse_scene(EditorContext *ctx, const cJSON *node, const cJSON *styl
         }
         sc->duration_ms = (last > 0) ? last + 1000 : 3000;
     }
+
+    cJSON_Delete(expanded);      /* NULL-safe; only set when a repeat existed */
+    cJSON_Delete(emitted);
+    repeat_table_free(&repeats);
     return true;
 }
 
@@ -1516,7 +2814,8 @@ EditorContext *parse_video_project_ex(const char *filepath, char **defines, int 
     }
     resolve_timeline_targets(ctx);
 
-    if (!parse_transitions(ctx, cJSON_GetObjectItemCaseSensitive(root, "transitions"))) {
+    if (!parse_transitions(ctx, cJSON_GetObjectItemCaseSensitive(root, "transitions"),
+                                cJSON_GetObjectItemCaseSensitive(root, "transition"))) {
         fprintf(stderr, "error: could not allocate the transitions.\n");
         goto fail;
     }
@@ -1529,6 +2828,10 @@ EditorContext *parse_video_project_ex(const char *filepath, char **defines, int 
         ctx->scenes[0].duration_ms = ctx->config.duration_ms;
     }
     compute_scene_times(ctx);
+
+    /* Durations are final only now — so this is the earliest "50%" can become
+     * seconds, and the latest it may still be one. */
+    resolve_relative_times(ctx);
 
     if (!arena_init(&ctx->frame_arena, FRAME_ARENA_BYTES)) {
         fprintf(stderr, "error: could not allocate the frame arena.\n");
@@ -1560,10 +2863,16 @@ static void widget_base_free(WidgetBase *b)
     track_free(&b->tr_opacity);
     track_free(&b->tr_scale);
     track_free(&b->tr_rotation);
+    track_free(&b->tr_w);
+    track_free(&b->tr_h);
+    track_free(&b->tr_tint);
+    track_free(&b->tr_trim);
 
     free(b->x_expr);
     free(b->y_expr);
+    free(b->group_name);
     b->x_expr = b->y_expr = NULL;
+    b->group_name = NULL;
 }
 
 void editor_context_free(EditorContext *ctx)
@@ -1601,6 +2910,17 @@ void editor_context_free(EditorContext *ctx)
     }
     free(ctx->images);
 
+    for (size_t i = 0; i < ctx->line_count; i++) {
+        widget_base_free(&ctx->lines[i].base);
+    }
+    free(ctx->lines);
+
+    for (size_t i = 0; i < ctx->path_count; i++) {
+        widget_base_free(&ctx->paths[i].base);
+        free(ctx->paths[i].segs);
+    }
+    free(ctx->paths);
+
     for (size_t i = 0; i < ctx->shape_count; i++) {
         widget_base_free(&ctx->shapes[i].base);
     }
@@ -1629,8 +2949,13 @@ void editor_context_free(EditorContext *ctx)
         free(sc->effects);
         for (size_t e = 0; e < sc->event_count; e++) {
             free(sc->events[e].target_id);
+            track_free(&sc->events[e].anim_track);
         }
         free(sc->events);
+        for (size_t g = 0; g < sc->group_count; g++) {
+            free(sc->groups[g].id);
+        }
+        free(sc->groups);
     }
     free(ctx->scenes);
 
@@ -1666,6 +2991,9 @@ static const char *action_name(ActionType a)
         case ACTION_SCALE:     return "scale";
         case ACTION_ROTATE:    return "rotate";
         case ACTION_HIGHLIGHT: return "highlight";
+        case ACTION_ORBIT:     return "orbit";
+        case ACTION_EMIT:      return "emit";
+        case ACTION_ANIMATE:   return "animate";
         default:               return "unknown";
     }
 }
@@ -1859,7 +3187,8 @@ int editor_context_check(const EditorContext *ctx)
                 VR_PROBLEM("'%s' #%zu — unknown action (t=%d ms).\n", sn, i, e->time_ms);
                 continue;
             }
-            if (e->target_index < 0) {
+            /* A group is a legitimate target, and has no widget index. */
+            if (e->target_index < 0 && e->target_group < 0) {
                 VR_PROBLEM("'%s' #%zu — target '%s' not found.\n", sn, i,
                            e->target_id ? e->target_id : "(null)");
             }

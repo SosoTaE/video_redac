@@ -92,6 +92,17 @@ bool vr_composite_setup(int fb_w, int fb_h, int tex_w, int tex_h,
                         const WidgetBase *b, const WidgetRuntime *rt,
                         CompositeParams *out);
 
+/*
+ * Fills in a highlight band for a widget, reusing the compositing transform so
+ * the band lines up with the text exactly.
+ *
+ * Returns false when there is nothing to draw — no band, no line metrics, or a
+ * line range entirely outside the text. Callers can therefore treat it as
+ * "should I run the band pass at all?".
+ */
+bool vr_highlight_setup(const CompositeParams *geom, const WidgetBase *b,
+                        const WidgetRuntime *rt, HighlightParams *out);
+
 /* ------------------------------------------------------------------------- */
 /* Effects                                                                    */
 /* ------------------------------------------------------------------------- */

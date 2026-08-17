@@ -227,6 +227,22 @@ __global__ void k_transition(uchar4 *__restrict__ dst,
 }
 
 /* ------------------------------------------------------------------------- */
+/* Highlight band                                                             */
+/* ------------------------------------------------------------------------- */
+
+__global__ void k_highlight(uchar4 *__restrict__ fb, const uchar4 *__restrict__ plate,
+                            HighlightParams p)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (i >= p.geom.bb_w || j >= p.geom.bb_h) {
+        return;
+    }
+    vr_px_highlight(fb, plate, &p, i, j);
+}
+
+/* ------------------------------------------------------------------------- */
 /* Texture compositor                                                         */
 /* ------------------------------------------------------------------------- */
 
@@ -589,6 +605,22 @@ static void render_scene_into(const EditorContext *ctx, RenderResources *res, in
         if (b->kind == WIDGET_CODE) {
             const CodeWidget *cw = (const CodeWidget *)b;
             composite_layer(res, stream, target, &cw->plate, b, r, NULL);
+        }
+
+        /* 2a'. The highlight band — above the panel, below the glyphs. */
+        CompositeParams hp;
+        if (vr_composite_setup(res->width, res->height, b->tex.width, b->tex.height,
+                               b, r, &hp)) {
+            HighlightParams hl;
+            if (vr_highlight_setup(&hp, b, r, &hl)) {
+                const dim3 hblock(16, 16);
+                dim3       hgrid((hl.geom.bb_w + hblock.x - 1) / hblock.x,
+                                 (hl.geom.bb_h + hblock.y - 1) / hblock.y);
+                const uchar4 *plate = (b->kind == WIDGET_CODE)
+                    ? (const uchar4 *)((const CodeWidget *)b)->plate.d_pixels : NULL;
+                k_highlight<<<hgrid, hblock, 0, stream>>>(target, plate, hl);
+                CUDA_CHECK_KERNEL();
+            }
         }
 
         /* 2b. Typewriter cutoffs → VRAM (only when the text is partly visible). */

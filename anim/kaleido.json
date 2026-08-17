@@ -1,0 +1,74 @@
+{
+  "vars": {
+    "p1": "#7EE787",
+    "p2": "#79C0FF",
+    "p3": "#D2A8FF",
+    "p4": "#FFA657"
+  },
+  "project": {
+    "width": 700,
+    "height": 700,
+    "fps": 30,
+    "bg_color": "#0A0A0F",
+    "duration_ms": 6000
+  },
+  "groups": [
+    {
+      "id": "kaleido",
+      "pivot_x": "center",
+      "pivot_y": "center"
+    }
+  ],
+  "objects": [
+    {
+      "id": "petal",
+      "type": "rect",
+      "w": 90,
+      "h": 18,
+      "corner_radius": 9,
+      "x": "center",
+      "y": "center",
+      "anchor": "center",
+      "group": "kaleido",
+      "color": "${p1}",
+      "repeat": {
+        "count": 24,
+        "layout": "radial",
+        "radius": 200,
+        "color_cycle": [
+          "${p1}",
+          "${p2}",
+          "${p3}",
+          "${p4}"
+        ]
+      }
+    }
+  ],
+  "timeline": [
+    {
+      "time_ms": 0,
+      "duration_ms": 6000,
+      "action": "rotate",
+      "target": "kaleido",
+      "value": 360,
+      "ease": "linear"
+    },
+    {
+      "time_ms": 0,
+      "duration_ms": 2500,
+      "action": "scale",
+      "target": "kaleido",
+      "value": 1.35,
+      "ease": "easeinout"
+    },
+    {
+      "time_ms": 3500,
+      "duration_ms": 2500,
+      "action": "scale",
+      "target": "kaleido",
+      "value": 0.8,
+      "ease": "easeinout"
+    }
+  ],
+  "_comment": "`group` + `repeat`: 24 objects and a whole kaleidoscope driven by two timeline events."
+}

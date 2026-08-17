@@ -54,6 +54,17 @@ typedef struct {
     float    t;     /* time in seconds */
     float    v;
     EaseType ease;  /* the curve used to reach *this* key */
+
+    /*
+     * `t` was written as a percentage ("50%") and is still a fraction of the
+     * owning scene's duration, not seconds.
+     *
+     * It cannot be resolved during parsing: in flat mode a scene's duration
+     * only becomes known after the whole project has been read. So the flag
+     * survives until resolve_relative_times() runs, and is false everywhere
+     * afterwards — nothing downstream of the parser ever sees it set.
+     */
+    bool     t_relative;
 } Keyframe;
 
 /*
@@ -148,7 +159,9 @@ typedef enum {
     WIDGET_CODE,
     WIDGET_IMAGE,
     WIDGET_RECT,    /* rectangle — scrims, lower thirds, divider bars */
-    WIDGET_CIRCLE   /* circle/ellipse — accents, pulses               */
+    WIDGET_CIRCLE,  /* circle/ellipse — accents, pulses               */
+    WIDGET_LINE,    /* straight segment — connectors, edges, arrows   */
+    WIDGET_PATH     /* polyline or bezier — curves, plots, glyphs      */
 } WidgetKind;
 
 /* ------------------------------------------------------------------------- */
@@ -215,6 +228,36 @@ typedef struct {
     bool       has_track_scale, has_track_rotation;
 
     /*
+     * Animated destination size.
+     *
+     * Distinct from `scale`, and needed because of it: a bar growing from
+     * nothing has to start at h = 0, and `scale` multiplies — 0 × anything
+     * stays 0, so the bar never appears. These set the size outright.
+     *
+     * No re-rasterization is involved: the compositor already derives an
+     * independent x and y scale from destination ÷ texture size, so animating
+     * the destination costs nothing per frame.
+     */
+    Track      tr_w, tr_h;
+    bool       has_track_w, has_track_h;
+
+    /* `trim` 0..1 — how much of a line is drawn. Shares the compositor's
+     * typewriter cutoff, so it needs no pixel code of its own. */
+    Track      tr_trim;
+    bool       has_track_trim;
+
+    /*
+     * Tint: blend the whole layer toward `tint_color` by an animated amount.
+     *
+     * A cheaper answer than animating the colour itself, which for text would
+     * mean re-rasterizing every frame. Enough for the case that actually comes
+     * up — something lighting up, or going red on failure.
+     */
+    Color      tint_color;
+    Track      tr_tint;
+    bool       has_track_tint;
+
+    /*
      * Relative layout (see layout.h).
      *
      * The expression ("center", "bottom-160", "50%+40") is stored as text,
@@ -231,6 +274,34 @@ typedef struct {
      * static positions.
      */
     float      anchor_off_x, anchor_off_y;
+
+    /*
+     * Rotation baked in at parse time, added to whatever the timeline supplies.
+     *
+     * A line is rasterized horizontally and then turned to its real angle. That
+     * is what lets `trim` reuse the typewriter's cutoff untouched: in the
+     * texture the segment always runs along +x, so "reveal up to here" is a
+     * plain x threshold no matter which way the line points on screen.
+     */
+    float      base_rotation;
+
+    /*
+     * Displacement contributed by a `repeat` block (see parser.c).
+     *
+     * Kept apart from `x`/`y` rather than folded into them, because a repeated
+     * object may still position itself with an expression ("center") — and that
+     * only becomes pixels after rasterization. Adding the offset there keeps
+     * both features working together instead of one overwriting the other.
+     */
+    float      repeat_dx, repeat_dy;
+
+    /*
+     * Group membership. The name is what the JSON wrote; the index is resolved
+     * once the widget array exists (see resolve_timeline_targets) and the name
+     * is kept only for the error message.
+     */
+    char      *group_name;
+    int        group_index;   /* scene-local index into Scene::groups, or -1 */
 } WidgetBase;
 
 /* A plain text object — titles, captions, formulae. */
@@ -295,7 +366,74 @@ typedef struct {
     Color  color;
     float  w, h;             /* for a circle: the bounding box               */
     int    corner_radius;    /* rectangles only */
+
+    /*
+     * Outline. `stroke_width` 0 means no outline, which is the historical
+     * behaviour; `filled` false draws the outline alone.
+     *
+     * Both exist because a ring cannot be expressed by a fill: the workaround
+     * was a fully transparent fill colour, which simply produced nothing.
+     */
+    Color  stroke_color;
+    float  stroke_width;
+    bool   filled;
 } ShapeWidget;
+
+/*
+ * A straight segment.
+ *
+ * It exists because the alternative was a rotated rectangle whose length and
+ * angle the author computed by hand with hypot() and atan2() — the arithmetic
+ * that produced most of the visual bugs it was meant to avoid.
+ *
+ * Stored as its two endpoints; the parser derives the rotation and the
+ * rasterizer draws it horizontally.
+ */
+typedef struct {
+    WidgetBase base;         /* base.kind = WIDGET_LINE */
+
+    float  x1, y1, x2, y2;
+    float  width;
+    Color  color;
+    int    cap;              /* 0 = butt, 1 = round, 2 = square */
+} LineWidget;
+
+/*
+ * One step of a path.
+ *
+ * Quadratics are converted to cubics while parsing, so there is exactly one
+ * curve type here — the rasterizer and the bounding-box pass each handle two
+ * cases instead of three.
+ */
+typedef struct {
+    uint8_t op;      /* 0 = move, 1 = line, 2 = cubic, 3 = close */
+    float   c[6];    /* line/move: x,y | cubic: c1x,c1y,c2x,c2y,x,y */
+} PathSeg;
+
+/*
+ * A polyline or bezier path.
+ *
+ * The alternative in a project file was forty-six points and forty-five tiny
+ * rectangles per curve — which is not only verbose but visibly faceted, and
+ * makes the curve impossible to restyle.
+ *
+ * Coordinates are stored relative to the path's own bounding box, so the widget
+ * behaves like every other one: a texture with a position, free to be moved,
+ * scaled and rotated by the timeline.
+ */
+typedef struct {
+    WidgetBase base;         /* base.kind = WIDGET_PATH */
+
+    PathSeg *segs;
+    size_t   seg_count, seg_cap;
+
+    float    width;          /* stroke width; 0 → fill only */
+    Color    color;          /* stroke colour  */
+    Color    fill_color;
+    bool     filled;
+    bool     closed;
+    int      cap, join;      /* 0 = butt/miter, 1 = round, 2 = square/bevel */
+} PathWidget;
 
 /* A raster image (PNG/JPG), loaded with stb_image. */
 typedef struct {
@@ -318,8 +456,30 @@ typedef enum {
     ACTION_TYPEWRITE,  /* characters appearing one by one     */
     ACTION_SCALE,      /* value → target scale (1.0 = original)       */
     ACTION_ROTATE,     /* value → target angle in degrees     */
-    ACTION_HIGHLIGHT
+    ACTION_HIGHLIGHT,
+    ACTION_ORBIT,      /* position swept around a centre — see the orbit_* fields */
+    ACTION_EMIT,       /* one particle: ballistic motion + a lifetime */
+    ACTION_ANIMATE     /* a keyframe track on any named property */
 } ActionType;
+
+/*
+ * The property an `animate` event drives.
+ *
+ * Having one action able to address every property is what removes the older
+ * awkwardness: `scale` and `rotate` were separate actions carrying a single
+ * tween each, so two overlapping scales on one object fought, and a property
+ * without its own action (a bar's height) had no way to be animated at all.
+ */
+typedef enum {
+    PROP_NONE = 0,
+    PROP_X, PROP_Y,
+    PROP_OPACITY,
+    PROP_SCALE,
+    PROP_ROTATION,   /* degrees in the JSON, radians inside */
+    PROP_W, PROP_H,
+    PROP_TINT,
+    PROP_TRIM
+} AnimProp;
 
 /* Per-event easing — see anim.h. */
 
@@ -329,10 +489,60 @@ typedef struct {
     ActionType action;
     char      *target_id;    /* the widget id exactly as written in the JSON  */
     int        target_index; /* resolved SCENE-LOCAL index; -1 if not found        */
+    int        target_group; /* resolved group index, or -1 — targets are either  */
     float      value;        /* generic scalar (scale, rotate, …)             */
     float      value_x;      /* MOVE delta on X                               */
     float      value_y;      /* MOVE delta on Y                               */
     EaseType   ease;         /* "ease": "backout" — defaults to EASE_SMOOTH   */
+
+    /* HIGHLIGHT: an inclusive line range and the band's colour. Lines are
+     * 1-based in the JSON, as an editor shows them; stored 0-based. */
+    int        hl_from, hl_to;
+    Color      hl_color;
+
+    /*
+     * ORBIT: the object's centre is swept along a circle (or a spiral, when the
+     * two radii differ).
+     *
+     * This exists because `rotate` spins an object about its *own* centre,
+     * which is a different thing entirely — expressing circular travel with it
+     * is impossible, and the alternative was a polyline of keyframes
+     * approximating the arc. The centre is stored in pixels: the JSON may write
+     * it as a layout expression ("center", "50%+40"), which is resolved during
+     * parsing, since it depends on the canvas rather than on the object.
+     *
+     * Angles are degrees. 0° points right (+x); because y grows downwards, a
+     * positive sweep reads as clockwise on screen.
+     */
+    /*
+     * EMIT: one particle's flight, evaluated in closed form.
+     *
+     * Generated by an `emitter` block, never written by hand. Storing velocity
+     * rather than keyframes is what keeps a 700-particle burst cheap: the
+     * position at any instant is p0 + v·t + ½g·t², so a particle needs no
+     * keyframe array and any frame can still be rendered on its own.
+     */
+    /*
+     * ANIMATE: a keyframe track and the property it drives.
+     *
+     * Key times are seconds *from the event's start*, and values are absolute.
+     * Absolute rather than relative is the point: two overlapping tracks on one
+     * property no longer accumulate into something neither author intended —
+     * the later event simply wins, the same rule fade and scale already follow.
+     */
+    AnimProp   anim_prop;
+    Track      anim_track;
+    bool       has_keys;
+
+    float      emit_vx, emit_vy;      /* px per second                         */
+    float      emit_gravity;          /* px per second², downward              */
+    float      emit_fade;             /* fraction of the life spent fading out */
+    float      emit_spin;             /* degrees per second                    */
+
+    float      orbit_cx, orbit_cy;    /* centre, in pixels                     */
+    float      orbit_r0, orbit_r1;    /* start and end radius (equal = circle)  */
+    float      orbit_a0, orbit_sweep; /* start angle and total travel, degrees  */
+    bool       orbit_orient;          /* also turn the object along the tangent */
 } TimelineEvent;
 
 /*
@@ -355,6 +565,23 @@ typedef struct {
      */
     float reveal;
     bool  visible;
+
+    /*
+     * HIGHLIGHT: a band drawn behind a range of lines, the way an editor marks
+     * the current line. `hl_alpha` 0 means no band — which is the state of
+     * every widget that has no highlight event, so the extra layer costs
+     * nothing when unused.
+     */
+    int   hl_from, hl_to;    /* inclusive, 0-based line indices */
+    float hl_alpha;
+    Color hl_color;
+
+    /* Destination size for this frame, before `scale` is applied. */
+    float w, h;
+
+    /* Tint strength 0..1, and the colour to blend toward. */
+    float tint;
+    Color tint_color;
 } WidgetRuntime;
 
 /* ------------------------------------------------------------------------- */
@@ -392,6 +619,39 @@ typedef struct {
  * contiguous span of `ctx->widgets` that belongs to it. Contiguity is
  * guaranteed by z_order increasing globally across scenes.
  */
+/*
+ * A parent transform shared by several objects.
+ *
+ * Groups are not a container: widgets stay in one flat array and merely record
+ * which group they belong to. That keeps the renderer's iteration, z-ordering
+ * and scene-slicing exactly as they were, while still letting one `rotate`
+ * drive sixty-four children.
+ *
+ * The pivot is a point on the canvas, resolved during parsing like an orbit
+ * centre — a group has no size of its own to derive one from.
+ */
+typedef struct {
+    char  *id;
+    float  pivot_x, pivot_y;
+} GroupDef;
+
+/* Per-frame state of one group. Composed onto every member. */
+typedef struct {
+    float x, y;        /* translation, pixels                */
+    float scale;
+    float rotation;    /* radians                            */
+    float opacity;     /* multiplies each member's own       */
+} GroupRuntime;
+
+/*
+ * Upper bound on groups per scene.
+ *
+ * A fixed array keeps vr_evaluate_scene allocation-free — it runs per frame and
+ * has no arena of its own. Sixty-four is far past any sane hand-authored scene;
+ * the parser rejects more with a clear message rather than overflowing.
+ */
+#define VR_MAX_GROUPS 64
+
 typedef struct {
     char          *id;
     int            duration_ms;
@@ -402,6 +662,9 @@ typedef struct {
 
     TimelineEvent *events;        /* scene-local; target_index is local too   */
     size_t         event_count, event_cap;
+
+    GroupDef      *groups;        /* scene-local, like everything else here    */
+    size_t         group_count, group_cap;
 
     Color          bg_color;
     bool           has_bg;
@@ -495,6 +758,12 @@ typedef struct {
 
     ShapeWidget   *shapes;
     size_t         shape_count, shape_cap;
+
+    LineWidget    *lines;
+    size_t         line_count, line_cap;
+
+    PathWidget    *paths;
+    size_t         path_count, path_cap;
 
     /* Post-processing stack — applied to the whole frame, in order. */
     struct Effect *effects;

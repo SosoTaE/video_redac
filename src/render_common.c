@@ -87,6 +87,8 @@ void vr_evaluate_scene(const EditorContext *ctx, const Scene *scene,
         rt[i].rotation = b->has_track_rotation
                              ? track_sample(&b->tr_rotation, t_sec) * (float)(M_PI / 180.0)
                              : 0.0f;
+        /* A line's own angle; zero for everything else. */
+        rt[i].rotation += b->base_rotation;
 
         if (b->has_track_opacity) {
             rt[i].opacity = track_sample(&b->tr_opacity, t_sec);
@@ -94,14 +96,127 @@ void vr_evaluate_scene(const EditorContext *ctx, const Scene *scene,
             /* With a fade_in the widget starts invisible; otherwise visible from t=0. */
             rt[i].opacity = widget_has_action(scene, (int)i, ACTION_FADE_IN) ? 0.0f : 1.0f;
         }
-        rt[i].reveal = widget_has_action(scene, (int)i, ACTION_TYPEWRITE) ? 0.0f : 1.0f;
+        /*
+         * `reveal` doubles as a line's `trim`: both mean "show this fraction of
+         * the content", and for a line rasterized along +x the compositor's
+         * cutoff already does the right thing.
+         */
+        if (b->has_track_trim) {
+            rt[i].reveal = track_sample(&b->tr_trim, t_sec);
+        } else {
+            rt[i].reveal = widget_has_action(scene, (int)i, ACTION_TYPEWRITE) ? 0.0f : 1.0f;
+        }
+
+        /*
+         * Destination size. Untracked, it is the object's own size and the
+         * precomputed anchor offset applies unchanged — which is what keeps
+         * every existing project byte-for-byte identical.
+         *
+         * Tracked, the anchor has to be recomputed from the *current* size, or
+         * a bar with "anchor": "bottom" would slide as it grew instead of
+         * rising from a fixed baseline.
+         */
+        rt[i].w = b->has_track_w ? track_sample(&b->tr_w, t_sec) : b->base_w;
+        rt[i].h = b->has_track_h ? track_sample(&b->tr_h, t_sec) : b->base_h;
+        if (rt[i].w < 0.0f) rt[i].w = 0.0f;
+        if (rt[i].h < 0.0f) rt[i].h = 0.0f;
+
+        if (b->has_track_w && !b->auto_center_x) {
+            rt[i].x += b->anchor_off_x - b->anchor_x * rt[i].w;
+        }
+        if (b->has_track_h) {
+            rt[i].y += b->anchor_off_y - b->anchor_y * rt[i].h;
+        }
+
+        rt[i].tint       = b->has_track_tint ? track_sample(&b->tr_tint, t_sec) : 0.0f;
+        rt[i].tint_color = b->tint_color;
+
+        /* No band unless a highlight event says otherwise. */
+        rt[i].hl_alpha = 0.0f;
+        rt[i].hl_from  = 0;
+        rt[i].hl_to    = 0;
+    }
+
+    /*
+     * --- pass 1: group transforms -----------------------------------------
+     *
+     * Groups are resolved before their members so a member's own animation can
+     * be layered on top of the parent's rather than fighting it. Events are
+     * read twice, which is cheaper than it looks: a scene has a handful of
+     * events, and the alternative is a second pointer array per frame.
+     */
+    GroupRuntime gr[VR_MAX_GROUPS];
+    size_t       ngroups = (scene->group_count < VR_MAX_GROUPS)
+                               ? scene->group_count : VR_MAX_GROUPS;
+
+    for (size_t g = 0; g < ngroups; g++) {
+        gr[g].x = gr[g].y = 0.0f;
+        gr[g].scale       = 1.0f;
+        gr[g].rotation    = 0.0f;
+        gr[g].opacity     = 1.0f;
     }
 
     for (size_t e = 0; e < scene->event_count; e++) {
         const TimelineEvent *ev = &scene->events[e];
+        if (ev->target_group < 0 || (size_t)ev->target_group >= ngroups) {
+            continue;
+        }
+
+        int ev_ms = local_ms - ev->time_ms;
+        if (ev_ms < 0) {
+            continue;
+        }
+        float p = (ev->duration_ms > 0)
+                      ? vr_clampf((float)ev_ms / (float)ev->duration_ms, 0.0f, 1.0f)
+                      : 1.0f;
+        float eased = easing_apply(ev->ease, p);
+
+        GroupRuntime *g = &gr[ev->target_group];
+
+        switch (ev->action) {
+            case ACTION_FADE_IN:  g->opacity  = eased;                     break;
+            case ACTION_FADE_OUT: g->opacity  = 1.0f - eased;              break;
+            case ACTION_MOVE:     g->x       += ev->value_x * eased;
+                                  g->y       += ev->value_y * eased;       break;
+            case ACTION_SCALE:    g->scale    = 1.0f + (ev->value - 1.0f) * eased; break;
+            case ACTION_ROTATE:   g->rotation = ev->value * eased * (float)(M_PI / 180.0); break;
+            case ACTION_ANIMATE: {
+                if (!ev->has_keys) {
+                    break;
+                }
+                float v = track_sample(&ev->anim_track, (float)ev_ms * 0.001f);
+                switch (ev->anim_prop) {
+                    case PROP_X:        g->x        = v; break;
+                    case PROP_Y:        g->y        = v; break;
+                    case PROP_OPACITY:  g->opacity  = v; break;
+                    case PROP_SCALE:    g->scale    = v; break;
+                    case PROP_ROTATION: g->rotation = v * (float)(M_PI / 180.0); break;
+                    default:            break;   /* size and tint are per-object */
+                }
+                break;
+            }
+
+            case ACTION_ORBIT: {
+                /* A group has no size, so its centre *is* the orbit point. */
+                float ang = (ev->orbit_a0 + ev->orbit_sweep * eased) * (float)(M_PI / 180.0);
+                float rad = ev->orbit_r0 + (ev->orbit_r1 - ev->orbit_r0) * eased;
+                g->x = ev->orbit_cx + rad * cosf(ang) - scene->groups[ev->target_group].pivot_x;
+                g->y = ev->orbit_cy + rad * sinf(ang) - scene->groups[ev->target_group].pivot_y;
+                if (ev->orbit_orient) {
+                    g->rotation = ang + (float)(M_PI * 0.5);
+                }
+                break;
+            }
+            default: break;   /* typewrite/highlight are per-object concepts */
+        }
+    }
+
+    /* --- pass 2: per-object events ---------------------------------------- */
+    for (size_t e = 0; e < scene->event_count; e++) {
+        const TimelineEvent *ev = &scene->events[e];
 
         if (ev->target_index < 0 || (size_t)ev->target_index >= scene->widget_count) {
-            continue; /* unresolved target or unknown action */
+            continue; /* unresolved target, a group event, or an unknown action */
         }
 
         int ev_ms = local_ms - ev->time_ms;
@@ -139,11 +254,153 @@ void vr_evaluate_scene(const EditorContext *ctx, const Scene *scene,
             case ACTION_ROTATE:
                 r->rotation = ev->value * eased * (float)(M_PI / 180.0);
                 break;
+            case ACTION_ORBIT: {
+                /*
+                 * Circular (or spiral) travel, evaluated in closed form.
+                 *
+                 * This is the whole reason the action exists: the same motion
+                 * expressed as keyframes is a polygon, and a smooth-looking one
+                 * costs dozens of keys per revolution. Here it is exact at every
+                 * timestamp, and costs one sin and one cos.
+                 */
+                float ang = (ev->orbit_a0 + ev->orbit_sweep * eased) * (float)(M_PI / 180.0);
+                float rad = ev->orbit_r0 + (ev->orbit_r1 - ev->orbit_r0) * eased;
+
+                /*
+                 * `rt->x` is the object's top-left, so the half-size is taken
+                 * off to put its *centre* on the orbit — which is what "this
+                 * object goes round that point" has to mean.
+                 */
+                const WidgetBase *ob = ctx->widgets[scene->first_widget + ev->target_index];
+                r->x = ev->orbit_cx + rad * cosf(ang) - ob->base_w * 0.5f;
+                r->y = ev->orbit_cy + rad * sinf(ang) - ob->base_h * 0.5f;
+
+                /* Optionally turn the object to face along its direction of
+                 * travel — the tangent, a quarter turn ahead of the radius. */
+                if (ev->orbit_orient) {
+                    r->rotation = ang + (float)(M_PI * 0.5);
+                }
+                break;
+            }
+
+            case ACTION_ANIMATE: {
+                /*
+                 * A track sampled at the event's own local time, assigned
+                 * absolutely. Past the end the last key holds — an animation
+                 * that finishes should stay where it finished, not snap back.
+                 */
+                if (!ev->has_keys) {
+                    break;
+                }
+                float v = track_sample(&ev->anim_track, (float)ev_ms * 0.001f);
+
+                switch (ev->anim_prop) {
+                    case PROP_X:        r->x        = v; break;
+                    case PROP_Y:        r->y        = v; break;
+                    case PROP_OPACITY:  r->opacity  = v; break;
+                    case PROP_SCALE:    r->scale    = v; break;
+                    case PROP_ROTATION: r->rotation = v * (float)(M_PI / 180.0); break;
+                    case PROP_W:        r->w        = v; break;
+                    case PROP_H:        r->h        = v; break;
+                    case PROP_TINT:     r->tint     = v; break;
+                    case PROP_TRIM:     r->reveal   = v; break;
+                    case PROP_NONE:
+                    default:            break;
+                }
+                break;
+            }
+
+            case ACTION_EMIT: {
+                /*
+                 * A particle's whole life, in closed form.
+                 *
+                 * `p` is already clamped to [0,1] over the lifetime, so the
+                 * elapsed seconds come from the event's duration rather than
+                 * from p — a particle must stop at its end, not keep coasting.
+                 */
+                float dt = (float)ev_ms * 0.001f;
+                r->x += ev->emit_vx * dt;
+                r->y += ev->emit_vy * dt + 0.5f * ev->emit_gravity * dt * dt;
+
+                if (ev->emit_spin != 0.0f) {
+                    r->rotation += ev->emit_spin * dt * (float)(M_PI / 180.0);
+                }
+
+                /*
+                 * Alpha over the life: a quick rise, then a fade whose length
+                 * is `fade`. Past the end the particle is gone — otherwise a
+                 * burst would leave its debris frozen on screen for ever.
+                 */
+                float fade = vr_clampf(ev->emit_fade, 0.0f, 1.0f);
+                float a;
+                if (p >= 1.0f) {
+                    a = 0.0f;
+                } else if (p < 0.06f) {
+                    a = p / 0.06f;
+                } else if (fade > 0.0f && p > 1.0f - fade) {
+                    a = (1.0f - p) / fade;
+                } else {
+                    a = 1.0f;
+                }
+                r->opacity *= a;
+                break;
+            }
+
             case ACTION_HIGHLIGHT:
+                /*
+                 * The band fades in over the event's duration and then stays.
+                 * A later highlight on the same widget simply replaces this one
+                 * — the same "last event wins" rule fade and scale follow.
+                 */
+                r->hl_from  = ev->hl_from;
+                r->hl_to    = ev->hl_to;
+                r->hl_color = ev->hl_color;
+                r->hl_alpha = (float)ev->hl_color.a / 255.0f * eased;
+                break;
+
             case ACTION_UNKNOWN:
             default:
                 break;
         }
+    }
+
+    /*
+     * --- composing the parent transform ------------------------------------
+     *
+     * The member's centre is taken through the group's scale and rotation about
+     * the pivot, then translated. Working on the centre rather than the
+     * top-left is what makes a rotating group turn as a rigid body instead of
+     * shearing: every child keeps its offset from the pivot.
+     *
+     * Scale and rotation are *composed* with the member's own (multiplied and
+     * added), so a spinning child inside a spinning group does both.
+     */
+    for (size_t i = 0; i < scene->widget_count; i++) {
+        const WidgetBase *b = ctx->widgets[scene->first_widget + i];
+        if (b->group_index < 0 || (size_t)b->group_index >= ngroups) {
+            continue;
+        }
+        const GroupRuntime *g  = &gr[b->group_index];
+        const GroupDef     *gd = &scene->groups[b->group_index];
+
+        float cx = rt[i].x + rt[i].w * 0.5f;
+        float cy = rt[i].y + rt[i].h * 0.5f;
+
+        float dx = (cx - gd->pivot_x) * g->scale;
+        float dy = (cy - gd->pivot_y) * g->scale;
+
+        float cs = cosf(g->rotation), sn = sinf(g->rotation);
+        float rx = dx * cs - dy * sn;
+        float ry = dx * sn + dy * cs;
+
+        cx = gd->pivot_x + rx + g->x;
+        cy = gd->pivot_y + ry + g->y;
+
+        rt[i].x        = cx - rt[i].w * 0.5f;
+        rt[i].y        = cy - rt[i].h * 0.5f;
+        rt[i].scale   *= g->scale;
+        rt[i].rotation += g->rotation;
+        rt[i].opacity *= g->opacity;
     }
 
     for (size_t i = 0; i < scene->widget_count; i++) {
@@ -245,9 +502,9 @@ bool vr_composite_setup(int fb_w, int fb_h, int tex_w, int tex_h,
         return false;
     }
 
-    /* Destination size: the base size × the animated scale. */
-    float dst_w = b->base_w * rt->scale;
-    float dst_h = b->base_h * rt->scale;
+    /* Destination size: the (possibly animated) size × the animated scale. */
+    float dst_w = rt->w * rt->scale;
+    float dst_h = rt->h * rt->scale;
     if (dst_w < 0.5f || dst_h < 0.5f) {
         return false;
     }
@@ -260,8 +517,8 @@ bool vr_composite_setup(int fb_w, int fb_h, int tex_w, int tex_h,
      * top-left corner and drift down and to the right — a centred title would
      * visibly slide off centre.
      */
-    float cx = rt->x + b->base_w * 0.5f;
-    float cy = rt->y + b->base_h * 0.5f;
+    float cx = rt->x + rt->w * 0.5f;
+    float cy = rt->y + rt->h * 0.5f;
 
     float cs = cosf(rt->rotation);
     float sn = sinf(rt->rotation);
@@ -310,10 +567,61 @@ bool vr_composite_setup(int fb_w, int fb_h, int tex_w, int tex_h,
     out->bb_h  = y1 - y0;
     out->alpha = rt->opacity;
 
+    const float inv255 = 1.0f / 255.0f;
+    out->tint_amount = vr_clampf(rt->tint, 0.0f, 1.0f);
+    out->tint_r      = rt->tint_color.r * inv255;
+    out->tint_g      = rt->tint_color.g * inv255;
+    out->tint_b      = rt->tint_color.b * inv255;
+
     out->pad_y       = b->glyphs.pad_y;
     out->line_height = (b->glyphs.line_height > 0.0f) ? b->glyphs.line_height : 1.0f;
     out->line_count  = b->glyphs.line_count;
     return true;
+}
+
+bool vr_highlight_setup(const CompositeParams *geom, const WidgetBase *b,
+                        const WidgetRuntime *rt, HighlightParams *out)
+{
+    if (rt->hl_alpha <= 0.002f || b->glyphs.line_count <= 0) {
+        return false;
+    }
+
+    int last = b->glyphs.line_count - 1;
+    if (rt->hl_from > last) {
+        return false; /* the range starts past the end of the text */
+    }
+
+    out->geom       = *geom;
+    out->first_line = (rt->hl_from < 0) ? 0 : rt->hl_from;
+    out->last_line  = (rt->hl_to > last) ? last : rt->hl_to;
+
+    /* The panel doubles as the band's stencil — see HighlightParams. */
+    out->plate_w = 0;
+    out->plate_h = 0;
+    if (b->kind == WIDGET_CODE) {
+        const CodeWidget *cw = (const CodeWidget *)b;
+        out->plate_w = cw->plate.width;
+        out->plate_h = cw->plate.height;
+    }
+
+    const float inv = 1.0f / 255.0f;
+    out->r = rt->hl_color.r * inv;
+    out->g = rt->hl_color.g * inv;
+    out->b = rt->hl_color.b * inv;
+
+    /*
+     * The band's own alpha is folded together with the widget's fade, so a code
+     * block fading out takes its highlight with it instead of leaving a
+     * coloured rectangle hanging in mid-air.
+     */
+    out->alpha = rt->hl_alpha * rt->opacity;
+
+    /* Premultiply, matching the convention every other layer follows. */
+    out->r *= out->alpha;
+    out->g *= out->alpha;
+    out->b *= out->alpha;
+
+    return out->last_line >= out->first_line;
 }
 
 /* ------------------------------------------------------------------------- */

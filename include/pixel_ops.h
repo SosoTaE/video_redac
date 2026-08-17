@@ -665,10 +665,128 @@ typedef struct {
 
     float alpha;
 
+    /*
+     * Tint: blend the layer's colour toward (tint_r, tint_g, tint_b) by
+     * `tint_amount`. 0 is the overwhelmingly common case and costs one
+     * comparison.
+     */
+    float tint_amount;
+    float tint_r, tint_g, tint_b;
+
     /* TYPEWRITE: line geometry in texture space. */
     float pad_y, line_height;
     int   line_count;
 } CompositeParams;
+
+/*
+ * A highlight band: a filled rectangle covering a range of text lines, drawn
+ * behind the glyphs the way an editor marks the current line.
+ *
+ * It reuses `CompositeParams` verbatim rather than carrying its own geometry.
+ * That is the whole point: the band is back-projected through exactly the same
+ * inverse matrix as the text it sits behind, so it inherits the widget's
+ * position, scale and rotation for free and can never drift out of alignment
+ * with the lines it is marking.
+ */
+typedef struct {
+    CompositeParams geom;     /* the owning widget's transform */
+    float           r, g, b;  /* 0..1, premultiplied by `alpha` */
+    float           alpha;    /* 0 → nothing to draw */
+    int             first_line, last_line; /* inclusive, 0-based */
+
+    /*
+     * The code block's panel, used purely as a stencil.
+     *
+     * A band is a rectangle in texture space, but the panel behind it has
+     * rounded corners — so on the first and last line the band's square corners
+     * poke out past the panel and the whole thing looks broken. Multiplying the
+     * band's coverage by the panel's own alpha clips it to whatever shape the
+     * panel actually has, corners included, for the cost of one texture read.
+     *
+     * NULL for plain text, which has no panel and should fill its line box.
+     */
+    int plate_w, plate_h;
+} HighlightParams;
+
+/*
+ * One pixel of the band. (i,j) indexes the widget's destination bounding box,
+ * the same as vr_px_composite. `plate` may be NULL — see HighlightParams.
+ */
+VR_PIX void vr_px_highlight(uchar4 *VR_RESTRICT fb, const uchar4 *VR_RESTRICT plate,
+                            const HighlightParams *p, int i, int j)
+{
+    const CompositeParams *g = &p->geom;
+
+    int gx = g->bb_x + i;
+    int gy = g->bb_y + j;
+
+    if (gx < 0 || gx >= g->fb_w || gy < 0 || gy >= g->fb_h) {
+        return;
+    }
+
+    /* Back-project into texture space — identical to the compositor. */
+    float dx = (float)gx + 0.5f - g->cx;
+    float dy = (float)gy + 0.5f - g->cy;
+
+    float tx = g->inv_a * dx + g->inv_b * dy;
+    float ty = g->inv_c * dx + g->inv_d * dy;
+
+    float u = tx + (float)g->tex_w * 0.5f;
+    float v = ty + (float)g->tex_h * 0.5f;
+
+    if (u < 0.0f || u >= (float)g->tex_w || v < 0.0f || v >= (float)g->tex_h) {
+        return;
+    }
+
+    /* Is this row inside the marked lines? */
+    float top    = g->pad_y + (float)p->first_line * g->line_height;
+    float bottom = g->pad_y + (float)(p->last_line + 1) * g->line_height;
+    if (v < top || v >= bottom) {
+        return;
+    }
+
+    float a = vr_sat(p->alpha);
+    float r = p->r, gg = p->g, bb = p->b;
+
+    /*
+     * Clip to the panel's shape. Both textures are composited onto the same
+     * destination rectangle, so normalised coordinates carry across even when
+     * their pixel dimensions differ.
+     */
+    if (plate != NULL && p->plate_w > 0 && p->plate_h > 0) {
+        float pu = u / (float)g->tex_w * (float)p->plate_w;
+        float pv = v / (float)g->tex_h * (float)p->plate_h;
+
+        float cov = vr_sample_bilinear(plate, p->plate_w, p->plate_h, pu, pv).w;
+        a  *= cov;
+        r  *= cov;   /* the colour is premultiplied, so it scales too */
+        gg *= cov;
+        bb *= cov;
+    }
+
+    if (a <= 0.0f) {
+        return;
+    }
+
+    /*
+     * Source-over with a premultiplied source: dst = src + dst*(1-a).
+     *
+     * `p->r/g/b` already carry the alpha (vr_highlight_setup premultiplies
+     * them), so they must NOT be scaled by `a` a second time here — doing that
+     * squares the alpha on the colour while leaving the coverage alone, and the
+     * band comes out several times too dim to see.
+     */
+    size_t idx = (size_t)gy * g->fb_w + gx;
+    uchar4 d   = fb[idx];
+
+    const float inv = 1.0f / 255.0f;
+    float       ia  = 1.0f - a;
+
+    fb[idx] = make_uchar4(vr_u8(r  + (float)d.x * inv * ia),
+                          vr_u8(gg + (float)d.y * inv * ia),
+                          vr_u8(bb + (float)d.z * inv * ia),
+                          vr_u8(a  + (float)d.w * inv * ia));
+}
 
 /*
  * Composites one texture pixel onto the frame, with scale and rotation.
@@ -725,6 +843,21 @@ VR_PIX void vr_px_composite(uchar4 *VR_RESTRICT fb,
     }
 
     float4 src = vr_sample_bilinear(tex, p->tex_w, p->tex_h, u, v);
+
+    /*
+     * Tint, before the fade is applied.
+     *
+     * The sample is premultiplied, so the target colour has to be multiplied by
+     * the sample's own alpha before mixing — otherwise a tint would light up
+     * the transparent area around a glyph and the text would gain a coloured
+     * box.
+     */
+    if (p->tint_amount > 0.0f) {
+        float t = p->tint_amount;
+        src.x += (p->tint_r * src.w - src.x) * t;
+        src.y += (p->tint_g * src.w - src.y) * t;
+        src.z += (p->tint_b * src.w - src.z) * t;
+    }
 
     src.x *= p->alpha;
     src.y *= p->alpha;

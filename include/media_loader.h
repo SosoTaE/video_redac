@@ -49,6 +49,13 @@ bool media_render_code_widget(CodeWidget *w);
 /* Rectangle / circle → an antialiased RGBA texture. */
 bool media_render_shape_widget(ShapeWidget *w);
 
+/* Rasterizes a straight segment horizontally; the angle is applied by the
+ * compositor via base_rotation. */
+bool media_render_line_widget(LineWidget *w);
+
+/* Rasterizes a polyline/bezier path into its own bounding box. */
+bool media_render_path_widget(PathWidget *w);
+
 /* PNG/JPG → premultiplied RGBA8 (stb_image). */
 bool media_load_image_rgba(const char *path, Texture *out);
 

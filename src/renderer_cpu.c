@@ -375,6 +375,25 @@ static void render_scene_into(const EditorContext *ctx, CpuResources *res,
             composite_layer(res, target, &cw->plate, b, r, NULL);
         }
 
+        /* 2a'. The highlight band — above the panel, below the glyphs. */
+        CompositeParams hp;
+        if (vr_composite_setup(res->width, res->height, b->tex.width, b->tex.height,
+                               b, r, &hp)) {
+            HighlightParams hl;
+            if (vr_highlight_setup(&hp, b, r, &hl)) {
+                const uchar4 *plate = (b->kind == WIDGET_CODE)
+                    ? (const uchar4 *)((const CodeWidget *)b)->plate.pixels : NULL;
+
+                /* bx/by, not i/j — `i` is the enclosing widget index. */
+                #pragma omp parallel for schedule(static)
+                for (int by = 0; by < hl.geom.bb_h; by++) {
+                    for (int bx = 0; bx < hl.geom.bb_w; bx++) {
+                        vr_px_highlight(target, plate, &hl, bx, by);
+                    }
+                }
+            }
+        }
+
         /* 2b. Typewriter cutoffs (only when the text is partly visible).
          *
          * Unlike the GPU path there is no upload and no need to keep several
