@@ -243,7 +243,73 @@ typedef struct {
     float p[FXP_MAX];
     float ca[4];   /* color_a 0..1 */
     float cb[4];   /* color_b 0..1 */
+    int   lut_size;   /* FX_LUT: edge length of the cube; 0 = no table */
 } EffectGPU;
+
+/*
+ * Trilinear lookup in a 3D colour cube.
+ *
+ * The table maps a colour to a colour: it is the whole of a "look" — the film
+ * emulation, the show LUT, the thing a colourist hands over — reduced to a
+ * lattice that any program can read. Interpolating between its entries is what
+ * makes a 33-cube enough for sixteen million colours.
+ *
+ * Trilinear rather than tetrahedral. Tetrahedral is the better interpolation
+ * and what grading tools use, because it follows the cube's diagonal — the grey
+ * axis — exactly, where trilinear drifts slightly off it and can tint a neutral.
+ * The drift is well under a code value for the smooth tables that make up
+ * nearly every real .cube, and trilinear is eight taps of straightforward
+ * arithmetic against a barycentric case analysis. If a LUT ever visibly tints
+ * greys here, that is the thing to change.
+ *
+ * The input is clamped, not wrapped: a colour outside 0..1 has no entry, and
+ * the nearest edge of the cube is the only defensible answer.
+ */
+VR_PIX float3 vr_fx_lut3(const float *VR_RESTRICT lut, int n, float3 c)
+{
+    float fn = (float)(n - 1);
+    float r = vr_sat(c.x) * fn;
+    float g = vr_sat(c.y) * fn;
+    float b = vr_sat(c.z) * fn;
+
+    int r0 = (int)r, g0 = (int)g, b0 = (int)b;
+    if (r0 > n - 2) r0 = (n > 1) ? n - 2 : 0;
+    if (g0 > n - 2) g0 = (n > 1) ? n - 2 : 0;
+    if (b0 > n - 2) b0 = (n > 1) ? n - 2 : 0;
+    int r1 = r0 + 1, g1 = g0 + 1, b1 = b0 + 1;
+
+    float fr = r - (float)r0, fg = g - (float)g0, fb = b - (float)b0;
+
+    /* Red varies fastest — the order .cube stores and lut.c preserves. */
+    #define VR_LUT_AT(ri, gi, bi) \
+        (&lut[(((size_t)(bi) * n + (size_t)(gi)) * n + (size_t)(ri)) * 3])
+
+    const float *c000 = VR_LUT_AT(r0, g0, b0);
+    const float *c100 = VR_LUT_AT(r1, g0, b0);
+    const float *c010 = VR_LUT_AT(r0, g1, b0);
+    const float *c110 = VR_LUT_AT(r1, g1, b0);
+    const float *c001 = VR_LUT_AT(r0, g0, b1);
+    const float *c101 = VR_LUT_AT(r1, g0, b1);
+    const float *c011 = VR_LUT_AT(r0, g1, b1);
+    const float *c111 = VR_LUT_AT(r1, g1, b1);
+    #undef VR_LUT_AT
+
+    float3 o;
+    /* Three nested lerps, unrolled over the channels. */
+    o.x = ((c000[0] * (1 - fr) + c100[0] * fr) * (1 - fg)
+         + (c010[0] * (1 - fr) + c110[0] * fr) * fg) * (1 - fb)
+        + ((c001[0] * (1 - fr) + c101[0] * fr) * (1 - fg)
+         + (c011[0] * (1 - fr) + c111[0] * fr) * fg) * fb;
+    o.y = ((c000[1] * (1 - fr) + c100[1] * fr) * (1 - fg)
+         + (c010[1] * (1 - fr) + c110[1] * fr) * fg) * (1 - fb)
+        + ((c001[1] * (1 - fr) + c101[1] * fr) * (1 - fg)
+         + (c011[1] * (1 - fr) + c111[1] * fr) * fg) * fb;
+    o.z = ((c000[2] * (1 - fr) + c100[2] * fr) * (1 - fg)
+         + (c010[2] * (1 - fr) + c110[2] * fr) * fg) * (1 - fb)
+        + ((c001[2] * (1 - fr) + c101[2] * fr) * (1 - fg)
+         + (c011[2] * (1 - fr) + c111[2] * fr) * fg) * fb;
+    return o;
+}
 
 VR_PIX float3 vr_fx_load(uchar4 c)
 {
@@ -286,9 +352,19 @@ VR_PIX float vr_fx_hash(unsigned int x)
 
 /* Evaluates one effect for one pixel (no neighbour reads). */
 VR_PIX float3 vr_fx_apply_point(float3 c, const EffectGPU *fx,
+                                const float *VR_RESTRICT lut,
                                 int x, int y, int w, int h, unsigned int seed)
 {
     switch (fx->type) {
+        case FX_LUT: {
+            if (lut == NULL || fx->lut_size < 2) {
+                return c;
+            }
+            /* `amount` mixes back toward the original, which is how a look is
+             * dialled down — the same control a grading tool calls opacity. */
+            return vr_fx_mix(c, vr_fx_lut3(lut, fx->lut_size, c),
+                             vr_sat(fx->p[FXP_AMOUNT]));
+        }
         case FX_GRAYSCALE: {
             float a = vr_sat(fx->p[FXP_AMOUNT]);
             float l = vr_fx_luma(c);
@@ -437,12 +513,14 @@ VR_PIX float3 vr_fx_apply_point(float3 c, const EffectGPU *fx,
 
 /* One pixel of the pointwise pass — several effects share it. */
 VR_PIX void vr_px_fx_point(uchar4 *VR_RESTRICT dst, const uchar4 *VR_RESTRICT src,
-                           int w, int h, const EffectGPU *fx, unsigned int seed,
+                           int w, int h, const EffectGPU *fx,
+                           const float *VR_RESTRICT lut, unsigned int seed,
                            int x, int y)
 {
     size_t i = (size_t)y * w + x;
     uchar4 s = src[i];
-    dst[i]   = vr_fx_store(vr_fx_apply_point(vr_fx_load(s), fx, x, y, w, h, seed), s.w);
+    dst[i]   = vr_fx_store(vr_fx_apply_point(vr_fx_load(s), fx, lut,
+                                             x, y, w, h, seed), s.w);
 }
 
 /*
@@ -716,6 +794,24 @@ typedef struct {
     /* TYPEWRITE: line geometry in texture space. */
     float pad_y, line_height;
     int   line_count;
+
+    /*
+     * Chroma key: knock a background colour out of the layer.
+     *
+     * It lives in the compositor rather than in the effect stack because it is
+     * a property of *one layer*, not of the finished frame. A green screen is
+     * green in the clip and nowhere else; running it over the composite would
+     * key the same green out of everything behind it too.
+     *
+     * `key_dom` is which channel the key colour is strongest in, worked out on
+     * the host. Spill suppression needs it and it never changes per pixel.
+     */
+    int   key_on;
+    float key_r, key_g, key_b;   /* the colour to remove, 0..1 */
+    float key_tol;               /* chroma distance fully keyed out */
+    float key_soft;              /* width of the ramp beyond it     */
+    float key_spill;             /* 0 = leave the fringe, 1 = full  */
+    int   key_dom;               /* 0 = r, 1 = g, 2 = b             */
 } CompositeParams;
 
 /*
@@ -932,6 +1028,79 @@ VR_PIX void vr_px_composite(uchar4 *VR_RESTRICT fb,
     float4 src = vr_sample_bilinear(tex, p->tex_w, p->tex_h, u, v);
 
     /*
+     * Chroma key.
+     *
+     * The comparison is in the chroma plane only — brightness is discarded —
+     * because a lit backdrop is never one colour. The top of a green screen is
+     * pale green and the bottom is dark green, and a test on RGB distance keys
+     * one of them and leaves the other; the two differ almost entirely in
+     * luma, and hardly at all in Cb/Cr.
+     *
+     * The result is a coverage multiplier, so a partly-keyed pixel comes out
+     * partly transparent. That is what makes hair and motion blur survive: they
+     * are genuine blends of subject and backdrop, and a hard in/out test can
+     * only round them to one or the other.
+     */
+    if (p->key_on && src.w > 1e-4f) {
+        /* The sample is premultiplied; chroma is a property of the colour
+         * itself, so it has to be divided back out before measuring. */
+        float ia = 1.0f / src.w;
+        float cr = src.x * ia, cg = src.y * ia, cb = src.z * ia;
+
+        float ly = vr_fx_luma(make_float3(cr, cg, cb));
+        float lk = vr_fx_luma(make_float3(p->key_r, p->key_g, p->key_b));
+
+        /* BT.709 chroma axes, the same primaries as everything else here. */
+        float pcb = (cb - ly) * (1.0f / 1.8556f);
+        float pcr = (cr - ly) * (1.0f / 1.5748f);
+        float kcb = (p->key_b - lk) * (1.0f / 1.8556f);
+        float kcr = (p->key_r - lk) * (1.0f / 1.5748f);
+
+        float ddb = pcb - kcb, ddr = pcr - kcr;
+        float dist = sqrtf(ddb * ddb + ddr * ddr);
+
+        float cov;
+        if (dist <= p->key_tol) {
+            cov = 0.0f;
+        } else if (dist >= p->key_tol + p->key_soft) {
+            cov = 1.0f;
+        } else {
+            float t = (dist - p->key_tol) / p->key_soft;
+            cov = t * t * (3.0f - 2.0f * t);      /* smoothstep */
+        }
+
+        if (cov <= 0.0f) {
+            return;                                /* wholly background */
+        }
+
+        /*
+         * Spill suppression, on the partly-keyed fringe.
+         *
+         * A subject in front of a green screen is lit by green bounced off it,
+         * so its edges carry a green rim that no keying threshold removes — the
+         * rim is the subject's colour, merely tinted. Clamping the key's own
+         * channel to the average of the other two takes the tint out while
+         * leaving the pixel's brightness, which is why it reads as a fixed edge
+         * rather than a dark one.
+         */
+        if (p->key_spill > 0.0f) {
+            float ch[3] = { cr, cg, cb };
+            int   d0 = p->key_dom;
+            float other = (ch[(d0 + 1) % 3] + ch[(d0 + 2) % 3]) * 0.5f;
+            if (ch[d0] > other) {
+                ch[d0] += (other - ch[d0]) * p->key_spill;
+                cr = ch[0]; cg = ch[1]; cb = ch[2];
+            }
+        }
+
+        /* Back to premultiplied, with the keyed coverage folded in. */
+        src.w *= cov;
+        src.x = cr * src.w;
+        src.y = cg * src.w;
+        src.z = cb * src.w;
+    }
+
+    /*
      * Tint, before the fade is applied.
      *
      * The sample is premultiplied, so the target colour has to be multiplied by
@@ -1016,11 +1185,50 @@ typedef struct {
     float r, g, b;
 
     /*
-     * Per-vertex shading terms, for smooth (Gouraud) shading. Interpolating a
-     * scalar rather than a normal keeps the pixel loop to one multiply-add per
-     * vertex — the lighting itself was already resolved on the host.
+     * Per-vertex normals, in view space and pointing outward.
+     *
+     * The host used to resolve the lighting here and hand down a scalar per
+     * vertex, which is Gouraud shading: cheap, and wrong wherever the lighting
+     * varies faster than the mesh is subdivided. A specular highlight smaller
+     * than a triangle was the case that made it untenable — it landed on
+     * whichever vertices happened to catch it and came out a faceted lozenge.
+     *
+     * Interpolating the normal instead and lighting each pixel costs the inner
+     * loop a normalise and a short loop over the lights, and buys a highlight
+     * that is round on a coarse mesh — and the one thing a normal map cannot do
+     * without, since its whole purpose is to change the normal per pixel.
+     *
+     * Flat-shaded and normal-less meshes put the face normal in all three, so
+     * the interpolation is constant and the result is exactly flat shading.
      */
-    float l0, l1, l2;
+    float n0x, n0y, n0z;
+    float n1x, n1y, n1z;
+    float n2x, n2y, n2z;
+
+    /*
+     * Per-vertex tangents, also in view space: the direction along the surface
+     * in which the texture's u increases. With the normal they span the frame a
+     * tangent-space normal map is written in, and without them the map is just
+     * three unrelated numbers per texel.
+     *
+     * Only meaningful when the mesh carries a normal map; otherwise zero, and
+     * the rasterizer never looks.
+     */
+    float t0x, t0y, t0z;
+    float t1x, t1y, t1z;
+    float t2x, t2y, t2z;
+
+    /*
+     * Handedness of the tangent frame, +1 or -1, taken per triangle rather than
+     * per vertex.
+     *
+     * It cannot be interpolated: it is a sign, and halfway between +1 and -1 is
+     * zero, which is a bitangent of no length. The only place the three
+     * vertices disagree is a triangle straddling a mirrored UV seam, where the
+     * frame is genuinely discontinuous and no interpolation would have helped
+     * anyway.
+     */
+    float hand;
 
     /* Texture coordinates, already divided by view z so the interpolation is
      * perspective-correct; `wz` carries the reciprocals to undo it. */
@@ -1043,11 +1251,37 @@ typedef struct {
     float alpha;                    /* the widget's fade */
     int   blend;                    /* as in CompositeParams */
 
-    int   smooth;                   /* interpolate l0..l2 rather than use r,g,b flat */
     int   tex_w, tex_h;             /* 0 = untextured */
 
     float wire;                     /* half stroke width in px; 0 = filled     */
     int   aa;                       /* feather the outer silhouette by a pixel */
+    int   filter;                   /* 1 = bilinear, 0 = nearest texel         */
+
+    int   ao_w, ao_h;               /* occlusion map; 0 = none                 */
+    float ao_strength;              /* 0 = ignore the map, 1 = full            */
+
+    int   nrm_w, nrm_h;             /* tangent-space normal map; 0 = none      */
+    float normal_scale;             /* how far it may tilt the normal; 0 = off */
+
+    int   emis_w, emis_h;           /* emissive map; 0 = none                  */
+    float emis_r, emis_g, emis_b;   /* emissive colour, already premultiplied
+                                     * by its strength; all zero = off         */
+    /*
+     * The lighting environment, resolved once per mesh.
+     *
+     * Positions are already in view space, so the pixel loop never touches the
+     * camera matrix; and because the eye is the view origin, the direction to
+     * the viewer is just the negated surface position.
+     */
+    Light lights[VR_MAX_LIGHTS];
+    int   light_count;
+
+    float ambient;                  /* floor for surfaces facing away          */
+    float specular;                 /* 0 = matte                               */
+    float shininess;                /* Blinn-Phong exponent                    */
+    int   two_sided;                /* light both faces (cull off)             */
+
+    float ccx, ccy, focal;          /* to undo the projection, per pixel       */
 } MeshParams;
 
 /*
@@ -1064,6 +1298,91 @@ typedef struct {
  * The cost is O(triangles) per pixel, so this suits models of hundreds to a few
  * thousand faces rather than scanned assets.
  */
+/*
+ * Inverse-square falloff, softened so it never blows up at the source.
+ *
+ * `range` is where the light is down to half. Zero means no falloff, which is
+ * what a sun wants and what every scene written before this existed assumes.
+ */
+VR_PIX float vr_falloff(float dist, float range)
+{
+    if (range <= 0.0f) {
+        return 1.0f;
+    }
+    float t = dist / range;
+    return 1.0f / (1.0f + t * t);
+}
+
+/*
+ * The maps a mesh surface wears.
+ *
+ * A struct rather than a widening argument list because the material is a set
+ * that grows together: base colour today, occlusion now, and the same UVs will
+ * address a normal or emissive map next. Passing them as one value means the
+ * rasterizer's signature stops changing every time the set does — the dimensions
+ * ride along in MeshParams, and a null pointer is simply "this mesh has none".
+ */
+typedef struct {
+    const uchar4 *VR_RESTRICT base;   /* diffuse / albedo   */
+    const uchar4 *VR_RESTRICT ao;     /* ambient occlusion  */
+    const uchar4 *VR_RESTRICT nrm;    /* tangent-space normal */
+    const uchar4 *VR_RESTRICT emis;   /* emissive           */
+} MeshTextures;
+
+/*
+ * Bilinear sample for a mesh surface: u wraps, v clamps.
+ *
+ * The two axes are treated differently on purpose, because on the maps meshes
+ * actually wear they mean different things. An equirectangular texture's u is
+ * longitude, which is a circle — the left and right edges are the same meridian,
+ * so wrapping is what joins them and clamping would smear a seam down the globe.
+ * Its v is latitude, which ends: the first and last rows are the poles, and
+ * wrapping there would blend the arctic into the antarctic in a one-texel band
+ * across the top and bottom of every planet.
+ *
+ * Nearest sampling was the previous behaviour and is still available, but it is
+ * rarely what anyone wants on a mesh: a 2048-wide map on a 160-pixel planet
+ * takes one texel in thirteen, and picks a different one each frame as the
+ * globe turns, which crawls.
+ */
+VR_PIX float4 vr_sample_mesh(const uchar4 *VR_RESTRICT tex,
+                             int tw, int th, float u, float v)
+{
+    float fx = u * (float)tw - 0.5f;
+    float fy = v * (float)th - 0.5f;
+
+    int   x0 = (int)floorf(fx);
+    int   y0 = (int)floorf(fy);
+    float ax = fx - (float)x0;
+    float ay = fy - (float)y0;
+
+    /* Wrap by modulus rather than by masking, so a non-power-of-two map works
+     * and a negative coordinate lands on the far side instead of at zero. */
+    int x0w = x0 % tw; if (x0w < 0) x0w += tw;
+    int x1w = (x0w + 1 == tw) ? 0 : x0w + 1;
+
+    int y0c = vr_clampi(y0,     0, th - 1);
+    int y1c = vr_clampi(y0 + 1, 0, th - 1);
+
+    uchar4 p00 = tex[(size_t)y0c * tw + x0w];
+    uchar4 p10 = tex[(size_t)y0c * tw + x1w];
+    uchar4 p01 = tex[(size_t)y1c * tw + x0w];
+    uchar4 p11 = tex[(size_t)y1c * tw + x1w];
+
+    const float inv = 1.0f / 255.0f;
+    float w00 = (1.0f - ax) * (1.0f - ay);
+    float w10 = ax * (1.0f - ay);
+    float w01 = (1.0f - ax) * ay;
+    float w11 = ax * ay;
+
+    float4 out;
+    out.x = (p00.x * w00 + p10.x * w10 + p01.x * w01 + p11.x * w11) * inv;
+    out.y = (p00.y * w00 + p10.y * w10 + p01.y * w01 + p11.y * w11) * inv;
+    out.z = (p00.z * w00 + p10.z * w10 + p01.z * w01 + p11.z * w11) * inv;
+    out.w = (p00.w * w00 + p10.w * w10 + p01.w * w01 + p11.w * w11) * inv;
+    return out;
+}
+
 /*
  * Squared distance from a point to a line *segment* — the projection clamped to
  * the segment's ends, so a point beyond an endpoint measures to that endpoint
@@ -1087,7 +1406,7 @@ VR_PIX float vr_seg_dist2(float px, float py,
 
 VR_PIX void vr_px_mesh(uchar4 *VR_RESTRICT fb, float *VR_RESTRICT depth,
                        const ScreenTri *VR_RESTRICT tris,
-                       const uchar4 *VR_RESTRICT tex,
+                       MeshTextures maps,
                        const MeshParams *p, int i, int j)
 {
     int gx = p->bb_x + i;
@@ -1276,10 +1595,185 @@ VR_PIX void vr_px_mesh(uchar4 *VR_RESTRICT fb, float *VR_RESTRICT depth,
             }
         }
 
+        /*
+         * Lighting, per pixel.
+         *
+         * The normal interpolates perspective-correctly like the texture
+         * coordinates — divided through by the same reciprocal depth — because
+         * a normal is a surface attribute and suffers the same foreshortening.
+         * That same reciprocal gives the view depth back, and from the pixel's
+         * own screen position the rest of the view-space point follows: the
+         * projection is x_screen = ccx + X*focal/Z, so X = (x - ccx)*Z/focal.
+         * Nothing about the camera has to be passed in for that.
+         */
+        float wsum = b0 * tr->w0 + b1 * tr->w1 + b2 * tr->w2;
+        if (wsum <= 1e-12f) {
+            continue;
+        }
+        float invw = 1.0f / wsum;
+
+        float nx = (b0 * tr->n0x * tr->w0 + b1 * tr->n1x * tr->w1
+                  + b2 * tr->n2x * tr->w2) * invw;
+        float ny = (b0 * tr->n0y * tr->w0 + b1 * tr->n1y * tr->w1
+                  + b2 * tr->n2y * tr->w2) * invw;
+        float nz = (b0 * tr->n0z * tr->w0 + b1 * tr->n1z * tr->w1
+                  + b2 * tr->n2z * tr->w2) * invw;
+
+        /*
+         * The texture coordinate is resolved here, before the lighting, rather
+         * than inside the colour lookup where it used to live. A normal map is
+         * addressed by the same UVs and has to be read *before* anything is
+         * lit — it decides what the normal is — so the two lookups now share
+         * one perspective-correct divide instead of repeating it.
+         */
+        float uu = 0.0f, vv = 0.0f;
+        bool  have_uv = false;
+        if (p->tex_w > 0 || p->nrm_w > 0 || p->emis_w > 0) {
+            /*
+             * Perspective-correct texturing: u/z and 1/z interpolate linearly
+             * in screen space, u does not. Interpolating u directly is the
+             * classic swimming-texture artefact on a steeply angled face.
+             */
+            float w = b0 * tr->w0 + b1 * tr->w1 + b2 * tr->w2;
+            if (w > 1e-9f) {
+                uu = (b0 * tr->u0 + b1 * tr->u1 + b2 * tr->u2) / w;
+                vv = (b0 * tr->v0 + b1 * tr->v1 + b2 * tr->v2) / w;
+                have_uv = true;
+            }
+        }
+
+        float nl = sqrtf(nx * nx + ny * ny + nz * nz);
+        if (nl < 1e-12f) {
+            nl = 1.0f;
+        }
+
+        /*
+         * Normal mapping.
+         *
+         * The map stores a normal in tangent space — a frame that follows the
+         * texture across the surface — so reading it means building that frame
+         * here and rotating the texel into view space. T comes interpolated
+         * from the vertices, N is the geometric normal just computed, and the
+         * third axis is their cross product, signed by the handedness.
+         *
+         * T is re-orthogonalised against N first. Interpolation does not
+         * preserve a right angle: two perpendicular frames averaged across a
+         * curved face come out slightly skewed, and the skew shows as the
+         * lighting sliding a little as a surface turns.
+         *
+         * What this buys is the whole reason the map exists: the geometry stays
+         * at two triangles per plank while the lighting behaves as though the
+         * grain, the knots and the nail heads were modelled.
+         */
+        if (p->nrm_w > 0 && maps.nrm != NULL && have_uv && p->normal_scale > 0.0f) {
+            float4 nt = vr_sample_mesh(maps.nrm, p->nrm_w, p->nrm_h, uu, vv);
+
+            /* 0..1 back to -1..1. The blue channel is not rescaled: it is the
+             * component along the normal, and weakening the map means tilting
+             * less, which is exactly "leave z alone and shrink x and y". */
+            float mx_ = (nt.x * 2.0f - 1.0f) * p->normal_scale;
+            float my_ = (nt.y * 2.0f - 1.0f) * p->normal_scale;
+            float mz_ =  nt.z * 2.0f - 1.0f;
+
+            float tx = (b0 * tr->t0x * tr->w0 + b1 * tr->t1x * tr->w1
+                      + b2 * tr->t2x * tr->w2) * invw;
+            float ty = (b0 * tr->t0y * tr->w0 + b1 * tr->t1y * tr->w1
+                      + b2 * tr->t2y * tr->w2) * invw;
+            float tz = (b0 * tr->t0z * tr->w0 + b1 * tr->t1z * tr->w1
+                      + b2 * tr->t2z * tr->w2) * invw;
+
+            /* Unit normal, needed for the Gram-Schmidt and for the cross. */
+            float ux = nx / nl, uy = ny / nl, uz = nz / nl;
+
+            float d = tx * ux + ty * uy + tz * uz;
+            tx -= ux * d; ty -= uy * d; tz -= uz * d;
+
+            float tl = sqrtf(tx * tx + ty * ty + tz * tz);
+            if (tl > 1e-9f) {
+                tx /= tl; ty /= tl; tz /= tl;
+
+                float hsign = (tr->hand < 0.0f) ? -1.0f : 1.0f;
+                float bx = (uy * tz - uz * ty) * hsign;
+                float by = (uz * tx - ux * tz) * hsign;
+                float bz = (ux * ty - uy * tx) * hsign;
+
+                float rx = tx * mx_ + bx * my_ + ux * mz_;
+                float ry = ty * mx_ + by * my_ + uy * mz_;
+                float rz = tz * mx_ + bz * my_ + uz * mz_;
+
+                float rl = sqrtf(rx * rx + ry * ry + rz * rz);
+                if (rl > 1e-9f) {
+                    nx = rx; ny = ry; nz = rz;
+                    nl = rl;
+                }
+            }
+        }
+
         float shade = 1.0f;
-        if (p->smooth) {
-            shade = b0 * tr->l0 + b1 * tr->l1 + b2 * tr->l2;
-            if (shade < 0.0f) shade = 0.0f;
+        float spec  = 0.0f;
+
+        if (p->light_count > 0) {
+            float Zv = invw;
+            float Xv = (px - p->ccx) * Zv / p->focal;
+            float Yv = (py - p->ccy) * Zv / p->focal;
+
+            /* The eye is the view origin, so this is the direction to it. */
+            float vlen = sqrtf(Xv * Xv + Yv * Yv + Zv * Zv);
+            float vx = 0.0f, vy = 0.0f, vz = -1.0f;
+            if (vlen > 1e-9f) {
+                vx = -Xv / vlen; vy = -Yv / vlen; vz = -Zv / vlen;
+            }
+
+            float diff = 0.0f;
+            for (int li = 0; li < p->light_count; li++) {
+                float lx = p->lights[li].x - Xv;
+                float ly = p->lights[li].y - Yv;
+                float lz = p->lights[li].z - Zv;
+                float ll = sqrtf(lx * lx + ly * ly + lz * lz);
+                if (ll < 1e-9f) {
+                    continue;
+                }
+
+                float d = (nx * lx + ny * ly + nz * lz) / (ll * nl);
+                if (p->two_sided) {
+                    d = fabsf(d);
+                }
+                if (d <= 0.0f) {
+                    continue;
+                }
+
+                float att = p->lights[li].intensity
+                          * vr_falloff(ll, p->lights[li].range);
+                diff += d * att;
+
+                if (p->specular > 0.0f) {
+                    /* Blinn-Phong: the halfway vector between light and eye. */
+                    float hx = lx / ll + vx;
+                    float hy = ly / ll + vy;
+                    float hz = lz / ll + vz;
+                    float hl = sqrtf(hx * hx + hy * hy + hz * hz);
+                    if (hl > 1e-9f) {
+                        float nh = (nx * hx + ny * hy + nz * hz) / (hl * nl);
+                        if (p->two_sided) {
+                            nh = fabsf(nh);
+                        }
+                        if (nh > 0.0f) {
+                            spec += att * powf(nh, p->shininess);
+                        }
+                    }
+                }
+            }
+            if (diff > 1.0f) diff = 1.0f;
+            shade = p->ambient + (1.0f - p->ambient) * diff;
+            spec *= p->specular;
+        } else {
+            /*
+             * No lights: the camera is the lamp, so the term is just how far
+             * the surface has turned away from the viewer. Absolute, because
+             * with nothing else to disambiguate it, either face is the lit one.
+             */
+            float lam = fabsf(nz) / nl;
+            shade = p->ambient + (1.0f - p->ambient) * lam;
         }
 
         /*
@@ -1293,24 +1787,27 @@ VR_PIX void vr_px_mesh(uchar4 *VR_RESTRICT fb, float *VR_RESTRICT depth,
         float tr_b = tr->b * shade;
         float ta = 1.0f;
 
-        if (p->tex_w > 0 && tex != NULL) {
-            /*
-             * Perspective-correct texturing: u/z and 1/z interpolate linearly
-             * in screen space, u does not. Interpolating u directly is the
-             * classic swimming-texture artefact on a steeply angled face.
-             */
-            float w = b0 * tr->w0 + b1 * tr->w1 + b2 * tr->w2;
-            if (w > 1e-9f) {
-                float uu = (b0 * tr->u0 + b1 * tr->u1 + b2 * tr->u2) / w;
-                float vv = (b0 * tr->v0 + b1 * tr->v1 + b2 * tr->v2) / w;
+        if (p->tex_w > 0 && maps.base != NULL) {
+            if (have_uv) {
+                float su = uu, sv = vv;
+                float sr_, sg_, sb_, sa_;
 
-                /* Wrap, so tiled UVs outside 0..1 behave as expected. */
-                uu = uu - floorf(uu);
-                vv = vv - floorf(vv);
+                if (p->filter) {
+                    float4 t4 = vr_sample_mesh(maps.base, p->tex_w, p->tex_h, su, sv);
+                    sr_ = t4.x; sg_ = t4.y; sb_ = t4.z; sa_ = t4.w;
+                } else {
+                    /* Wrap, so tiled UVs outside 0..1 behave as expected. */
+                    su = su - floorf(su);
+                    sv = sv - floorf(sv);
 
-                int tx = vr_clampi((int)(uu * (float)p->tex_w), 0, p->tex_w - 1);
-                int ty = vr_clampi((int)(vv * (float)p->tex_h), 0, p->tex_h - 1);
-                uchar4 tc = tex[(size_t)ty * p->tex_w + tx];
+                    int tx = vr_clampi((int)(su * (float)p->tex_w), 0, p->tex_w - 1);
+                    int ty = vr_clampi((int)(sv * (float)p->tex_h), 0, p->tex_h - 1);
+                    uchar4 tc = maps.base[(size_t)ty * p->tex_w + tx];
+
+                    const float i255 = 1.0f / 255.0f;
+                    sr_ = tc.x * i255; sg_ = tc.y * i255;
+                    sb_ = tc.z * i255; sa_ = tc.w * i255;
+                }
 
                 /*
                  * Texture times mesh colour, so a white mesh shows the texture
@@ -1319,12 +1816,71 @@ VR_PIX void vr_px_mesh(uchar4 *VR_RESTRICT fb, float *VR_RESTRICT depth,
                  * texel by `shade` alone would light the flat-shaded case not
                  * at all, leaving a textured cube perfectly evenly lit.
                  */
-                const float i255 = 1.0f / 255.0f;
-                tr_r *= tc.x * i255;
-                tr_g *= tc.y * i255;
-                tr_b *= tc.z * i255;
-                ta    = tc.w * i255;
+                tr_r *= sr_;
+                tr_g *= sg_;
+                tr_b *= sb_;
+                ta    = sa_;
+
+                /*
+                 * Ambient occlusion: how much of the sky a crevice cannot see.
+                 *
+                 * Stored in the red channel, which is where glTF puts it and
+                 * also where the ORM/ARM maps that ship with scanned props keep
+                 * it — occlusion, roughness and metalness packed into one image
+                 * so it costs a single fetch.
+                 *
+                 * The spec says occlusion attenuates *indirect* light only. It
+                 * is applied to the whole shade here instead, and the reason is
+                 * practical rather than principled: this renderer's indirect
+                 * term is one `ambient` constant, usually around 0.15, so the
+                 * spec-correct version is very nearly invisible. Multiplying
+                 * everything is what actually seats an object into its own
+                 * shadowed corners, which is the entire reason to read the map.
+                 */
+                if (p->ao_w > 0 && maps.ao != NULL) {
+                    /* Always filtered, even when the albedo is asked for
+                     * unfiltered: `nearest` is a choice about how the colour
+                     * should look, and nothing is gained by making the shading
+                     * term blocky to match. */
+                    float ao = vr_sample_mesh(maps.ao, p->ao_w, p->ao_h, uu, vv).x;
+                    /* Dialled towards 1, so a map that already has the shading
+                     * baked into its albedo does not darken twice. */
+                    ao = 1.0f + (ao - 1.0f) * p->ao_strength;
+                    tr_r *= ao; tr_g *= ao; tr_b *= ao;
+                }
             }
+        }
+
+        /*
+         * The highlight is added, not multiplied — after the texture, so it
+         * sits *on* the surface rather than being tinted by it. Occlusion has
+         * already been applied to the diffuse above and deliberately not to
+         * this: a crevice still reflects a light that reaches it.
+         */
+        tr_r += spec;
+        tr_g += spec;
+        tr_b += spec;
+
+        /*
+         * Emissive: light the surface produces rather than reflects.
+         *
+         * Added last, after the shading and after the occlusion, and that
+         * placement is the whole feature. Every other term here is a multiplier
+         * on the albedo, so anything expressed through the albedo goes dark
+         * exactly when the object does — which is the opposite of what a lit
+         * screen or a glowing filament should do. A term that is added survives
+         * the dark, and the object reads as switched on.
+         *
+         * No bloom and no light cast on anything else: this renderer has no
+         * global illumination, so an emissive surface lights itself only.
+         */
+        if (p->emis_r > 0.0f || p->emis_g > 0.0f || p->emis_b > 0.0f) {
+            float er = p->emis_r, eg = p->emis_g, eb = p->emis_b;
+            if (p->emis_w > 0 && maps.emis != NULL && have_uv) {
+                float4 e4 = vr_sample_mesh(maps.emis, p->emis_w, p->emis_h, uu, vv);
+                er *= e4.x; eg *= e4.y; eb *= e4.z;
+            }
+            tr_r += er; tr_g += eg; tr_b += eb;
         }
 
         /*

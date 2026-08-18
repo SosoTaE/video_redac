@@ -250,6 +250,35 @@ was the fix rather than the build.
 than only the C ones. If you add a third compilation path, give it the same
 treatment.
 
+### The two backends must not share a build directory
+
+The same failure mode, one level up, and it hides better.
+
+Both backends produce a binary called `video_redac`, and for a while both wrote
+their objects into `build`. So `make CPU=1` immediately after a CUDA build found
+the binary newer than every object it cared about, said "nothing to be done",
+and left the CUDA binary sitting there. A CPU-versus-GPU comparison run that way
+compares the GPU against itself.
+
+That is worse than a stale object, because the answer it gives is the answer you
+were hoping for: perfect agreement, zero differing pixels, on a code path
+neither backend had actually exercised twice. It was caught only because the
+result was *too* good — the 2D pipeline agrees exactly, but the mesh path never
+has, and a sudden 0.000% on a freshly written rasterizer is not a success, it is
+a measurement that failed to measure.
+
+`BUILD` is now `build/gpu` or `build/cpu`, which fixes exactly half of it. Going
+*back* to the CUDA build, its objects are all present and the binary the CPU
+build has just written is newer than every one of them — so make says "nothing
+to be done" a second time, in the other direction, and the first fix looks
+complete because the case it repairs is the one you happen to test.
+
+No timestamp can express *which* backend produced `./video_redac`, so the answer
+is written down. `build/.backend` is a file whose content is the backend name,
+rewritten only when that name changes; the binary depends on it, so switching
+relinks and staying put remains a no-op. The link banner names the backend too,
+which is the cheap part and the part that makes the mistake visible.
+
 ### Sanitizers now cover the whole pipeline
 
 This is the unexpected payoff. ASAN and the CUDA runtime do not coexist — the

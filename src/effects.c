@@ -7,6 +7,7 @@
 
 #include "effects.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 /* Comparison that tolerates case and separators: "rgb_split", "rgbSplit" and
@@ -51,6 +52,8 @@ static const struct {
     { "split_tone",   FX_SPLIT_TONE   },
     { "gradient_map", FX_GRADIENT_MAP },
     { "duotone",      FX_GRADIENT_MAP },
+    { "lut",          FX_LUT          },
+    { "look",         FX_LUT          },
     { "blur",         FX_BLUR         },
     { "pixelate",     FX_PIXELATE     },
     { "rgb_split",    FX_RGB_SPLIT    },
@@ -102,4 +105,12 @@ void effect_free(Effect *fx)
     for (int i = 0; i < FXP_MAX; i++) {
         track_free(&fx->param[i]);
     }
+    free(fx->lut_path);
+    free(fx->lut);
+    fx->lut_path = NULL;
+    fx->lut = NULL;
+    fx->lut_size = 0;
+    /* d_lut is device memory owned by the renderer, which frees it with the
+     * rest of its allocations; freeing it here would be a double free on the
+     * CUDA backend and a wild pointer on neither. */
 }

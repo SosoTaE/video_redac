@@ -27,6 +27,7 @@
 #include "effects.h"
 #include "layout.h"
 #include "media_loader.h"
+#include "lut.h"
 #include "mesh.h"
 #include "renderer.h"
 
@@ -771,6 +772,10 @@ static const struct {
 };
 
 /* Neutral defaults — whatever the JSON does not override leaves the frame alone. */
+/* Defined below, next to the other path helpers; the effect parser needs it
+ * here to resolve a LUT's path against the JSON's directory. */
+static char *resolve_relative_path(const char *base_file, const char *path);
+
 static void effect_set_defaults(Effect *fx)
 {
     for (int i = 0; i < FXP_MAX; i++) {
@@ -828,7 +833,7 @@ static void effect_set_defaults(Effect *fx)
 }
 
 static bool parse_effects_into(struct Effect **list, size_t *count, size_t *cap,
-                               const cJSON *arr)
+                               const cJSON *arr, const char *base_file)
 {
     if (!cJSON_IsArray(arr)) {
         return true; /* effects are optional */
@@ -867,6 +872,28 @@ static bool parse_effects_into(struct Effect **list, size_t *count, size_t *cap,
         fx->color_a = json_color(item, "shadow",    fx->color_a);
         fx->color_b = json_color(item, "highlights", fx->color_b);
         fx->color_b = json_color(item, "highlight",  fx->color_b);
+
+        /*
+         * A LUT's table, read here rather than at media-load time.
+         *
+         * Effects are not widgets and never pass through the media loader, and
+         * a look that cannot be found should stop the parse the way a missing
+         * font or audio file does — a film delivered without its grade is worse
+         * than one that refused to render.
+         */
+        if (type == FX_LUT) {
+            const char *lp = json_str(item, "path", json_str(item, "file", NULL));
+            if (lp == NULL) {
+                fprintf(stderr, "error: a 'lut' effect needs a \"path\" to a "
+                                ".cube file.\n");
+                return false;
+            }
+            fx->lut_path = resolve_relative_path(base_file, lp);
+            if (fx->lut_path == NULL ||
+                !lut_load_cube(fx->lut_path, &fx->lut, &fx->lut_size)) {
+                return false;
+            }
+        }
     }
     return true;
 }
@@ -954,6 +981,33 @@ static void parse_widget_base(WidgetBase *base, const cJSON *obj, WidgetKind kin
             base->mask[3] = json_float(mk, "h", 1.0f);
         }
         base->mask_invert = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(mk, "invert"));
+    }
+
+    /* --- chroma key ------------------------------------------------------ */
+    const cJSON *ky = cJSON_GetObjectItemCaseSensitive(obj, "key");
+    if (ky == NULL) {
+        ky = cJSON_GetObjectItemCaseSensitive(obj, "chroma_key");
+    }
+    if (cJSON_IsObject(ky)) {
+        /* Default green rather than none: "key": {} on a green-screen clip is
+         * what almost everyone means, and the studio green #00B140 is the one
+         * colour a backdrop is most likely to be. */
+        base->key_on        = true;
+        base->key_color     = json_color(ky, "color", (Color){ 0x00, 0xB1, 0x40, 255 });
+        base->key_tolerance = json_float(ky, "tolerance", 0.14f);
+        base->key_softness  = json_float(ky, "softness",  0.08f);
+        base->key_spill     = json_float(ky, "spill",     0.7f);
+
+        if (base->key_tolerance < 0.0f) base->key_tolerance = 0.0f;
+        if (base->key_softness  < 0.0f) base->key_softness  = 0.0f;
+    } else if (cJSON_IsString(ky)) {
+        /* "key": "#00B140" — the colour alone, everything else defaulted. */
+        base->key_on        = true;
+        base->key_color     = (Color){ 0x00, 0xB1, 0x40, 255 };
+        parse_hex_color(ky->valuestring, &base->key_color);
+        base->key_tolerance = 0.14f;
+        base->key_softness  = 0.08f;
+        base->key_spill     = 0.7f;
     }
 
     /* --- anchoring ("anchor": "center", "bottomright", …) ---------------- */
@@ -1682,8 +1736,60 @@ static bool parse_mesh_object(EditorContext *ctx, const cJSON *obj, int z,
     const cJSON *aa = cJSON_GetObjectItemCaseSensitive(obj, "antialias");
     w->antialias = cJSON_IsBool(aa) ? cJSON_IsTrue(aa) : true;
 
+    const char *flt = json_str(obj, "filter", "bilinear");
+    w->filter = (strcmp(flt, "nearest") != 0);
+
     const char *tp = json_str(obj, "texture", NULL);
     w->tex_path = (tp != NULL) ? resolve_relative_path(base_file, tp) : NULL;
+
+    /* An explicit map wins over whatever the model's material names, so a
+     * scene can override what the exporter chose. */
+    const char *aop = json_str(obj, "ao", json_str(obj, "occlusion", NULL));
+    w->ao_path = (aop != NULL) ? resolve_relative_path(base_file, aop) : NULL;
+    w->ao_strength = vr_clampf01(json_float(obj, "ao_strength", 1.0f));
+
+    const char *nmp = json_str(obj, "normal_map", json_str(obj, "normal", NULL));
+    w->nrm_path = (nmp != NULL) ? resolve_relative_path(base_file, nmp) : NULL;
+    /*
+     * Negative means "unset", so the glTF material's own normalTexture.scale
+     * can fill it in. A plain default of 1 would silently overrule what the
+     * exporter said, which is the one number in the material worth respecting.
+     */
+    w->normal_scale = json_float(obj, "normal_scale", -1.0f);
+
+    /*
+     * "emissive" takes either a colour or a path, and which one is decided by
+     * whether the string parses as a colour.
+     *
+     * One key rather than two because the two spellings mean the same thing to
+     * whoever is writing the scene — "this surface glows" — and the difference
+     * between a flat glow and a mapped one is a detail of how it is specified.
+     * "emissive_map" stays available for the case where a filename genuinely
+     * does look like a hex colour.
+     */
+    Color emis_col = { 255, 255, 255, 255 };
+    bool  emis_is_colour = false;
+    const char *ems = json_str(obj, "emissive", NULL);
+    if (ems != NULL) {
+        emis_is_colour = parse_hex_color(ems, &emis_col);
+    }
+
+    const char *emp = json_str(obj, "emissive_map", emis_is_colour ? NULL : ems);
+    w->emis_path = (emp != NULL) ? resolve_relative_path(base_file, emp) : NULL;
+    w->emissive  = json_color(obj, "emissive_color", emis_col);
+
+    /*
+     * Negative means unset, which lets a glTF emissiveFactor fill it in. A
+     * colour or a map named in the JSON is an explicit request, so it defaults
+     * to full strength instead.
+     */
+    w->emissive_strength = json_float(obj, "emissive_strength",
+                                      (emis_is_colour || emp != NULL) ? 1.0f : -1.0f);
+
+    w->specular  = json_float(obj, "specular", 0.0f);
+    w->shininess = json_float(obj, "shininess", 32.0f);
+    if (w->specular < 0.0f)  w->specular = 0.0f;
+    if (w->shininess < 1.0f) w->shininess = 1.0f;
 
     bool open_shape = (w->shape != NULL &&
                        (strcmp(w->shape, "plane") == 0 ||
@@ -3505,6 +3611,28 @@ static bool parse_scene(EditorContext *ctx, const cJSON *node, const cJSON *styl
             dst->z = json_float(l, "z", 0.0f);
             dst->intensity = json_float(l, "intensity", 1.0f);
             dst->range     = json_float(l, "range", 0.0f);
+
+            /*
+             * A light is fixed for the whole scene, and a keyframe array in one
+             * of its fields reads as zero rather than as motion.
+             *
+             * Worth saying out loud, because every other numeric field in this
+             * format takes a track and the shape of the value gives no hint
+             * that this one does not. Silently placing the light at the origin
+             * produces a scene that renders, looks merely wrong, and sends the
+             * author looking at their geometry.
+             */
+            const struct { const char *key; float value; } lf[] = {
+                { "x", dst->x }, { "y", dst->y }, { "z", dst->z },
+                { "intensity", dst->intensity }, { "range", dst->range },
+            };
+            for (size_t q = 0; q < sizeof lf / sizeof *lf; q++) {
+                if (cJSON_IsArray(cJSON_GetObjectItemCaseSensitive(l, lf[q].key))) {
+                    fprintf(stderr, "warning: scene '%s' — light '%s' is a keyframe "
+                                    "track, but lights do not animate; using %g.\n",
+                            sc->id ? sc->id : "(unnamed)", lf[q].key, (double)lf[q].value);
+                }
+            }
         }
         if (cJSON_IsArray(lit) && cJSON_GetArraySize(lit) > VR_MAX_LIGHTS) {
             fprintf(stderr, "warning: scene '%s' — %d lights given, only %d are used.\n",
@@ -3514,7 +3642,8 @@ static bool parse_scene(EditorContext *ctx, const cJSON *node, const cJSON *styl
 
     if (!is_root &&
         !parse_effects_into(&sc->effects, &sc->effect_count, &sc->effect_cap,
-                            cJSON_GetObjectItemCaseSensitive(node, "effects"))) {
+                            cJSON_GetObjectItemCaseSensitive(node, "effects"),
+                            filepath)) {
         cJSON_Delete(expanded);
         cJSON_Delete(emitted);
         repeat_table_free(&repeats);
@@ -3791,8 +3920,9 @@ EditorContext *parse_video_project_ex(const char *filepath, char **defines, int 
 
     /* --- 3b. effects [ ] -------------------------------------------------- */
     if (!parse_effects_into(&ctx->effects, &ctx->effect_count, &ctx->effect_cap,
-                            cJSON_GetObjectItemCaseSensitive(root, "effects"))) {
-        fprintf(stderr, "error: could not allocate the effects.\n");
+                            cJSON_GetObjectItemCaseSensitive(root, "effects"),
+                            filepath)) {
+        fprintf(stderr, "error: the film's effects could not be prepared.\n");
         goto fail;
     }
 
@@ -3932,9 +4062,15 @@ void editor_context_free(EditorContext *ctx)
         widget_base_free(&ctx->meshes[i].base);
         mesh_free(&ctx->meshes[i]);
         texture_free(&ctx->meshes[i].tex);
+        texture_free(&ctx->meshes[i].ao);
+        texture_free(&ctx->meshes[i].nrm);
+        texture_free(&ctx->meshes[i].emis);
         free(ctx->meshes[i].path);
         free(ctx->meshes[i].shape);
         free(ctx->meshes[i].tex_path);
+        free(ctx->meshes[i].ao_path);
+        free(ctx->meshes[i].nrm_path);
+        free(ctx->meshes[i].emis_path);
     }
     free(ctx->meshes);
 

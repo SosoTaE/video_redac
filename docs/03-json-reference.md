@@ -416,6 +416,21 @@ happened to be on the far side. Those surfaces use the magnitude of the term
 instead. It is the reason a ring lit by a star in its own plane is visible at
 all rather than arithmetically, uselessly correct.
 
+**So `cull` is not purely an optimisation, and the tempting invariant is
+false.** It reads as one — on a closed body the depth buffer already discards
+everything culling would remove, so turning culling off ought to change nothing
+— and under camera-mounted shading it very nearly holds: a textured sphere
+measures 1,075 differing pixels in 350,000, max delta 16, all of it silhouette
+antialiasing where the far side contributes coverage.
+
+Add a light and it stops holding, because `cull` also selects the lighting
+model. Near the limb of a smooth body the front faces have a slightly negative
+Lambert term, which clamps to the ambient floor with culling on and is lifted by
+the magnitude with it off: the same sphere then differs on 31,372 pixels, max
+105. That is the two-sided rule working as designed, not a regression — but it
+looks exactly like one, so measure the invariant with the lights off or not at
+all.
+
 ---
 
 ## `groups[]`
@@ -543,6 +558,7 @@ Two keys every object accepts, beyond position and the property tracks:
 |---|---|---|
 | `z` | int | explicit draw order, overriding array position |
 | `clip` / `mask` | object | clip the object to a shape |
+| `key` / `chroma_key` | object or colour | knock a backdrop colour out of this layer |
 
 ```json
 "clip": { "shape": "circle", "cx": 0.5, "cy": 0.5, "r": 0.45 }
@@ -552,6 +568,47 @@ Two keys every object accepts, beyond position and the property tracks:
 Mask coordinates are **fractions of the object's own box**, not pixels, so a
 mask survives scaling: "the left half" stays the left half at any size the
 object animates to. It rotates with the object too.
+
+### `key` — chroma keying
+
+```json
+"key": {}
+"key": "#00B140"
+"key": { "color": "#00B140", "tolerance": 0.14, "softness": 0.08, "spill": 0.7 }
+```
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `color` | colour | `#00B140` | the backdrop to remove — studio green |
+| `tolerance` | float | 0.14 | chroma distance removed outright |
+| `softness` | float | 0.08 | the ramp beyond it, where coverage falls off |
+| `spill` | float 0..1 | 0.7 | how hard to pull the backdrop's tint off the fringe |
+
+`"key": {}` on a green-screen clip is almost always what you mean, so the
+defaults are a full green key.
+
+**It is a property of the layer, not an effect on the frame.** That placement is
+the whole design: the green in a green screen is a fact about one clip, and
+keying the finished composite would take the same green out of everything behind
+it as well. It works on any object, though only `image` and `video` have much
+use for it.
+
+**The comparison ignores brightness.** A lit backdrop is never one colour — the
+top of a screen is pale green and the bottom is dark green — and those two
+differ almost entirely in luma and hardly at all in chroma. A test on RGB
+distance keys one of them and leaves the other; a test in the Cb/Cr plane keys
+both, which is why `tolerance` can stay small.
+
+**Coverage is continuous, not a yes/no.** A partly-keyed pixel comes out partly
+transparent, which is what lets hair and motion blur survive: those are genuine
+blends of subject and backdrop, and a hard threshold can only round them to one
+side or the other.
+
+`spill` handles the rim that no threshold removes. A subject standing in front
+of a green screen is lit by green bounced off it, so its edges are the subject's
+own colour with green added; clamping the key's channel down to the average of
+the other two takes the tint out and leaves the brightness, so the edge reads as
+corrected rather than darkened.
 
 
 | Key | Type | Default | Notes |
@@ -757,10 +814,30 @@ A triangle mesh — an OBJ file, or a named primitive.
 | `smooth` | bool | true for curved primitives and imported models |
 | `wire` | bool or float | false — a number sets the stroke width in pixels |
 | `antialias` | bool | true — feather the silhouette by a pixel |
+| `filter` | `bilinear` \| `nearest` | `bilinear` |
+| `ao` / `occlusion` | string | an occlusion map; glTF supplies its own |
+| `ao_strength` | float 0..1 | 1 |
+| `normal_map` / `normal` | string | a tangent-space normal map; glTF supplies its own |
+| `normal_scale` | float | 1 — how far the map may tilt the normal; 0 is off |
+| `emissive` | colour or path | none — a glow colour, or an emissive map |
+| `emissive_map` | string | an emissive map, when the filename looks like a colour |
+| `emissive_color` | colour | `#FFFFFF` — tints the emissive map |
+| `emissive_strength` | float | 1 when either is given; glTF supplies its own |
+| `specular` | float | 0 — highlight strength |
+| `shininess` | float | 32 — exponent; larger is tighter |
 | `texture` | string | an image to wrap onto the surface, relative to the JSON |
 
 Position, rotation, depth, `scale`, `opacity` and `blend` all work as on any
 other object. `rotate_x` / `rotate_y` / `rotation` turn the model in space.
+
+**Shading is per pixel.** The rasterizer interpolates the view-space normal and
+resolves the lighting for each pixel, instead of resolving it at the vertices
+and interpolating a brightness. That costs a normalise and a short loop over the
+lights per pixel, and buys two things: highlights that stay round on coarse
+geometry, and somewhere for a normal map to change the normal — which is the
+entire point of one. A flat-shaded or normal-less mesh puts the face normal in
+all three vertices, so the interpolation is constant and the result is exactly
+flat shading rather than an approximation of it.
 
 **Meshes are clipped against the near plane.** A triangle that straddles the
 eye plane cannot be projected — perspective division sends it to infinity — so
@@ -860,6 +937,116 @@ And the mesh is antialiased against the background and against other meshes,
 not against itself: where one part of a model passes in front of another, the
 depth test still picks a winner per pixel.
 
+### `ao` — ambient occlusion
+
+How much of the sky a crevice cannot see, read from the map's **red channel**.
+It is what seats an object into its own shadowed corners: the inside of a
+crate's lattice, the recess behind a handle, the gap under a shelf.
+
+An imported glTF brings its own, so usually nothing needs saying. Where a
+material declares no `occlusionTexture`, the metallic/roughness map's red
+channel is used instead — glTF reserves that channel as unused, which is
+precisely why the "ARM" packing (occlusion, roughness, metalness in R, G, B)
+became the common way to ship three maps as one image, and why plenty of
+exporters pack that way without ever declaring the occlusion slot.
+
+That is a convention rather than a guarantee, so it is checked rather than
+trusted: a map whose red channel averages near black was never occlusion, and is
+reported and ignored instead of turning the object black.
+
+`ao_strength` dials the effect towards 1. Occlusion is applied to the whole
+shading term here, not only to the indirect part the glTF specification names —
+with a single `ambient` constant for indirect light, usually around 0.15, the
+specification-correct version is very nearly invisible. The cost of the stronger
+reading is that an albedo which already has shadowing painted in gets darkened
+twice, and that is what the dial is for.
+
+### `normal_map` — detail without geometry
+
+```json
+{ "type": "mesh", "shape": "plane", "size": 900,
+  "texture": "assets/plaster.png", "normal_map": "assets/plaster_nor.png" }
+```
+
+A tangent-space normal map: an image whose RGB is a direction rather than a
+colour, where `(128, 128, 255)` means "unchanged" and everything else tilts the
+surface normal. The geometry does not move — no vertex is added and no
+silhouette changes — but the lighting behaves as though it had.
+
+This is the map that earns its keep on cheap geometry. A plane of two triangles
+carrying a bump map is lit like a moulded surface; the same plane without one is
+lit like a sheet of card, because a flat surface has exactly one normal and
+therefore exactly one brightness.
+
+It needs three things, and says so when one is missing:
+
+* **Texture coordinates.** The map is addressed by the same UVs as the base
+  colour. A mesh without them cannot read one.
+* **Tangents** — a frame on the surface saying which way `u` runs. An imported
+  glTF may supply them (`TANGENT`); when it does not, they are derived from the
+  UV layout, which is the same information the exporter would have used. They
+  are only built for a mesh that actually has a normal map, because they are
+  another third of the vertex data.
+* **A light.** Perturbing the normal changes how light strikes the surface, so
+  with no lights in the scene there is nothing for it to change.
+
+`normal_scale` is glTF's `normalTexture.scale`: 1 is the map as authored, 0
+switches it off without unloading the image, and values between flatten it.
+When the project does not set it, an imported material's own value is used.
+
+**Green points the way glTF says it does** (the "OpenGL" convention, `_nor_gl`
+in Poly Haven's naming). A map baked the other way round — DirectX convention —
+comes out with its bumps as dents; invert its green channel first.
+
+### `emissive` — light a surface gives off
+
+```json
+{ "type": "mesh", "shape": "sphere", "emissive": "#39E0FF", "emissive_strength": 0.8 }
+{ "type": "mesh", "path": "assets/lamp.gltf" }
+```
+
+Emission is **added** after everything else — after the shading, after the
+occlusion — and that placement is the whole feature. Every other term is a
+multiplier on the albedo, so anything expressed through the albedo goes dark
+exactly when the object does. A screen, a filament or a signal lamp reads as
+switched on precisely because it stays bright while the rest of the object falls
+into shadow, and only an added term does that.
+
+`emissive` takes either a colour or a path, decided by whether the string parses
+as a colour — one key, because to whoever is writing the scene both spellings
+mean "this surface glows". `emissive_map` is there for the case where a filename
+genuinely looks like a hex colour, and `emissive_color` tints a map.
+
+An imported glTF brings its own `emissiveFactor` and `emissiveTexture`, so a
+model that ships a lit part arrives lit. Note that such a map is often almost
+entirely black — Poly Haven's pipe lamp emits from the filament and nowhere
+else, which is a few hundred texels of a 1k image.
+
+There is no bloom and no light cast on anything else: an emissive surface lights
+itself and nothing around it. This renderer has no global illumination, and a
+glow that spills onto its surroundings would have to be faked with a `light` at
+the same place.
+
+### `specular` — the highlight
+
+```json
+{ "type": "mesh", "shape": "sphere", "specular": 0.55, "shininess": 12 }
+```
+
+A Blinn-Phong highlight, off by default because matte is the honest starting
+point. It needs normals and at least one `light`; with neither it does nothing.
+
+The highlight is **added** after the texture, never multiplied by it, because it
+is the light reflecting off the surface rather than the surface showing through:
+a red crate takes a white highlight, and folding the term into the diffuse
+shading would tint it red. For the same reason occlusion does not dim it — a
+crevice still reflects a light that reaches it.
+
+**It is computed per pixel.** Shading interpolates the surface normal and lights
+each pixel from it, rather than lighting the vertices and interpolating the
+result — so a highlight smaller than a triangle is still round. Any `shininess`
+works on any mesh.
+
 ### `texture` — wrapping an image onto the surface
 
 ```json
@@ -877,7 +1064,23 @@ normally.
 
 A sphere's UVs are laid out for equirectangular maps — u is longitude, v is
 latitude with v = 0 at the top — so a planet or globe texture can be used as
-downloaded. Sampling is
+downloaded.
+
+**Sampling is bilinear, with u wrapped and v clamped.** The axes differ because
+on the maps meshes actually wear they mean different things: u is longitude, a
+circle whose left and right edges are the same meridian, so wrapping joins them
+and clamping would smear a seam down the globe; v is latitude, which ends, and
+wrapping it would blend the arctic into the antarctic in a one-texel band across
+the top and bottom of every planet.
+
+`"filter": "nearest"` takes the single closest texel instead — for a
+deliberately blocky look. It is rarely what you want otherwise: a 2048-wide map
+on a 160-pixel planet takes one texel in thirteen, and a different one each
+frame as the globe turns, which crawls.
+
+Note that this fixes *magnification*, not minification: a texture much larger
+than its on-screen size still aliases, because there are no mipmaps. Scaling
+such a map down before use remains worthwhile. Sampling is
 perspective-correct — interpolating UVs directly across a steeply angled face is
 the classic swimming-texture artefact — and coordinates outside 0..1 wrap, so
 tiled UVs behave as expected.
@@ -895,9 +1098,20 @@ as a fan. Faces referencing undefined vertices are dropped with a warning rather
 than read out of bounds.
 
 **glTF 2.0** — both `.gltf` (with an external `.bin` or an embedded base64
-buffer) and `.glb`. Positions, normals, texture coordinates, indices and the
-whole node hierarchy's transforms are read, along with the material's base
-colour texture when it is a file next to the model.
+buffer) and `.glb`. Positions, normals, tangents, texture coordinates, indices
+and the whole node hierarchy's transforms are read.
+
+From the material: the base colour, occlusion, normal and emissive textures, the
+`normalTexture.scale` and the `emissiveFactor` — each used only when the project
+did not name its own. A texture must be a file next to the model; one stored in
+a bufferView is reported rather than silently dropped, since the loader reads
+paths.
+
+`TANGENT` is read when every primitive in the file supplies it, and otherwise
+derived from the UVs for the whole mesh. All or nothing, because a file that
+supplies tangents for some primitives and not others would get a frame on part
+of the model and zeroes on the rest — one consistent frame beats a marginally
+better one on half the object.
 
 **Two conventions are converted on the way in**, and both are invisible until
 they bite. glTF is Y-up with +Z toward the viewer, while this renderer's world
@@ -916,24 +1130,28 @@ almost right. Non-triangle primitives are counted and reported; sparse accessors
 are refused rather than read as their dense base, which would be wrong geometry
 presented as correct.
 
-**Shading is flat, lit from the camera.** It is the cheapest thing that makes a
-solid read as a solid — without it every face of a cube is the same colour and
-the shape collapses into a silhouette. `ambient` sets how dark a face turned
-fully away becomes.
-
 #### What this is not
 
-There is no z-buffer. The rasterizer loops over *triangles inside each pixel*
-rather than pixels inside each triangle, so the depth test is a local variable
-and needs no shared buffer or atomics — which is what lets one implementation
-serve both backends. The cost is **O(triangles) per pixel**, so this suits
-models of hundreds to a few thousand faces, not scanned assets.
+The rasterizer loops over *triangles inside each pixel* rather than pixels
+inside each triangle, so the depth test is a local variable and needs no shared
+buffer or atomics — which is what lets one implementation serve both backends.
+The cost is **O(triangles) per pixel**, so this suits models of hundreds to a
+few thousand faces, not scanned assets.
 
-There is also no texturing, no per-vertex normals (so no smooth shading), and no
-scene lighting.
+There is no shadow casting, no reflection, no global illumination and no bloom.
+Every lighting term is local to the surface being shaded: a light is not
+occluded by anything between it and the surface, and an emissive surface does
+not brighten its neighbours.
 
-Cross-backend agreement is looser than for 2D: measured at 3 differing bytes in
-23 million, max delta 10.
+There are no mipmaps, so a texture much larger than its on-screen size aliases
+under minification however it is filtered.
+
+Cross-backend agreement is looser than for 2D, where it is exact. Divergence is
+concentrated on shared triangle edges, where the two backends round a depth tie
+differently. Measured: a normal-mapped plane with a specular light differs on
+0.287% of pixels, 81 of 744,000 by more than 20/255; a scene of two imported
+props differs on 0.056%, 3 of 921,600 by more than 20/255. Emissive alone
+differs on none.
 
 ### `type: "image"`
 
@@ -1373,13 +1591,46 @@ Run in array order, after compositing. Every numeric parameter is a track.
 | `split_tone` | `shadows`, `highlights`, `balance`, `amount` | blue/orange, 0, 0.25 |
 | `gradient_map` | `shadow`, `highlight`, `amount` | black/white, 1 |
 | `color_grade` | `exposure`, `brightness`, `contrast`, `gamma`, `saturation`, `vibrance`, `hue`, `temperature`, `tint` | 0,0,1,1,1,0,0,0,0 |
+| `lut` | `path` (**required**), `amount` | —, 1 |
 | `blur` | `radius` | 8 (capped at 128) |
 | `pixelate` | `size` | 8 |
 | `rgb_split` | `amount`, `angle` | 3, 0 |
 | `glitch` | `amount` | 0.05 |
 
 Aliases: `greyscale`, `noise` → `grain`, `grade` → `color_grade`, `chromatic` →
-`rgb_split`, `duotone` → `gradient_map`.
+`rgb_split`, `duotone` → `gradient_map`, `look` → `lut`.
+
+### `lut` — a look from somewhere else
+
+```json
+{ "type": "lut", "path": "looks/kodak_2383.cube", "amount": 0.8 }
+```
+
+A `.cube` colour lookup table, in either the 3D or the 1D form. This is the one
+colour format worth supporting, because it is the one every grading tool
+exports and every other tool reads: it is the difference between "you can grade
+here" and "you can bring the grade you already made".
+
+`amount` mixes back toward the ungraded image, which is the control a grading
+tool calls opacity. It is a track, so a look can be dialled in over a shot.
+
+A 1D table is expanded into a cube on load, so the pixel loop has one case
+instead of two. That is exact rather than an approximation — a 1D LUT means the
+three axes are independent, which is precisely a separable cube.
+
+**Interpolation is trilinear.** Tetrahedral is what grading applications use and
+is marginally better: it follows the cube's grey diagonal exactly, where
+trilinear drifts a little off it and can tint a neutral. For the smooth tables
+that make up nearly every real `.cube` the drift is well under one code value —
+an identity LUT round-trips **bit-exactly** here. If a look ever visibly tints
+greys, that is the thing to change.
+
+**A malformed file stops the render** rather than being applied partially: a
+declared size that does not match the row count means the stride is wrong, and a
+LUT read with the wrong stride still produces an image, in wrong colour. A
+`DOMAIN_MIN`/`DOMAIN_MAX` other than 0..1 is reported and then used as-is —
+those files expect log footage, which nothing here produces, so the result is a
+look rather than the grade that was intended.
 
 ---
 

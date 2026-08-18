@@ -364,6 +364,21 @@ typedef struct {
     bool       mask_invert;
 
     /*
+     * Chroma key: a backdrop colour to knock out of this layer.
+     *
+     * Per-object rather than an entry in the effect stack, because the green in
+     * a green screen is a fact about one clip. Keying the finished frame would
+     * take the same green out of everything composited behind it as well.
+     *
+     * `key_on` false is the default and costs one comparison in the pixel loop.
+     */
+    bool       key_on;
+    Color      key_color;
+    float      key_tolerance;   /* chroma distance removed outright */
+    float      key_softness;    /* the ramp beyond it               */
+    float      key_spill;       /* how hard to pull the fringe back */
+
+    /*
      * Drop shadow / glow.
      *
      * Both are the same operation: blur the object's own alpha, tint it, and
@@ -584,6 +599,23 @@ typedef struct {
     float   *verts;          /* 3 floats each, model space */
     float   *norms;          /* 3 floats each; NULL when the mesh has none */
     float   *uvs;            /* 2 floats each; NULL when the mesh has none */
+
+    /*
+     * Surface tangents, 4 floats each: the direction of increasing u, and a
+     * handedness of +1 or -1 in the fourth.
+     *
+     * Only a normal map needs them, so they are only built when one is
+     * present — they are a third of the size of the position array again, and
+     * on a scanned prop that is real memory spent on nothing.
+     *
+     * The handedness is what makes the fourth float necessary rather than
+     * storing the bitangent outright. A UV layout is free to mirror across a
+     * seam — the two halves of a face reusing one half of the texture is the
+     * usual case — and on the mirrored side the bitangent runs the other way.
+     * One sign per vertex reconstructs it; a stored bitangent would have to be
+     * interpolated and would go through zero at the seam.
+     */
+    float   *tans;           /* 4 floats each; NULL when the mesh has none */
     size_t   vert_count;
     MeshTri *tris;
     size_t   tri_count;
@@ -600,6 +632,58 @@ typedef struct {
 
     Texture  tex;            /* optional surface texture; pixels NULL if none */
     char    *tex_path;
+
+    /*
+     * Ambient occlusion, in the red channel — where glTF puts it, and where the
+     * packed ORM/ARM maps that ship with scanned assets keep it too.
+     */
+    Texture  ao;
+    char    *ao_path;
+    float    ao_strength;    /* 0 = ignore the map, 1 = full */
+
+    /*
+     * Normal map, in tangent space — the RGB convention glTF uses, where a
+     * texel of (128, 128, 255) is "unchanged" and everything else tilts the
+     * surface normal without moving a single vertex.
+     *
+     * This is the map that earns its keep on a low-polygon model: a plank with
+     * two triangles per face gets the grain and the nail holes of one with
+     * thousands, because the lighting is decided per pixel from the map rather
+     * than per vertex from the geometry.
+     *
+     * `normal_scale` is glTF's `normalTexture.scale` — how far the perturbation
+     * is allowed to go. 1 is the map as authored; smaller flattens it, and 0
+     * turns it off without unloading the image.
+     */
+    Texture  nrm;
+    char    *nrm_path;
+    float    normal_scale;
+
+    /*
+     * Emissive colour: light the surface gives off rather than reflects.
+     *
+     * Added after the shading, so it survives being in shadow — which is the
+     * point. A screen, a filament or a signal lamp reads as switched on only
+     * because it stays bright where the rest of the object has gone dark; a
+     * bright albedo cannot do that, because every lighting term multiplies it.
+     */
+    Texture  emis;
+    char    *emis_path;
+    Color    emissive;       /* multiplier; black = off, which is the default */
+    float    emissive_strength;
+
+    /*
+     * Blinn-Phong highlight. `specular` is its strength and 0 turns it off,
+     * which is the default — a matte surface is the honest starting point, and
+     * it keeps every scene written before this unchanged.
+     *
+     * `shininess` is the exponent: small numbers give a broad sheen, large ones
+     * a tight glint. It is per-vertex, so a highlight smaller than a triangle
+     * can slip between vertices; dense meshes and broad exponents are where it
+     * behaves.
+     */
+    float    specular;
+    float    shininess;
 
     /*
      * Where this mesh's triangles live inside the renderer's shared staging
@@ -641,6 +725,10 @@ typedef struct {
      * stepped outline.
      */
     bool     antialias;
+
+    /* Bilinear texture sampling. On by default; "filter": "nearest" opts out,
+     * which is what a deliberately blocky look wants. */
+    bool     filter;
 } MeshWidget;
 
 /* A raster image (PNG/JPG), loaded with stb_image. */

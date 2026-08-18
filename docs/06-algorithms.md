@@ -378,3 +378,44 @@ so every externally supplied value is single-quoted, with `'` escaped as `'\''`.
 
 Verified: `-o "x'; touch pwned.txt; echo '.mp4"` creates a file with that literal
 name and executes nothing.
+
+## Tangent frames for normal mapping
+
+A tangent-space normal map stores a direction relative to the surface, so
+reading one needs a frame at every pixel: the normal, the direction in which the
+texture's `u` increases, and their cross product. The normal is already there.
+The other two come from the UV layout.
+
+Per triangle, the two edges in space and the same two edges in UV give a 2×2
+system whose solution is the u-direction; the v-direction falls out of the same
+solve. Accumulate both per vertex, orthogonalise the tangent against the normal,
+and normalise.
+
+Three details are each worth a bug:
+
+**Accumulate unweighted.** Vertex normals are area-weighted, so a sliver does
+not skew the surface. Tangents are not, and should not be: the tangent describes
+the texture's parameterisation rather than the surface's shape, and a wall built
+from one large quad and a strip of small ones would otherwise twist its frame
+along the join.
+
+**Keep the handedness as a sign, and never interpolate it.** A UV layout is free
+to mirror across a seam — two halves of a face reusing one half of the texture
+is the ordinary case — and on the mirrored side the bitangent runs backwards.
+One `±1` per vertex reconstructs it. Interpolating that sign puts a zero halfway
+across any triangle spanning the seam, which is a bitangent of no length; the
+frame is genuinely discontinuous there, so the triangle takes one vertex's sign
+and no interpolation would have helped.
+
+**Tangents take the forward transform, normals the inverse transpose.** They
+point in different ways for a reason: squash an object flat and its normals
+splay outward while its surface directions squash with it. Using the normal's
+transform on the tangent skews the frame against the geometry on every
+non-uniformly scaled mesh — a lamp post, a wall, anything given a three-element
+`size`.
+
+Degenerate cases are common and quiet. A triangle collapsed to a point in UV
+space — every model has a few, at a pole or a closed seam — has no direction to
+extract and contributes nothing rather than dividing by zero. A vertex left with
+no usable direction gets an arbitrary perpendicular, which reads as noise but
+never as a discontinuity, and is counted and reported.

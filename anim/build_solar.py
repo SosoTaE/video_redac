@@ -58,10 +58,12 @@ ACCENT = "#F0B357"
 def prepare(src, width):
     """Downscales a map to `width` and returns the path to the copy.
 
-    Sampling is nearest-neighbour with no mipmaps, so a 2048-wide map on a
-    160-pixel planet takes one texel out of every thirteen — and picks a
-    different one each frame as the globe turns, which crawls. Pre-scaling to
-    roughly the size the body is actually drawn at is what stops that.
+    Sampling is bilinear now, which fixes magnification, but there are still no
+    mipmaps — so a 2048-wide map on a 160-pixel planet is being *minified* by a
+    factor of thirteen, and bilinear only ever averages four texels of the
+    thirteen-by-thirteen block it should. Pre-scaling to roughly the size the
+    body is actually drawn at is what covers the rest, and it stays until
+    mipmaps exist.
     """
     from PIL import Image
 

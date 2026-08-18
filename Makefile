@@ -25,7 +25,27 @@
 # =============================================================================
 
 TARGET   := video_redac
-BUILD    := build
+
+#
+# One object directory per backend.
+#
+# They used to share `build`, and because the two backends also share the
+# binary's name, switching between them did nothing at all: `make CPU=1` after a
+# CUDA build found the target newer than every object it cared about and
+# reported "nothing to be done", leaving the CUDA binary in place. A CPU/GPU
+# comparison run that way compares the GPU against itself and reports perfect
+# agreement, which is the most convincing way possible to measure nothing.
+#
+# Separate directories make the switch visible to make in one direction: under
+# CPU=1 the objects are simply absent, so they get built. It is not enough on
+# its own — going *back* to the CUDA build, its objects are all present and the
+# binary the CPU build just wrote is newer than every one of them, so make would
+# again say "nothing to be done" and leave the wrong backend in place.
+#
+# What no timestamp can express is *which* backend produced ./video_redac, so
+# the answer is written down: see BACKEND_STAMP below.
+BACKEND  := $(if $(CPU),cpu,gpu)
+BUILD    := build/$(BACKEND)
 
 # --- Tools ------------------------------------------------------------------
 CC       := gcc
@@ -138,12 +158,27 @@ endif
 
 all: $(TARGET)
 
+#
+# Which backend last wrote ./$(TARGET), as a file whose *content* is the answer.
+#
+# Rewritten only when the answer changes, so its timestamp moves exactly when
+# the backend does and never otherwise — the binary depends on it, so switching
+# backends relinks and staying put does not.
+BACKEND_STAMP := build/.backend
+
+.PHONY: FORCE
+FORCE:
+
+$(BACKEND_STAMP): FORCE
+	@mkdir -p $(dir $@)
+	@echo '$(BACKEND)' | cmp -s - $@ || echo '$(BACKEND)' > $@
+
 # CUDA build: nvcc links, adding -lcudart itself and doing device linking.
 # CPU build:  gcc links; nothing here refers to CUDA at all.
-$(TARGET): $(OBJS)
+$(TARGET): $(OBJS) $(BACKEND_STAMP)
 	@echo "  LD      $@"
-	@$(LINK) $(LINKFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
-	@echo "  ready → ./$@"
+	@$(LINK) $(LINKFLAGS) $(LDFLAGS) -o $@ $(OBJS) $(LDLIBS)
+	@echo "  ready → ./$@ ($(BACKEND))"
 
 # --- Host C11 ---------------------------------------------------------------
 $(BUILD)/%.o: %.c
@@ -213,7 +248,7 @@ info:
 	@echo "GENCODE   : $(GENCODE)"
 
 clean:
-	@rm -rf $(BUILD) $(TARGET)
+	@rm -rf build $(TARGET)
 	@echo "  cleaned"
 
 # Remove render output (leaves the build alone)

@@ -1886,6 +1886,52 @@ bool media_prepare_textures(EditorContext *ctx)
                                 b->id ? b->id : "(null)", mw->tex_path);
                     }
                 }
+                if (mw->ao_path != NULL) {
+                    if (!media_load_image_rgba(mw->ao_path, &mw->ao)) {
+                        fprintf(stderr, "warning: mesh '%s' — cannot load occlusion map "
+                                        "'%s'.\n", b->id ? b->id : "(null)", mw->ao_path);
+                    } else if (mw->ao.pixels != NULL) {
+                        /*
+                         * Occlusion is mostly open sky: a plausible map averages
+                         * bright, with dark only in the creases. A very dark one
+                         * means the red channel was never occlusion at all —
+                         * an unused channel left at zero — and multiplying by it
+                         * would black the object out. Better to drop it and say
+                         * so than to render something uniformly wrong.
+                         */
+        /* RGBA8, so the red byte of texel k is at 4k. */
+                        const uint8_t *px = mw->ao.pixels;
+                        size_t n = (size_t)mw->ao.width * mw->ao.height;
+                        unsigned long long sum = 0;
+                        for (size_t k = 0; k < n; k++) {
+                            sum += px[k * 4];
+                        }
+                        double mean = (n > 0) ? (double)sum / (double)n : 0.0;
+                        if (mean < 25.0) {
+                            fprintf(stderr, "warning: mesh '%s' — '%s' averages %.0f/255 "
+                                            "in red; that is not occlusion, ignoring it.\n",
+                                    b->id ? b->id : "(null)", mw->ao_path, mean);
+                            texture_free(&mw->ao);
+                        }
+                    }
+                }
+                if (mw->nrm_path != NULL) {
+                    if (!media_load_image_rgba(mw->nrm_path, &mw->nrm)) {
+                        fprintf(stderr, "warning: mesh '%s' — cannot load normal map "
+                                        "'%s'.\n", b->id ? b->id : "(null)", mw->nrm_path);
+                    } else if (mw->nrm.pixels != NULL && mw->tans == NULL) {
+                        fprintf(stderr, "warning: mesh '%s' — a normal map without "
+                                        "tangents cannot be applied; ignoring it.\n",
+                                b->id ? b->id : "(null)");
+                        texture_free(&mw->nrm);
+                    }
+                }
+                if (mw->emis_path != NULL) {
+                    if (!media_load_image_rgba(mw->emis_path, &mw->emis)) {
+                        fprintf(stderr, "warning: mesh '%s' — cannot load emissive map "
+                                        "'%s'.\n", b->id ? b->id : "(null)", mw->emis_path);
+                    }
+                }
                 break;
             }
             case WIDGET_VIDEO:

@@ -40,6 +40,21 @@ static int json_int_of(const cJSON *o, const char *k, int def)
     return cJSON_IsNumber(v) ? (int)v->valuedouble : def;
 }
 
+static float json_float_of(const cJSON *o, const char *k, float def)
+{
+    const cJSON *v = cJSON_GetObjectItemCaseSensitive(o, k);
+    return cJSON_IsNumber(v) ? (float)v->valuedouble : def;
+}
+
+/* 0..1 as a colour byte. The emissive factor is a float in the file and a
+ * Color in the widget, and this is the whole of the conversion. */
+static unsigned char byte_of(float v)
+{
+    if (v <= 0.0f) return 0;
+    if (v >= 1.0f) return 255;
+    return (unsigned char)(v * 255.0f + 0.5f);
+}
+
 static const char *json_str_of(const cJSON *o, const char *k)
 {
     const cJSON *v = cJSON_GetObjectItemCaseSensitive(o, k);
@@ -475,6 +490,22 @@ typedef struct {
     size_t      attrib_cap;
     int         skipped_modes;
     int         tex_source;      /* image index of the first base colour map */
+    int         ao_source;       /* ...and of the first occlusion map        */
+    int         nrm_source;      /* ...and of the first normal map           */
+    int         emis_source;     /* ...and of the first emissive map         */
+    bool        ao_packed;       /* it came from an ARM map, not a declared one */
+    float       normal_scale;    /* normalTexture.scale, 1 when unstated     */
+    float       emissive[3];     /* emissiveFactor, black when unstated      */
+    /*
+     * Set when any primitive arrived without TANGENT.
+     *
+     * All or nothing: a file that supplies tangents for some primitives and not
+     * others would otherwise get a frame on part of the model and zeroes on the
+     * rest, which reads as one half of an object lit correctly and the other
+     * half black. Deriving the lot from the UVs is both consistent and close
+     * enough — the exporter derived its own from the same parameterisation.
+     */
+    bool        tan_missing;
 } Build;
 
 /* Grows the attribute arrays geometrically. They are indexed by vertex, so
@@ -497,14 +528,103 @@ static bool reserve_attribs(Build *bld, size_t need)
 
 static void note_texture(const Gltf *g, Build *bld, int material)
 {
-    if (bld->tex_source >= 0 || material < 0) {
+    if ((bld->tex_source >= 0 && bld->ao_source >= 0 &&
+         bld->nrm_source >= 0 && bld->emis_source >= 0) || material < 0) {
         return;
     }
     const cJSON *mat = at(g->materials, material);
     if (mat == NULL) {
         return;
     }
+    /*
+     * Occlusion first, because it is often the same image as the metallic /
+     * roughness map — the ARM packing — and a material may name that one
+     * without naming a base colour at all.
+     */
+    const cJSON *occ = cJSON_GetObjectItemCaseSensitive(mat, "occlusionTexture");
+    if (occ != NULL) {
+        const cJSON *ot = at(g->textures, json_int_of(occ, "index", -1));
+        if (ot != NULL) {
+            bld->ao_source = json_int_of(ot, "source", -1);
+        }
+    }
+
     const cJSON *pbr = cJSON_GetObjectItemCaseSensitive(mat, "pbrMetallicRoughness");
+
+    /*
+     * No occlusionTexture? Try the metallic/roughness map's red channel.
+     *
+     * glTF reserves red and alpha there as unused, which is exactly why the
+     * "ARM" packing — occlusion, roughness, metalness in R, G, B — became the
+     * common way to ship three maps as one image. Plenty of exporters, Poly
+     * Haven's among them, pack that way and then never declare the occlusion
+     * slot, so following the declaration alone finds nothing.
+     *
+     * This is a convention rather than a guarantee, so it is not trusted
+     * blindly: the loader checks that the channel actually looks like occlusion
+     * before using it, and drops it if not.
+     */
+    if (bld->ao_source < 0 && pbr != NULL) {
+        const cJSON *mrt = cJSON_GetObjectItemCaseSensitive(pbr, "metallicRoughnessTexture");
+        if (mrt != NULL) {
+            const cJSON *mt = at(g->textures, json_int_of(mrt, "index", -1));
+            if (mt != NULL) {
+                bld->ao_source = json_int_of(mt, "source", -1);
+                bld->ao_packed = true;
+            }
+        }
+    }
+
+    /*
+     * The normal map, and with it the one material scalar worth reading: glTF's
+     * normalTexture.scale, which the exporter sets when the map was baked
+     * stronger or weaker than the surface should actually look.
+     */
+    if (bld->nrm_source < 0) {
+        const cJSON *nt = cJSON_GetObjectItemCaseSensitive(mat, "normalTexture");
+        if (nt != NULL) {
+            const cJSON *tt = at(g->textures, json_int_of(nt, "index", -1));
+            if (tt != NULL) {
+                bld->nrm_source  = json_int_of(tt, "source", -1);
+                bld->normal_scale = json_float_of(nt, "scale", 1.0f);
+            }
+        }
+    }
+
+    /*
+     * Emissive. The factor is read even without a map, because a material that
+     * glows uniformly — a bare filament, a painted-on indicator — states it
+     * with the factor alone and has no texture at all.
+     */
+    if (bld->emis_source < 0) {
+        const cJSON *ef = cJSON_GetObjectItemCaseSensitive(mat, "emissiveFactor");
+        if (cJSON_IsArray(ef) && cJSON_GetArraySize(ef) >= 3) {
+            for (int k = 0; k < 3; k++) {
+                const cJSON *c = cJSON_GetArrayItem(ef, k);
+                if (cJSON_IsNumber(c)) {
+                    bld->emissive[k] = (float)c->valuedouble;
+                }
+            }
+        }
+        const cJSON *et = cJSON_GetObjectItemCaseSensitive(mat, "emissiveTexture");
+        if (et != NULL) {
+            const cJSON *tt = at(g->textures, json_int_of(et, "index", -1));
+            if (tt != NULL) {
+                bld->emis_source = json_int_of(tt, "source", -1);
+                /*
+                 * A material with an emissive texture and no factor still
+                 * glows: the spec's default factor is black, but exporters that
+                 * omit it while naming a map plainly mean the map. Treating
+                 * that as "off" would drop every lit screen in the file.
+                 */
+                if (bld->emissive[0] == 0.0f && bld->emissive[1] == 0.0f &&
+                    bld->emissive[2] == 0.0f) {
+                    bld->emissive[0] = bld->emissive[1] = bld->emissive[2] = 1.0f;
+                }
+            }
+        }
+    }
+
     const cJSON *bct = (pbr != NULL)
         ? cJSON_GetObjectItemCaseSensitive(pbr, "baseColorTexture") : NULL;
     if (bct == NULL) {
@@ -537,7 +657,7 @@ static bool add_primitive(const Gltf *g, Build *bld, const cJSON *prim, const fl
         return true;
     }
 
-    Accessor pos, nrm, uv;
+    Accessor pos, nrm, uv, tan;
     if (!acc_open(g, json_int_of(attr, "POSITION", -1), &pos)) {
         return true;              /* no positions: nothing to draw */
     }
@@ -545,6 +665,17 @@ static bool add_primitive(const Gltf *g, Build *bld, const cJSON *prim, const fl
                  && nrm.count >= pos.count;
     bool has_uv = acc_open(g, json_int_of(attr, "TEXCOORD_0", -1), &uv)
                  && uv.count >= pos.count;
+    /*
+     * TANGENT is a vec4: the direction of increasing u, and a handedness in w.
+     *
+     * Worth reading rather than always deriving, because an exporter's
+     * tangents are the ones the normal map was baked against — usually
+     * MikkTSpace, whose whole purpose is that the baker and the renderer agree.
+     * Deriving from the UVs lands very close, but "very close" is visible as a
+     * faint shift in where a bevel catches the light.
+     */
+    bool has_tan = acc_open(g, json_int_of(attr, "TANGENT", -1), &tan)
+                 && tan.count >= pos.count && tan.comps >= 4;
 
     /*
      * Normals transform by the inverse transpose, which for the rigid and
@@ -557,6 +688,19 @@ static bool add_primitive(const Gltf *g, Build *bld, const cJSON *prim, const fl
 
     if (!reserve_attribs(bld, (size_t)base + (size_t)pos.count)) {
         return false;
+    }
+    /*
+     * Grown whenever the array exists at all, not only when this primitive has
+     * tangents: the array is indexed by vertex, so a primitive that contributes
+     * none still has to leave room for its own vertices or the next one writes
+     * past the end.
+     */
+    if ((bld->m->tans != NULL || has_tan) &&
+        !vr_mesh_ensure_tangents(bld->m, (size_t)base + (size_t)pos.count)) {
+        return false;
+    }
+    if (!has_tan) {
+        bld->tan_missing = true;
     }
 
     for (int i = 0; i < pos.count; i++) {
@@ -586,6 +730,28 @@ static bool add_primitive(const Gltf *g, Build *bld, const cJSON *prim, const fl
         vr_mesh_set_attrib(bld->m, nx, ny, nz,
                            has_uv ? acc_read(&uv, i, 0) : 0.0f,
                            has_uv ? acc_read(&uv, i, 1) : 0.0f);
+
+        if (bld->m->tans != NULL) {
+            float tx = 0.0f, ty = 0.0f, tz = 0.0f, tw = 0.0f;
+            if (has_tan) {
+                float bx = acc_read(&tan, i, 0);
+                float by = acc_read(&tan, i, 1);
+                float bz = acc_read(&tan, i, 2);
+                /* A tangent is a direction along the surface, so it takes the
+                 * transform itself rather than its inverse transpose — the
+                 * translation column is simply not applied. */
+                tx = xf[0] * bx + xf[4] * by + xf[8]  * bz;
+                ty = xf[1] * bx + xf[5] * by + xf[9]  * bz;
+                tz = xf[2] * bx + xf[6] * by + xf[10] * bz;
+                float l = sqrtf(tx * tx + ty * ty + tz * tz);
+                if (l > 1e-12f) { tx /= l; ty /= l; tz /= l; }
+                /* The handedness survives the node transform untouched: every
+                 * transform on the way in here is a rotation composed with a
+                 * positive scale, and neither reverses a cross product. */
+                tw = (acc_read(&tan, i, 3) < 0.0f) ? -1.0f : 1.0f;
+            }
+            vr_mesh_set_tangent(bld->m, tx, ty, tz, tw);
+        }
     }
 
     /*
@@ -759,6 +925,10 @@ bool vr_mesh_load_gltf(MeshWidget *m, size_t *vc, size_t *tc)
     bld.vc = vc;
     bld.tc = tc;
     bld.tex_source = -1;
+    bld.ao_source = -1;
+    bld.nrm_source = -1;
+    bld.emis_source = -1;
+    bld.normal_scale = 1.0f;
 
     /*
      * glTF is Y-up and +Z points at the viewer; this renderer's world is Y-down
@@ -836,6 +1006,68 @@ bool vr_mesh_load_gltf(MeshWidget *m, size_t *vc, size_t *tc)
                             "set \"texture\" on the object to supply it as a file.\n",
                     m->path);
         }
+    }
+
+    if (ok && bld.ao_source >= 0 && m->ao_path == NULL) {
+        const cJSON *img = at(g.images, bld.ao_source);
+        const char *uri = (img != NULL) ? json_str_of(img, "uri") : NULL;
+        if (uri != NULL && strncmp(uri, "data:", 5) != 0) {
+            m->ao_path = sibling_path(m->path, uri);
+            if (m->ao_path != NULL) {
+                uri_unescape(m->ao_path);
+                if (bld.ao_packed) {
+                    fprintf(stderr, "note: glTF '%s' — no occlusionTexture; reading "
+                                    "occlusion from the red channel of '%s'.\n",
+                            m->path, uri);
+                }
+            }
+        }
+    }
+
+    if (ok && bld.nrm_source >= 0 && m->nrm_path == NULL) {
+        const cJSON *img = at(g.images, bld.nrm_source);
+        const char *uri = (img != NULL) ? json_str_of(img, "uri") : NULL;
+        if (uri != NULL && strncmp(uri, "data:", 5) != 0) {
+            m->nrm_path = sibling_path(m->path, uri);
+            if (m->nrm_path != NULL) {
+                uri_unescape(m->nrm_path);
+                /* The project's own normal_scale, if it set one, wins over the
+                 * material's — same rule as every other map here. */
+                if (m->normal_scale < 0.0f) {
+                    m->normal_scale = bld.normal_scale;
+                }
+            }
+        }
+    }
+
+    if (ok && bld.emis_source >= 0 && m->emis_path == NULL) {
+        const cJSON *img = at(g.images, bld.emis_source);
+        const char *uri = (img != NULL) ? json_str_of(img, "uri") : NULL;
+        if (uri != NULL && strncmp(uri, "data:", 5) != 0) {
+            m->emis_path = sibling_path(m->path, uri);
+            if (m->emis_path != NULL) {
+                uri_unescape(m->emis_path);
+            }
+        }
+    }
+    if (ok && m->emissive_strength < 0.0f &&
+        (bld.emissive[0] > 0.0f || bld.emissive[1] > 0.0f || bld.emissive[2] > 0.0f)) {
+        m->emissive.r = byte_of(bld.emissive[0]);
+        m->emissive.g = byte_of(bld.emissive[1]);
+        m->emissive.b = byte_of(bld.emissive[2]);
+        m->emissive.a = 255;
+        m->emissive_strength = 1.0f;
+    }
+
+    /*
+     * Tangents are all or nothing. If any primitive came without them the
+     * partial array is thrown away here, and mesh_load derives the whole set
+     * from the UVs — one consistent frame beats a correct one on part of the
+     * model and zeroes on the rest.
+     */
+    if (bld.tan_missing && m->tans != NULL) {
+        free(m->tans);
+        m->tans = NULL;
     }
 
     gltf_release(&g);

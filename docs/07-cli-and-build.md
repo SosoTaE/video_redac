@@ -78,6 +78,13 @@ exactly one is compiled — the Makefile filters the other out of the wildcard.
 `CPU=1` also switches the linker to plain `gcc`, drops `-L$(CUDA_HOME)/lib64`
 and adds `-fopenmp`; nothing in that path refers to CUDA, which is the point.
 
+Each backend gets its own object directory — `build/gpu` and `build/cpu` — so
+switching between them without a `make clean` works. They used to share one, and
+since the two also share the binary's name, `make CPU=1` after a CUDA build
+found the binary newer than every object it cared about and reported "nothing to
+be done", leaving the CUDA binary in place. See
+[09-backends.md](09-backends.md) for why that particular silence is expensive.
+
 Details and the shared-code layout: [09-backends.md](09-backends.md).
 
 ### GPU architecture

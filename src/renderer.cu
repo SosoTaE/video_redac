@@ -159,14 +159,15 @@ __global__ void k_rgba_to_nv12(const uchar4 *__restrict__ rgba,
 
 /* Kernel for the pointwise effects — several of them share this one pass. */
 __global__ void k_fx_point(uchar4 *__restrict__ dst, const uchar4 *__restrict__ src,
-                           int w, int h, EffectGPU fx, unsigned int seed)
+                           int w, int h, EffectGPU fx,
+                           const float *__restrict__ lut, unsigned int seed)
 {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || y >= h) {
         return;
     }
-    vr_px_fx_point(dst, src, w, h, &fx, seed, x, y);
+    vr_px_fx_point(dst, src, w, h, &fx, lut, seed, x, y);
 }
 
 __global__ void k_fx_blur(uchar4 *__restrict__ dst, const uchar4 *__restrict__ src,
@@ -252,7 +253,7 @@ __global__ void k_highlight(uchar4 *__restrict__ fb, const uchar4 *__restrict__ 
 
 __global__ void k_mesh(uchar4 *__restrict__ fb, float *__restrict__ depth,
                        const ScreenTri *__restrict__ tris,
-                       const uchar4 *__restrict__ tex, MeshParams p)
+                       MeshTextures maps, MeshParams p)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int j = blockIdx.y * blockDim.y + threadIdx.y;
@@ -260,7 +261,7 @@ __global__ void k_mesh(uchar4 *__restrict__ fb, float *__restrict__ depth,
     if (i >= p.bb_w || j >= p.bb_h) {
         return;
     }
-    vr_px_mesh(fb, depth, tris, tex, &p, i, j);
+    vr_px_mesh(fb, depth, tris, maps, &p, i, j);
 }
 
 /* Resets the shared depth buffer at the start of a scene. */
@@ -319,6 +320,47 @@ static bool upload_one_texture(Texture *t, RenderResources *res)
     return true;
 }
 
+/*
+ * Uploads one effect's colour cube, if it has one.
+ *
+ * Separate from the texture path because a LUT is not a texture: it is float
+ * data addressed as a lattice rather than bytes addressed as pixels, and
+ * quantising it to RGBA8 to reuse that path would band every gradient the LUT
+ * touches — which is precisely what a look is applied to.
+ */
+static bool upload_one_lut(Effect *fx, RenderResources *res)
+{
+    if (fx->type != FX_LUT || fx->lut == NULL || fx->d_lut != NULL) {
+        return true;
+    }
+    size_t bytes = (size_t)fx->lut_size * fx->lut_size * fx->lut_size
+                 * 3u * sizeof(float);
+    void *d_ptr = NULL;
+    CUDA_TRY(cudaMalloc(&d_ptr, bytes));
+    CUDA_TRY(cudaMemcpy(d_ptr, fx->lut, bytes, cudaMemcpyHostToDevice));
+    fx->d_lut = d_ptr;
+    res->texture_bytes += bytes;
+    return true;
+}
+
+static bool upload_luts(EditorContext *ctx, RenderResources *res)
+{
+    for (size_t i = 0; i < ctx->effect_count; i++) {
+        if (!upload_one_lut(&ctx->effects[i], res)) {
+            return false;
+        }
+    }
+    for (size_t s = 0; s < ctx->scene_count; s++) {
+        Scene *sc = &ctx->scenes[s];
+        for (size_t i = 0; i < sc->effect_count; i++) {
+            if (!upload_one_lut(&sc->effects[i], res)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 /* Uploads every (already rasterized) texture to VRAM — once. */
 static bool upload_textures(EditorContext *ctx, RenderResources *res)
 {
@@ -341,7 +383,10 @@ static bool upload_textures(EditorContext *ctx, RenderResources *res)
          * empty because a mesh is rasterized rather than composited. */
         if (b->kind == WIDGET_MESH) {
             MeshWidget *mw = (MeshWidget *)b;
-            if (!upload_one_texture(&mw->tex, res)) {
+            if (!upload_one_texture(&mw->tex, res) ||
+                !upload_one_texture(&mw->ao, res) ||
+                !upload_one_texture(&mw->nrm, res) ||
+                !upload_one_texture(&mw->emis, res)) {
                 return false;
             }
         }
@@ -455,6 +500,9 @@ bool renderer_init(EditorContext *ctx)
         CUDA_TRY(cudaEventCreateWithFlags(&slot->done, cudaEventDisableTiming));
     }
 
+    if (!upload_luts(ctx, res)) {
+        return false;
+    }
     if (!upload_textures(ctx, res)) {
         return false;
     }
@@ -496,10 +544,33 @@ void renderer_shutdown(EditorContext *ctx)
         }
 
         if (b->kind == WIDGET_MESH) {
+            /* Every map the mesh wears. The list has to be kept in step with
+             * upload_textures: a map added there and forgotten here leaks its
+             * VRAM silently, because nothing else refers to the pointer. */
             MeshWidget *mw = (MeshWidget *)b;
-            if (mw->tex.d_pixels != NULL) {
-                cudaFree(mw->tex.d_pixels);
-                mw->tex.d_pixels = NULL;
+            Texture *maps[] = { &mw->tex, &mw->ao, &mw->nrm, &mw->emis };
+            for (size_t k = 0; k < sizeof maps / sizeof *maps; k++) {
+                if (maps[k]->d_pixels != NULL) {
+                    cudaFree(maps[k]->d_pixels);
+                    maps[k]->d_pixels = NULL;
+                }
+            }
+        }
+    }
+
+    /* The colour cubes, which live on the effects rather than on a widget. */
+    for (size_t i = 0; i < ctx->effect_count; i++) {
+        if (ctx->effects[i].d_lut != NULL) {
+            cudaFree(ctx->effects[i].d_lut);
+            ctx->effects[i].d_lut = NULL;
+        }
+    }
+    for (size_t s = 0; s < ctx->scene_count; s++) {
+        Scene *sc = &ctx->scenes[s];
+        for (size_t i = 0; i < sc->effect_count; i++) {
+            if (sc->effects[i].d_lut != NULL) {
+                cudaFree(sc->effects[i].d_lut);
+                sc->effects[i].d_lut = NULL;
             }
         }
     }
@@ -632,8 +703,9 @@ static uchar4 *apply_effect_list(const Effect *list, size_t count, RenderResourc
                 break;
 
             default:
-                k_fx_point<<<grid, block, 0, slot->stream>>>(dst, src, res->width,
-                                                             res->height, g, seed);
+                k_fx_point<<<grid, block, 0, slot->stream>>>(
+                    dst, src, res->width, res->height, g,
+                    (const float *)fx->d_lut, seed);
                 CUDA_CHECK_KERNEL();
                 break;
         }
@@ -721,9 +793,13 @@ static void render_scene_into(const EditorContext *ctx, RenderResources *res, in
                     const dim3 mblock(16, 16);
                     dim3       mgrid((mp.bb_w + mblock.x - 1) / mblock.x,
                                      (mp.bb_h + mblock.y - 1) / mblock.y);
-                    const uchar4 *mtex = (const uchar4 *)mw->tex.d_pixels;
+                    MeshTextures maps;
+                    maps.base = (const uchar4 *)mw->tex.d_pixels;
+                    maps.ao   = (const uchar4 *)mw->ao.d_pixels;
+                    maps.nrm  = (const uchar4 *)mw->nrm.d_pixels;
+                    maps.emis = (const uchar4 *)mw->emis.d_pixels;
                     k_mesh<<<mgrid, mblock, 0, stream>>>(target, slot->d_depth,
-                                                         d_slice, mtex, mp);
+                                                         d_slice, maps, mp);
                     CUDA_CHECK_KERNEL();
                 }
             }

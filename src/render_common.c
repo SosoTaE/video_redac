@@ -838,6 +838,27 @@ bool vr_composite_setup(int fb_w, int fb_h, int tex_w, int tex_h,
     out->pad_y       = b->glyphs.pad_y;
     out->line_height = (b->glyphs.line_height > 0.0f) ? b->glyphs.line_height : 1.0f;
     out->line_count  = b->glyphs.line_count;
+
+    out->key_on = b->key_on ? 1 : 0;
+    if (b->key_on) {
+        out->key_r     = b->key_color.r * inv255;
+        out->key_g     = b->key_color.g * inv255;
+        out->key_b     = b->key_color.b * inv255;
+        out->key_tol   = b->key_tolerance;
+        /* A zero-width ramp would divide by zero in the smoothstep; a hair's
+         * width instead keeps the branch arithmetic and gives a hard key. */
+        out->key_soft  = (b->key_softness > 1e-4f) ? b->key_softness : 1e-4f;
+        out->key_spill = vr_clampf(b->key_spill, 0.0f, 1.0f);
+
+        /* Which channel the key colour leans on — spill suppression needs it,
+         * and it is the same for every pixel. */
+        out->key_dom = 0;
+        if (b->key_color.g >= b->key_color.r && b->key_color.g >= b->key_color.b) {
+            out->key_dom = 1;
+        } else if (b->key_color.b >= b->key_color.r && b->key_color.b >= b->key_color.g) {
+            out->key_dom = 2;
+        }
+    }
     return true;
 }
 
@@ -958,22 +979,6 @@ bool vr_depth_order(const Scene *scene, const WidgetRuntime *rt, int *order)
 
 static int b_blend_of(const MeshWidget *m) { return m->base.blend; }
 
-/*
- * Inverse-square falloff, softened so it never blows up at the source.
- *
- * `range` is where the light is down to half. Zero means no falloff, which is
- * what a sun wants and what every scene written before this existed assumes —
- * so it is also the default.
- */
-static float vr_falloff(float dist, float range)
-{
-    if (range <= 0.0f) {
-        return 1.0f;
-    }
-    float t = dist / range;
-    return 1.0f / (1.0f + t * t);
-}
-
 int vr_mesh_project(const MeshWidget *m, const WidgetRuntime *rt,
                     int fb_w, int fb_h, const float view[12],
                     const Light *lights, int light_count,
@@ -1057,6 +1062,7 @@ int vr_mesh_project(const MeshWidget *m, const WidgetRuntime *rt,
      */
     bool two_sided = !m->cull;
 
+
     /*
      * The light is moved into view space once, here, rather than moving every
      * surface point back into world space. Both give the same dot product —
@@ -1078,7 +1084,10 @@ int vr_mesh_project(const MeshWidget *m, const WidgetRuntime *rt,
         const MeshTri *tri = &m->tris[t];
 
         float wx[3], wy[3], wz[3];      /* view space: x, y, and depth */
-        float vlit[3], vu[3], vv[3];
+        float vnx[3], vny[3], vnz[3];   /* view-space normals */
+        float vtx[3], vty[3], vtz[3];   /* view-space tangents */
+        float vu[3], vv[3];
+        float hand = 1.0f;
 
         for (int k = 0; k < 3; k++) {
             const float *v = &m->verts[(size_t)tri->v[k] * 3];
@@ -1096,47 +1105,53 @@ int vr_mesh_project(const MeshWidget *m, const WidgetRuntime *rt,
 
             wx[k] = X; wy[k] = Y; wz[k] = Z;
 
-            /* Per-vertex shading and texture coordinates, carried through the
-             * same loop so the vertex is touched once. */
+            /*
+             * The view-space normal. Lighting used to happen here; it happens
+             * per pixel now, so all this has to do is get the normal into the
+             * same space the rasterizer will interpolate it in.
+             */
             if (m->norms != NULL) {
                 const float *nv = &m->norms[(size_t)tri->v[k] * 3];
                 float na = nv[0] * nsx, nb = nv[1] * nsy, nc = nv[2] * nsz;
                 float NX = r00*na + r01*nb + r02*nc;
                 float NY = r10*na + r11*nb + r12*nc;
                 float NZ = r20*na + r21*nb + r22*nc;
-                float len2 = NX*NX + NY*NY + NZ*NZ;
-                float lam;
 
-                if (light_count > 0) {
-                    /* Vertex normals point outward, so no sign correction is
-                     * needed here — unlike the face normals below. Clamped at
-                     * zero, which is what draws the terminator: past ninety
-                     * degrees the surface simply faces away from the light.
-                     * Several lights add up, then saturate. */
-                    float VNx = V[0]*NX + V[1]*NY + V[2]*NZ;
-                    float VNy = V[4]*NX + V[5]*NY + V[6]*NZ;
-                    float VNz = V[8]*NX + V[9]*NY + V[10]*NZ;
-                    float nl = sqrtf(VNx*VNx + VNy*VNy + VNz*VNz);
-
-                    lam = 0.0f;
-                    for (int li = 0; li < light_count; li++) {
-                        float lx = Lv[li][0] - X, ly = Lv[li][1] - Y, lz = Lv[li][2] - Z;
-                        float ll = sqrtf(lx*lx + ly*ly + lz*lz);
-                        float d = (ll > 1e-9f && nl > 1e-9f)
-                            ? (VNx*lx + VNy*ly + VNz*lz) / (ll * nl) : 1.0f;
-                        if (two_sided) d = fabsf(d);
-                        if (d > 0.0f) {
-                            lam += d * lights[li].intensity * vr_falloff(ll, lights[li].range);
-                        }
-                    }
-                    if (lam > 1.0f) lam = 1.0f;
-                } else {
-                    float VZ = V[8]*NX + V[9]*NY + V[10]*NZ;   /* rotation only */
-                    lam = (len2 > 1e-12f) ? fabsf(VZ) / sqrtf(len2) : 1.0f;
-                }
-                vlit[k] = amb + (1.0f - amb) * lam;
+                vnx[k] = V[0]*NX + V[1]*NY + V[2]*NZ;
+                vny[k] = V[4]*NX + V[5]*NY + V[6]*NZ;
+                vnz[k] = V[8]*NX + V[9]*NY + V[10]*NZ;
             } else {
-                vlit[k] = 1.0f;
+                vnx[k] = 0.0f; vny[k] = 0.0f; vnz[k] = 0.0f;
+            }
+
+            /*
+             * The tangent goes through the *forward* transform, not the inverse
+             * transpose the normal takes. It is a direction lying in the
+             * surface — the way u runs across it — so it stretches with the
+             * object: squash a plank flat and the grain squashes with it, while
+             * the normals splay the other way. Using the normal's transform
+             * here would tilt the frame against the geometry and skew every
+             * bump on a non-uniformly scaled mesh.
+             */
+            if (m->tans != NULL) {
+                const float *tv = &m->tans[(size_t)tri->v[k] * 4];
+                float ta = tv[0] * ax_, tb = tv[1] * ay_, tc = tv[2] * az_;
+                float TX = r00*ta + r01*tb + r02*tc;
+                float TY = r10*ta + r11*tb + r12*tc;
+                float TZ = r20*ta + r21*tb + r22*tc;
+
+                vtx[k] = V[0]*TX + V[1]*TY + V[2]*TZ;
+                vty[k] = V[4]*TX + V[5]*TY + V[6]*TZ;
+                vtz[k] = V[8]*TX + V[9]*TY + V[10]*TZ;
+
+                /* One sign for the triangle — the first vertex's. A sign has no
+                 * meaningful average, and the vertices only disagree on a
+                 * mirrored UV seam, where the frame is genuinely discontinuous. */
+                if (k == 0) {
+                    hand = (tv[3] < 0.0f) ? -1.0f : 1.0f;
+                }
+            } else {
+                vtx[k] = 0.0f; vty[k] = 0.0f; vtz[k] = 0.0f;
             }
             if (m->uvs != NULL) {
                 vu[k] = m->uvs[(size_t)tri->v[k] * 2];
@@ -1148,50 +1163,27 @@ int vr_mesh_project(const MeshWidget *m, const WidgetRuntime *rt,
         }
 
         /*
-         * Flat shading from the face's own normal.
+         * The face's own normal, for meshes that came without any and for the
+         * deliberately flat-shaded ones.
          *
-         * The light sits at the camera, so the term is just how much the face
-         * turns away from the viewer. It is the cheapest thing that makes a
-         * solid read as a solid — without it every face of a cube is the same
-         * colour and the shape disappears into a silhouette.
+         * Negated, because the winding this renderer keeps has the cross
+         * product pointing away from the viewer (y-down flips the projected
+         * area), while everything downstream wants the outward normal — the one
+         * a light actually strikes. Putting it in all three vertices makes the
+         * interpolation constant, so per-pixel lighting reproduces flat shading
+         * exactly rather than approximating it.
          */
         float ax = wx[1] - wx[0], ay = wy[1] - wy[0], az = wz[1] - wz[0];
         float bx = wx[2] - wx[0], by = wy[2] - wy[0], bz = wz[2] - wz[0];
-        float nx = ay * bz - az * by;
-        float ny = az * bx - ax * bz;
-        float nz = ax * by - ay * bx;
+        float fnx = -(ay * bz - az * by);
+        float fny = -(az * bx - ax * bz);
+        float fnz = -(ax * by - ay * bx);
 
-        float len = sqrtf(nx * nx + ny * ny + nz * nz);
-        float lam;
-
-        if (light_count > 0) {
-            /*
-             * Negated: this renderer keeps the face whose cross product points
-             * *away* from the viewer (y-down flips the projected winding), so
-             * the outward normal — the one the light actually strikes — is the
-             * other one. Without the sign every lit body would come out
-             * inside-out, bright exactly where it should be dark.
-             */
-            float cx_w = (wx[0] + wx[1] + wx[2]) * (1.0f / 3.0f);
-            float cy_w = (wy[0] + wy[1] + wy[2]) * (1.0f / 3.0f);
-            float cz_w = (wz[0] + wz[1] + wz[2]) * (1.0f / 3.0f);
-
-            lam = 0.0f;
-            for (int li = 0; li < light_count; li++) {
-                float lx = Lv[li][0] - cx_w, ly = Lv[li][1] - cy_w, lz = Lv[li][2] - cz_w;
-                float ll = sqrtf(lx*lx + ly*ly + lz*lz);
-                float d = (ll > 1e-9f && len > 1e-9f)
-                    ? -(nx*lx + ny*ly + nz*lz) / (ll * len) : 1.0f;
-                if (two_sided) d = fabsf(d);
-                if (d > 0.0f) {
-                    lam += d * lights[li].intensity * vr_falloff(ll, lights[li].range);
-                }
+        if (!smooth || m->norms == NULL) {
+            for (int k = 0; k < 3; k++) {
+                vnx[k] = fnx; vny[k] = fny; vnz[k] = fnz;
             }
-            if (lam > 1.0f) lam = 1.0f;
-        } else {
-            lam = (len > 1e-9f) ? fabsf(nz) / len : 1.0f;
         }
-        float lit = smooth ? 1.0f : (amb + (1.0f - amb) * lam);
 
         /*
          * Clip against the near plane before projecting.
@@ -1210,7 +1202,9 @@ int vr_mesh_project(const MeshWidget *m, const WidgetRuntime *rt,
          * in gives three or four out, so a clipped triangle becomes one or two.
          */
         const float NEAR = 1.0f;
-        float px4[4], py4[4], pz4[4], pl4[4], pu4[4], pv4[4];
+        float px4[4], py4[4], pz4[4], pu4[4], pv4[4];
+        float nx4[4], ny4[4], nz4[4];
+        float tx4[4], ty4[4], tz4[4];
         int nc = 0;
 
         for (int a = 0; a < 3; a++) {
@@ -1219,7 +1213,9 @@ int vr_mesh_project(const MeshWidget *m, const WidgetRuntime *rt,
 
             if (ina) {
                 px4[nc] = wx[a]; py4[nc] = wy[a]; pz4[nc] = wz[a];
-                pl4[nc] = vlit[a]; pu4[nc] = vu[a]; pv4[nc] = vv[a];
+                nx4[nc] = vnx[a]; ny4[nc] = vny[a]; nz4[nc] = vnz[a];
+                tx4[nc] = vtx[a]; ty4[nc] = vty[a]; tz4[nc] = vtz[a];
+                pu4[nc] = vu[a]; pv4[nc] = vv[a];
                 nc++;
             }
             if (ina != inb) {
@@ -1229,7 +1225,12 @@ int vr_mesh_project(const MeshWidget *m, const WidgetRuntime *rt,
                 px4[nc] = wx[a] + (wx[b] - wx[a]) * ct;
                 py4[nc] = wy[a] + (wy[b] - wy[a]) * ct;
                 pz4[nc] = NEAR;
-                pl4[nc] = vlit[a] + (vlit[b] - vlit[a]) * ct;
+                nx4[nc] = vnx[a] + (vnx[b] - vnx[a]) * ct;
+                ny4[nc] = vny[a] + (vny[b] - vny[a]) * ct;
+                nz4[nc] = vnz[a] + (vnz[b] - vnz[a]) * ct;
+                tx4[nc] = vtx[a] + (vtx[b] - vtx[a]) * ct;
+                ty4[nc] = vty[a] + (vty[b] - vty[a]) * ct;
+                tz4[nc] = vtz[a] + (vtz[b] - vtz[a]) * ct;
                 pu4[nc] = vu[a] + (vu[b] - vu[a]) * ct;
                 pv4[nc] = vv[a] + (vv[b] - vv[a]) * ct;
                 nc++;
@@ -1243,14 +1244,17 @@ int vr_mesh_project(const MeshWidget *m, const WidgetRuntime *rt,
         for (int fan = 2; fan < nc; fan++) {
             const int fi[3] = { 0, fan - 1, fan };
 
-            float sxp[3], syp[3], szp[3], flit[3], fu[3], fv[3];
+            float sxp[3], syp[3], szp[3], fu[3], fv[3];
+            float fnx3[3], fny3[3], fnz3[3];
+            float ftx3[3], fty3[3], ftz3[3];
             for (int k = 0; k < 3; k++) {
                 int q = fi[k];
                 float sc = f / pz4[q];
                 sxp[k] = ccx + px4[q] * sc;
                 syp[k] = ccy + py4[q] * sc;
                 szp[k] = pz4[q];
-                flit[k] = pl4[q];
+                fnx3[k] = nx4[q]; fny3[k] = ny4[q]; fnz3[k] = nz4[q];
+                ftx3[k] = tx4[q]; fty3[k] = ty4[q]; ftz3[k] = tz4[q];
                 fu[k] = pu4[q];
                 fv[k] = pv4[q];
             }
@@ -1284,11 +1288,18 @@ int vr_mesh_project(const MeshWidget *m, const WidgetRuntime *rt,
         o->x0 = sxp[i0]; o->y0 = syp[i0]; o->z0 = szp[i0];
         o->x1 = sxp[i1]; o->y1 = syp[i1]; o->z1 = szp[i1];
         o->x2 = sxp[i2]; o->y2 = syp[i2]; o->z2 = szp[i2];
-        o->r = base_r * lit;
-        o->g = base_g * lit;
-        o->b = base_b * lit;
+        o->r = base_r;
+        o->g = base_g;
+        o->b = base_b;
 
-        o->l0 = flit[i0]; o->l1 = flit[i1]; o->l2 = flit[i2];
+        o->n0x = fnx3[i0]; o->n0y = fny3[i0]; o->n0z = fnz3[i0];
+        o->n1x = fnx3[i1]; o->n1y = fny3[i1]; o->n1z = fnz3[i1];
+        o->n2x = fnx3[i2]; o->n2y = fny3[i2]; o->n2z = fnz3[i2];
+
+        o->t0x = ftx3[i0]; o->t0y = fty3[i0]; o->t0z = ftz3[i0];
+        o->t1x = ftx3[i1]; o->t1y = fty3[i1]; o->t1z = ftz3[i1];
+        o->t2x = ftx3[i2]; o->t2y = fty3[i2]; o->t2z = ftz3[i2];
+        o->hand = hand;
 
         /*
          * u/z and 1/z, not u and v directly: those interpolate linearly in
@@ -1367,13 +1378,60 @@ int vr_mesh_project(const MeshWidget *m, const WidgetRuntime *rt,
     mp->tri_count = n;
     mp->alpha  = rt->opacity;
     mp->blend  = b_blend_of(m);
-    mp->smooth = smooth ? 1 : 0;
+    /* `smooth` no longer reaches the rasterizer: it decides which normals go
+     * into the vertices, and after that the pixel loop treats both the same. */
     /* Half the stroke: the rasterizer measures from the edge in both
      * directions, so a 2px line reaches 1px either side of it. */
     mp->wire   = m->wire * 0.5f;
     mp->aa     = m->antialias ? 1 : 0;
+    mp->filter = m->filter ? 1 : 0;
     mp->tex_w  = (m->tex.pixels != NULL) ? m->tex.width  : 0;
     mp->tex_h  = (m->tex.pixels != NULL) ? m->tex.height : 0;
+    mp->ao_w   = (m->ao.pixels  != NULL) ? m->ao.width   : 0;
+    mp->ao_h   = (m->ao.pixels  != NULL) ? m->ao.height  : 0;
+    mp->ao_strength = m->ao_strength;
+
+    /*
+     * A normal map without tangents is unreadable, so the gate is both: the
+     * loader drops the image when the geometry has no frame for it, and this
+     * repeats the test because a mesh can lose its tangents in ways the loader
+     * never sees.
+     */
+    bool has_nrm = (m->nrm.pixels != NULL && m->tans != NULL);
+    mp->nrm_w = has_nrm ? m->nrm.width  : 0;
+    mp->nrm_h = has_nrm ? m->nrm.height : 0;
+    mp->normal_scale = (m->normal_scale >= 0.0f) ? m->normal_scale : 1.0f;
+
+    mp->emis_w = (m->emis.pixels != NULL) ? m->emis.width  : 0;
+    mp->emis_h = (m->emis.pixels != NULL) ? m->emis.height : 0;
+    {
+        /* Strength folded into the colour here, so the pixel loop compares
+         * against zero once instead of carrying a separate scalar. */
+        float es = (m->emissive_strength > 0.0f) ? m->emissive_strength : 0.0f;
+        mp->emis_r = m->emissive.r * inv255 * es;
+        mp->emis_g = m->emissive.g * inv255 * es;
+        mp->emis_b = m->emissive.b * inv255 * es;
+    }
+
+    /*
+     * The lighting environment, handed down whole. The positions were already
+     * moved into view space at the top of this function, which is the one place
+     * the camera matrix is needed.
+     */
+    mp->light_count = (light_count > VR_MAX_LIGHTS) ? VR_MAX_LIGHTS : light_count;
+    for (int li = 0; li < mp->light_count; li++) {
+        mp->lights[li] = lights[li];
+        mp->lights[li].x = Lv[li][0];
+        mp->lights[li].y = Lv[li][1];
+        mp->lights[li].z = Lv[li][2];
+    }
+    mp->ambient   = amb;
+    mp->specular  = (m->norms != NULL || !smooth) ? m->specular : 0.0f;
+    mp->shininess = m->shininess;
+    mp->two_sided = two_sided ? 1 : 0;
+    mp->ccx = ccx;
+    mp->ccy = ccy;
+    mp->focal = f;
     return n;
 }
 
@@ -1474,6 +1532,7 @@ EffectGPU vr_effect_sample(const Effect *fx, float t)
     g.ca[2] = fx->color_a.b * inv; g.ca[3] = fx->color_a.a * inv;
     g.cb[0] = fx->color_b.r * inv; g.cb[1] = fx->color_b.g * inv;
     g.cb[2] = fx->color_b.b * inv; g.cb[3] = fx->color_b.a * inv;
+    g.lut_size = fx->lut_size;
     return g;
 }
 

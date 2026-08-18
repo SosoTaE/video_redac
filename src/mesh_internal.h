@@ -27,6 +27,18 @@ void vr_mesh_set_attrib(MeshWidget *m, float nx, float ny, float nz,
                         float u, float v);
 
 /*
+ * Grows the tangent array to `cap` vertices, allocating it on first use.
+ *
+ * Separate from ensure_attribs because tangents are optional in a way normals
+ * and UVs are not: only a normal-mapped mesh reads them, and a file that
+ * carries none should not pay for the array.
+ */
+bool vr_mesh_ensure_tangents(MeshWidget *m, size_t cap);
+
+/* Records the tangent of the vertex most recently pushed; `w` is handedness. */
+void vr_mesh_set_tangent(MeshWidget *m, float x, float y, float z, float w);
+
+/*
  * Reads a glTF 2.0 file — either .gltf (JSON, with external or base64 buffers)
  * or .glb (the binary container) — into `m`.
  *

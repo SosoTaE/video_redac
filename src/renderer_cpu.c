@@ -339,7 +339,9 @@ static uchar4 *apply_effect_list(const Effect *list, size_t count, CpuResources 
                 break;
 
             default:
-                FX_PASS(vr_px_fx_point(dst, src, w, h, &g, seed, x, y));
+                /* The CPU backend needs no upload: the table it reads is the
+                 * one the loader parsed. */
+                FX_PASS(vr_px_fx_point(dst, src, w, h, &g, fx->lut, seed, x, y));
                 break;
         }
 
@@ -433,11 +435,16 @@ static void render_scene_into(const EditorContext *ctx, CpuResources *res,
                                          scene->lights, scene->light_count,
                                          slice, (int)(mw->tri_count * 2), &mp);
                 if (nt > 0) {
+                    MeshTextures maps;
+                    maps.base = (const uchar4 *)mw->tex.pixels;
+                    maps.ao   = (const uchar4 *)mw->ao.pixels;
+                    maps.nrm  = (const uchar4 *)mw->nrm.pixels;
+                    maps.emis = (const uchar4 *)mw->emis.pixels;
+
                     #pragma omp parallel for schedule(static)
                     for (int my = 0; my < mp.bb_h; my++) {
                         for (int mx = 0; mx < mp.bb_w; mx++) {
-                            vr_px_mesh(target, res->depth, slice,
-                                       (const uchar4 *)mw->tex.pixels, &mp, mx, my);
+                            vr_px_mesh(target, res->depth, slice, maps, &mp, mx, my);
                         }
                     }
                 }

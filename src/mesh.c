@@ -95,6 +95,29 @@ void (vr_mesh_set_attrib)(MeshWidget *m, float nx, float ny, float nz, float u, 
     m->uvs[i * 2 + 1] = v;
 }
 
+bool (vr_mesh_ensure_tangents)(MeshWidget *m, size_t cap)
+{
+    /* calloc-equivalent growth: the tail has to start at zero, because a
+     * vertex the caller never sets must read as "no tangent" rather than as
+     * whatever realloc handed back. */
+    float *t = (float *)realloc(m->tans, cap * 4 * sizeof(float));
+    if (t == NULL) return false;
+    if (cap > m->vert_count) {
+        memset(t + m->vert_count * 4, 0, (cap - m->vert_count) * 4 * sizeof(float));
+    }
+    m->tans = t;
+    return true;
+}
+
+void (vr_mesh_set_tangent)(MeshWidget *m, float x, float y, float z, float w)
+{
+    size_t i = m->vert_count - 1;
+    m->tans[i * 4 + 0] = x;
+    m->tans[i * 4 + 1] = y;
+    m->tans[i * 4 + 2] = z;
+    m->tans[i * 4 + 3] = w;
+}
+
 /*
  * Area-weighted vertex normals from the faces that share each vertex.
  *
@@ -130,6 +153,143 @@ static bool derive_normals(MeshWidget *m)
         float l = sqrtf(n[0]*n[0] + n[1]*n[1] + n[2]*n[2]);
         if (l > 1e-12f) { n[0] /= l; n[1] /= l; n[2] /= l; }
         else            { n[0] = 0; n[1] = 0; n[2] = 1; }
+    }
+    return true;
+}
+
+/*
+ * Per-vertex tangents from the UV parameterisation.
+ *
+ * A normal map stores its perturbation in tangent space, so reading one needs
+ * a frame on the surface: which way is "along u", which way is "along v". The
+ * normal supplies the third axis, and the other two follow from how the
+ * texture is laid out — solve the 2x2 system relating the triangle's two edges
+ * in space to the same two edges in UV, and the u-axis falls out.
+ *
+ * Accumulated per vertex and then orthogonalised against the normal, the same
+ * shape as derive_normals: a vertex shared by several faces gets the average,
+ * which is what keeps the frame continuous across a smooth surface instead of
+ * faceting the lighting exactly where the geometry was smoothed.
+ *
+ * Not weighted by area, unlike the normals. The tangent is a direction in the
+ * texture's parameterisation rather than a property of the surface's shape, and
+ * a large triangle is not more authoritative about which way u runs than a
+ * small one — a wall built from one big quad and a strip of small ones would
+ * otherwise twist its frame along the join.
+ */
+static bool derive_tangents(MeshWidget *m)
+{
+    if (m->uvs == NULL || m->norms == NULL) {
+        return false;
+    }
+
+    float *acc = (float *)calloc(m->vert_count * 6, sizeof(float));   /* T then B */
+    if (acc == NULL) {
+        return false;
+    }
+    if (!vr_mesh_ensure_tangents(m, m->vert_count)) {
+        free(acc);
+        return false;
+    }
+
+    for (size_t t = 0; t < m->tri_count; t++) {
+        const int *v = m->tris[t].v;
+        const float *p0 = &m->verts[(size_t)v[0] * 3];
+        const float *p1 = &m->verts[(size_t)v[1] * 3];
+        const float *p2 = &m->verts[(size_t)v[2] * 3];
+        const float *q0 = &m->uvs[(size_t)v[0] * 2];
+        const float *q1 = &m->uvs[(size_t)v[1] * 2];
+        const float *q2 = &m->uvs[(size_t)v[2] * 2];
+
+        float e1[3] = { p1[0]-p0[0], p1[1]-p0[1], p1[2]-p0[2] };
+        float e2[3] = { p2[0]-p0[0], p2[1]-p0[1], p2[2]-p0[2] };
+        float s1 = q1[0]-q0[0], t1 = q1[1]-q0[1];
+        float s2 = q2[0]-q0[0], t2 = q2[1]-q0[1];
+
+        /*
+         * A zero determinant means the triangle occupies no area in UV space —
+         * three vertices sharing one texel, which every model has a few of at
+         * a pole or a collapsed seam. There is no direction to extract, so it
+         * contributes nothing rather than a division by zero.
+         */
+        float det = s1 * t2 - s2 * t1;
+        if (fabsf(det) < 1e-20f) {
+            continue;
+        }
+        float r = 1.0f / det;
+
+        float T[3], B[3];
+        for (int k = 0; k < 3; k++) {
+            T[k] = (t2 * e1[k] - t1 * e2[k]) * r;
+            B[k] = (s1 * e2[k] - s2 * e1[k]) * r;
+        }
+
+        /* Normalised before accumulating, so one enormous triangle does not
+         * outvote its neighbours simply by being long in texture space. */
+        float lt = sqrtf(T[0]*T[0] + T[1]*T[1] + T[2]*T[2]);
+        float lb = sqrtf(B[0]*B[0] + B[1]*B[1] + B[2]*B[2]);
+        if (lt < 1e-20f || lb < 1e-20f) {
+            continue;
+        }
+        for (int k = 0; k < 3; k++) { T[k] /= lt; B[k] /= lb; }
+
+        for (int k = 0; k < 3; k++) {
+            float *a = &acc[(size_t)v[k] * 6];
+            for (int c = 0; c < 3; c++) {
+                a[c]     += T[c];
+                a[3 + c] += B[c];
+            }
+        }
+    }
+
+    size_t degenerate = 0;
+    for (size_t i = 0; i < m->vert_count; i++) {
+        const float *n = &m->norms[i * 3];
+        float *a = &acc[i * 6];
+        float *o = &m->tans[i * 4];
+
+        /* Gram-Schmidt: remove the part of the tangent that leans out of the
+         * surface, so T ends up perpendicular to N and the frame is orthogonal
+         * where the pixel loop assumes it is. */
+        float d = a[0]*n[0] + a[1]*n[1] + a[2]*n[2];
+        float T[3] = { a[0] - n[0]*d, a[1] - n[1]*d, a[2] - n[2]*d };
+        float l = sqrtf(T[0]*T[0] + T[1]*T[1] + T[2]*T[2]);
+
+        if (l < 1e-12f) {
+            /*
+             * No usable tangent — a vertex no textured triangle touched, or one
+             * whose accumulated directions cancelled. Any perpendicular to the
+             * normal will do: the surface has no preferred direction there, so
+             * the normal map reads as noise but never as a discontinuity.
+             */
+            float ax[3] = { 0.0f, 0.0f, 1.0f };
+            if (fabsf(n[2]) > 0.9f) { ax[0] = 1.0f; ax[2] = 0.0f; }
+            T[0] = n[1]*ax[2] - n[2]*ax[1];
+            T[1] = n[2]*ax[0] - n[0]*ax[2];
+            T[2] = n[0]*ax[1] - n[1]*ax[0];
+            l = sqrtf(T[0]*T[0] + T[1]*T[1] + T[2]*T[2]);
+            if (l < 1e-12f) { T[0] = 1.0f; T[1] = 0.0f; T[2] = 0.0f; l = 1.0f; }
+            degenerate++;
+        }
+        o[0] = T[0] / l; o[1] = T[1] / l; o[2] = T[2] / l;
+
+        /*
+         * Handedness: does N x T point along the accumulated bitangent, or
+         * against it? Against means the UVs are mirrored here, and without the
+         * sign the map's bumps would come out as dents on that half.
+         */
+        float c[3] = { n[1]*o[2] - n[2]*o[1],
+                       n[2]*o[0] - n[0]*o[2],
+                       n[0]*o[1] - n[1]*o[0] };
+        float dot = c[0]*a[3] + c[1]*a[4] + c[2]*a[5];
+        o[3] = (dot < 0.0f) ? -1.0f : 1.0f;
+    }
+
+    free(acc);
+    if (degenerate > 0) {
+        fprintf(stderr, "note: mesh '%s' — %zu vertex(es) had no usable UV "
+                        "direction; their tangents are arbitrary.\n",
+                m->base.id ? m->base.id : "(unnamed)", degenerate);
     }
     return true;
 }
@@ -721,13 +881,37 @@ bool mesh_load(MeshWidget *m)
     }
 
     /*
-     * Normals were computed in model space and the mesh has just been scaled
-     * uniformly, so they stay correct — a uniform scale does not shear.
+     * Tangents, but only for a mesh that will actually sample a normal map —
+     * either the project named one or the glTF material did. Deriving them for
+     * every mesh would be a fifth again on the vertex data for nothing.
+     *
+     * Derived after the normalisation and after any derive_normals above,
+     * because both are inputs: the tangent is orthogonalised against the final
+     * normal, and reading a stale one would leave the frame skewed.
      */
-    fprintf(stderr, "mesh: %s — %zu vertices, %zu triangles%s%s\n",
+    if (m->nrm_path != NULL && m->tans == NULL && m->uvs != NULL) {
+        if (!derive_tangents(m)) {
+            fprintf(stderr, "warning: mesh '%s' — could not derive tangents; the "
+                            "normal map will be ignored.\n",
+                    m->base.id ? m->base.id : "(unnamed)");
+        }
+    }
+    if (m->nrm_path != NULL && m->uvs == NULL) {
+        fprintf(stderr, "warning: mesh '%s' — a normal map needs texture "
+                        "coordinates, and this mesh has none.\n",
+                m->base.id ? m->base.id : "(unnamed)");
+    }
+
+    /*
+     * Normals were computed in model space and the mesh has just been scaled
+     * uniformly, so they stay correct — a uniform scale does not shear. The
+     * same goes for the tangents, which are directions along the same surface.
+     */
+    fprintf(stderr, "mesh: %s — %zu vertices, %zu triangles%s%s%s\n",
             m->path ? m->path : (m->shape ? m->shape : "box"),
             m->vert_count, m->tri_count,
-            m->norms ? ", normals" : "", m->uvs ? ", uvs" : "");
+            m->norms ? ", normals" : "", m->uvs ? ", uvs" : "",
+            m->tans ? ", tangents" : "");
     return true;
 }
 
@@ -739,10 +923,12 @@ void mesh_free(MeshWidget *m)
     free(m->verts);
     free(m->norms);
     free(m->uvs);
+    free(m->tans);
     free(m->tris);
     m->verts = NULL;
     m->norms = NULL;
     m->uvs = NULL;
+    m->tans = NULL;
     m->tris = NULL;
     m->vert_count = 0;
     m->tri_count = 0;

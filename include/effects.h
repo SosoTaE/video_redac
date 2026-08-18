@@ -37,6 +37,7 @@ typedef enum {
     FX_VIBRANCE,      /* amount                                    */
     FX_SPLIT_TONE,    /* color_a=shadows, color_b=highlights, balance, amount */
     FX_GRADIENT_MAP,  /* color_a=shadow, color_b=highlight, amount */
+    FX_LUT,           /* amount — a .cube table, see `lut` below   */
 
     /* --- neighbourhood reads (needs a ping-pong buffer) --- */
     FX_BLUR,          /* radius — separable, two passes            */
@@ -78,6 +79,20 @@ typedef struct Effect {
     Track      param[FXP_MAX];
     Color      color_a;   /* vignette colour / shadow tone   */
     Color      color_b;   /* highlight tone                  */
+
+    /*
+     * FX_LUT only: the table, as size^3 RGB triples.
+     *
+     * It cannot ride in `param` like everything else, because every other
+     * effect's parameters are a handful of scalars that fit in a struct passed
+     * by value to the kernel, and a 33-cube is 108 KB. So the table is uploaded
+     * once at init and the kernel takes a pointer — `d_lut` on the CUDA
+     * backend, and `lut` itself on the CPU one, where they are the same memory.
+     */
+    char      *lut_path;
+    float     *lut;
+    int        lut_size;
+    void      *d_lut;
 } Effect;
 
 /* "vignette", "color_grade", "rgbSplit"… → EffectType. Unknown → FX_NONE. */
