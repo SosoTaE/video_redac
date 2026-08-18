@@ -1027,7 +1027,10 @@ static void parse_widget_base(WidgetBase *base, const cJSON *obj, WidgetKind kin
                          json_has(obj, "z_depth");
     base->has_track_rx = json_has(obj, "rotate_x");
     base->has_track_ry = json_has(obj, "rotate_y");
-    parse_track_ex(cJSON_GetObjectItemCaseSensitive(obj, "z_depth"),  &base->tr_z,  0.0f, eases);
+    /* z_depth is parsed once, just above. Parsing it a second time into the
+     * same Track overwrote the first keyframe array without freeing it, which
+     * leaked every depth track in the project — invisible until a scene used
+     * enough of them, and then only under LeakSanitizer. */
     parse_track_ex(cJSON_GetObjectItemCaseSensitive(obj, "rotate_x"), &base->tr_rx, 0.0f, eases);
     parse_track_ex(cJSON_GetObjectItemCaseSensitive(obj, "rotate_y"), &base->tr_ry, 0.0f, eases);
 
@@ -1640,7 +1643,17 @@ static bool parse_mesh_object(EditorContext *ctx, const cJSON *obj, int z,
     w->path  = (src != NULL) ? resolve_relative_path(base_file, src) : NULL;
     w->shape = dup_string(json_str(obj, "shape", (src == NULL) ? "box" : NULL));
 
-    w->size    = json_float(obj, "size", 300.0f);
+    /* "size": 300 is uniform; "size": [w, h, d] scales each axis on its own. */
+    const cJSON *sz = cJSON_GetObjectItemCaseSensitive(obj, "size");
+    if (cJSON_IsArray(sz) && cJSON_GetArraySize(sz) >= 3) {
+        for (int k = 0; k < 3; k++) {
+            const cJSON *v = cJSON_GetArrayItem(sz, k);
+            w->size[k] = cJSON_IsNumber(v) ? (float)v->valuedouble : 300.0f;
+        }
+    } else {
+        float u = json_float(obj, "size", 300.0f);
+        w->size[0] = w->size[1] = w->size[2] = u;
+    }
     w->color   = json_color(obj, "color", (Color){ 0x7E, 0xE7, 0x87, 255 });
     w->ambient = json_float(obj, "ambient", 0.25f);
 
@@ -1655,6 +1668,20 @@ static bool parse_mesh_object(EditorContext *ctx, const cJSON *obj, int z,
     const cJSON *sm = cJSON_GetObjectItemCaseSensitive(obj, "smooth");
     w->smooth = cJSON_IsBool(sm) ? cJSON_IsTrue(sm) : (curved || w->path != NULL);
 
+    /* "wire": true takes a sensible default width; a number sets it directly. */
+    const cJSON *wr = cJSON_GetObjectItemCaseSensitive(obj, "wire");
+    if (cJSON_IsNumber(wr)) {
+        w->wire = (float)wr->valuedouble;
+    } else if (cJSON_IsTrue(wr)) {
+        w->wire = 1.6f;
+    }
+    if (w->wire < 0.0f) {
+        w->wire = 0.0f;
+    }
+
+    const cJSON *aa = cJSON_GetObjectItemCaseSensitive(obj, "antialias");
+    w->antialias = cJSON_IsBool(aa) ? cJSON_IsTrue(aa) : true;
+
     const char *tp = json_str(obj, "texture", NULL);
     w->tex_path = (tp != NULL) ? resolve_relative_path(base_file, tp) : NULL;
 
@@ -1664,8 +1691,10 @@ static bool parse_mesh_object(EditorContext *ctx, const cJSON *obj, int z,
     const cJSON *cu = cJSON_GetObjectItemCaseSensitive(obj, "cull");
     w->cull = cJSON_IsBool(cu) ? cJSON_IsTrue(cu) : !open_shape;
 
-    if (w->size < 1.0f) {
-        w->size = 1.0f;
+    for (int k = 0; k < 3; k++) {
+        if (w->size[k] < 1.0f) {
+            w->size[k] = 1.0f;
+        }
     }
 
     if (!mesh_load(w)) {
@@ -3461,11 +3490,26 @@ static bool parse_scene(EditorContext *ctx, const cJSON *node, const cJSON *styl
      * being lit from this position, which is what puts a terminator on a body.
      */
     const cJSON *lit = cJSON_GetObjectItemCaseSensitive(node, "light");
-    if (cJSON_IsObject(lit)) {
-        sc->has_light = true;
-        sc->light[0] = json_float(lit, "x", 0.0f);
-        sc->light[1] = json_float(lit, "y", 0.0f);
-        sc->light[2] = json_float(lit, "z", 0.0f);
+    if (cJSON_IsObject(lit) || cJSON_IsArray(lit)) {
+        /* One light or several: an object is the common case and an array the
+         * same thing repeated, so both spellings resolve to the same table. */
+        const cJSON *first = cJSON_IsArray(lit) ? lit->child : lit;
+        for (const cJSON *l = first; l != NULL && sc->light_count < VR_MAX_LIGHTS;
+             l = cJSON_IsArray(lit) ? l->next : NULL) {
+            if (!cJSON_IsObject(l)) {
+                continue;
+            }
+            Light *dst = &sc->lights[sc->light_count++];
+            dst->x = json_float(l, "x", 0.0f);
+            dst->y = json_float(l, "y", 0.0f);
+            dst->z = json_float(l, "z", 0.0f);
+            dst->intensity = json_float(l, "intensity", 1.0f);
+            dst->range     = json_float(l, "range", 0.0f);
+        }
+        if (cJSON_IsArray(lit) && cJSON_GetArraySize(lit) > VR_MAX_LIGHTS) {
+            fprintf(stderr, "warning: scene '%s' — %d lights given, only %d are used.\n",
+                    sc->id ? sc->id : "(unnamed)", cJSON_GetArraySize(lit), VR_MAX_LIGHTS);
+        }
     }
 
     if (!is_root &&
@@ -4067,6 +4111,10 @@ static const char *kind_name(WidgetKind k)
         case WIDGET_CODE:   return "code";
         case WIDGET_IMAGE:  return "image";
         case WIDGET_CIRCLE: return "circle";
+        case WIDGET_LINE:   return "line";
+        case WIDGET_PATH:   return "path";
+        case WIDGET_VIDEO:  return "video";
+        case WIDGET_MESH:   return "mesh";
         default:            return "rect";
     }
 }
@@ -4290,6 +4338,15 @@ bool vr_list_table(const char *what)
         return true;
     }
 
+    if (strcmp(what, "shapes") == 0) {
+        printf("[");
+        for (size_t i = 0; mesh_shape_name(i) != NULL; i++) {
+            printf("%s\"%s\"", i ? ", " : "", mesh_shape_name(i));
+        }
+        printf("]\n");
+        return true;
+    }
+
     if (strcmp(what, "widgets") == 0) {
         printf("[\"text\", \"code\", \"image\", \"video\", \"mesh\", "
                "\"rect\", \"circle\", \"line\", \"path\"]\n");
@@ -4436,6 +4493,27 @@ static int check_run(const EditorContext *ctx, CheckSink *sk)
     for (size_t i = 0; i < ctx->widget_count; i++) {
         const WidgetBase *b  = ctx->widgets[i];
         const char       *id = b->id ? b->id : "(null)";
+
+        /*
+         * A mesh is checked on its geometry, not on a rectangle.
+         *
+         * base_w/base_h describe a flat layer's box; a mesh has no such box —
+         * what it covers on screen falls out of `size`, its rotation and the
+         * projection, and is different every frame. Measuring it as a rectangle
+         * produced a page of "extends past the canvas" notes about spheres
+         * sitting squarely in the middle of the frame, which is worse than no
+         * check at all: noise teaches you to stop reading the output.
+         *
+         * What can actually go wrong is that the model did not load, and that
+         * was previously only a line on stderr at parse time.
+         */
+        if (b->kind == WIDGET_MESH) {
+            const MeshWidget *mw = (const MeshWidget *)b;
+            if (mw->tri_count == 0) {
+                VR_PROBLEM("'%s' (mesh) — no geometry; the model failed to load.\n", id);
+            }
+            continue;      /* `size` is already clamped to >= 1 when parsed */
+        }
 
         if (b->base_w < 1.0f || b->base_h < 1.0f) {
             VR_PROBLEM("'%s' — zero size (%.0fx%.0f).\n", id,

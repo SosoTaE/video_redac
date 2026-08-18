@@ -1960,7 +1960,8 @@ bool media_prepare_textures(EditorContext *ctx)
          * keeps layout, anchoring and the validator working unchanged. */
         if (b->kind == WIDGET_MESH) {
             const MeshWidget *mw = (const MeshWidget *)b;
-            b->base_w = b->base_h = mw->size;
+            b->base_w = mw->size[0];
+            b->base_h = mw->size[1];
         }
 
         /* A clip's texture holds every frame stacked, so its height is the

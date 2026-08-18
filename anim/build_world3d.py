@@ -89,6 +89,17 @@ for i in range(6):
 objects.append(mesh("sphereA", "sphere", -150, -60, 400, 620, "#FF7043"))
 objects.append(mesh("sphereB", "sphere", 150, -60, 400, 620, "#42A5F5"))
 
+# A wireframe shell around the sphere pair.
+#
+# Its interior writes no depth, so the solids inside stay visible through it and
+# its own far side shows through its near side — which is the whole difference
+# between a wireframe and a mesh drawn in a thin colour.
+objects.append(mesh(
+    "cage", "sphere", 0, -60, 400, 900, "#9FE8FF",
+    wire=1.8, ambient=0.55,
+    rotate_y=track((0, 0), (DUR, 90), ease="linear"),
+))
+
 # A textured cube at the centre of the ring, flat-shaded on purpose so its
 # facets stay hard next to the smooth spheres.
 objects.append(mesh(

@@ -123,7 +123,8 @@ bool renderer_init(EditorContext *ctx)
     size_t max_tris = 0;
     for (size_t mi = 0; mi < ctx->mesh_count; mi++) {
         ctx->meshes[mi].tri_base = max_tris;
-        max_tris += ctx->meshes[mi].tri_count;
+        /* Twice, because a triangle crossing the near plane clips into two. */
+        max_tris += ctx->meshes[mi].tri_count * 2;
     }
     if (max_tris > 0) {
         res->tris = (ScreenTri *)malloc(max_tris * sizeof(ScreenTri));
@@ -425,12 +426,12 @@ static void render_scene_into(const EditorContext *ctx, CpuResources *res,
         /* 2a'. A mesh is not a texture: project it, then rasterize. */
         if (b->kind == WIDGET_MESH) {
             const MeshWidget *mw = (const MeshWidget *)b;
-            if (res->tris != NULL && mw->tri_base + mw->tri_count <= res->tri_cap) {
+            if (res->tris != NULL && mw->tri_base + mw->tri_count * 2 <= res->tri_cap) {
                 ScreenTri *slice = res->tris + mw->tri_base;
                 MeshParams mp;
                 int nt = vr_mesh_project(mw, r, res->width, res->height, view,
-                                         scene->has_light ? scene->light : NULL,
-                                         slice, &mp);
+                                         scene->lights, scene->light_count,
+                                         slice, (int)(mw->tri_count * 2), &mp);
                 if (nt > 0) {
                     #pragma omp parallel for schedule(static)
                     for (int my = 0; my < mp.bb_h; my++) {

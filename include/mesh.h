@@ -28,6 +28,13 @@ extern "C" {
  */
 bool mesh_load(MeshWidget *m);
 
+/*
+ * The i-th procedural shape name, or NULL past the end — so a caller can
+ * enumerate them without knowing how many there are. Backed by the same table
+ * mesh_load() dispatches on, so the two cannot disagree.
+ */
+const char *mesh_shape_name(size_t i);
+
 /* Frees the vertex and triangle arrays. Safe on NULL and on an empty mesh. */
 void mesh_free(MeshWidget *m);
 

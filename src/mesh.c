@@ -402,6 +402,65 @@ static bool gen_plane(MeshWidget *m, size_t *vc, size_t *tc, int n)
 }
 
 /* ------------------------------------------------------------------------- */
+/* The shape table                                                            */
+/* ------------------------------------------------------------------------- */
+
+/*
+ * One table drives both the dispatch and `--list shapes`.
+ *
+ * They were separate lists for a while, which is how a vocabulary quietly goes
+ * stale: adding `ring` to the generator taught the renderer about it and left
+ * every tool that asks the binary what it accepts still answering with the old
+ * five. Anything that enumerates a capability should read it from the same
+ * place that implements it.
+ *
+ * The tessellation counts live here rather than in the callers because they are
+ * a property of the primitive, not of the scene using it.
+ */
+static bool make_box(MeshWidget *m, size_t *vc, size_t *tc)
+{ return gen_box(m, vc, tc); }
+static bool make_sphere(MeshWidget *m, size_t *vc, size_t *tc)
+{ return gen_sphere(m, vc, tc, 28, 18); }
+static bool make_torus(MeshWidget *m, size_t *vc, size_t *tc)
+{ return gen_torus(m, vc, tc, 36, 18, 0.38f); }
+static bool make_cylinder(MeshWidget *m, size_t *vc, size_t *tc)
+{ return gen_cylinder(m, vc, tc, 30); }
+static bool make_plane(MeshWidget *m, size_t *vc, size_t *tc)
+{ return gen_plane(m, vc, tc, 12); }
+static bool make_ring(MeshWidget *m, size_t *vc, size_t *tc)
+{ return gen_ring(m, vc, tc, 96, 0.55f); }
+
+typedef struct {
+    const char *name;
+    bool (*fn)(MeshWidget *, size_t *, size_t *);
+} ShapeEntry;
+
+static const ShapeEntry kShapes[] = {
+    { "box",      make_box      },
+    { "cube",     make_box      },   /* alias */
+    { "sphere",   make_sphere   },
+    { "torus",    make_torus    },
+    { "cylinder", make_cylinder },
+    { "plane",    make_plane    },
+    { "ring",     make_ring     },
+};
+
+static const ShapeEntry *shape_lookup(const char *name)
+{
+    for (size_t i = 0; i < sizeof kShapes / sizeof kShapes[0]; i++) {
+        if (strcmp(kShapes[i].name, name) == 0) {
+            return &kShapes[i];
+        }
+    }
+    return NULL;
+}
+
+const char *mesh_shape_name(size_t i)
+{
+    return (i < sizeof kShapes / sizeof kShapes[0]) ? kShapes[i].name : NULL;
+}
+
+/* ------------------------------------------------------------------------- */
 /* OBJ                                                                        */
 /* ------------------------------------------------------------------------- */
 
@@ -588,17 +647,13 @@ bool mesh_load(MeshWidget *m)
         ok = is_gltf ? vr_mesh_load_gltf(m, &vc, &tc) : load_obj(m, &vc, &tc);
     } else {
         const char *sh = (m->shape != NULL) ? m->shape : "box";
-        if      (strcmp(sh, "box") == 0)      ok = gen_box(m, &vc, &tc);
-        else if (strcmp(sh, "cube") == 0)     ok = gen_box(m, &vc, &tc);
-        else if (strcmp(sh, "sphere") == 0)   ok = gen_sphere(m, &vc, &tc, 28, 18);
-        else if (strcmp(sh, "torus") == 0)    ok = gen_torus(m, &vc, &tc, 36, 18, 0.38f);
-        else if (strcmp(sh, "cylinder") == 0) ok = gen_cylinder(m, &vc, &tc, 30);
-        else if (strcmp(sh, "plane") == 0)    ok = gen_plane(m, &vc, &tc, 12);
-        else if (strcmp(sh, "ring") == 0)     ok = gen_ring(m, &vc, &tc, 96, 0.55f);
-        else {
+        const ShapeEntry *e = shape_lookup(sh);
+
+        if (e == NULL) {
             fprintf(stderr, "warning: unknown mesh shape '%s' — using a box.\n", sh);
-            ok = gen_box(m, &vc, &tc);
+            e = shape_lookup("box");
         }
+        ok = e->fn(m, &vc, &tc);
     }
 
     if (!ok || m->vert_count == 0 || m->tri_count == 0) {

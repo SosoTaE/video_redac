@@ -1026,6 +1026,14 @@ typedef struct {
      * perspective-correct; `wz` carries the reciprocals to undo it. */
     float u0, v0, u1, v1, u2, v2;
     float w0, w1, w2;
+
+    /*
+     * Reciprocal edge lengths, which turn an edge function into a distance in
+     * pixels: e / |edge|. Computed once per triangle on the host, because the
+     * three square roots are constant across the face and paying them per
+     * pixel would cost millions of repeats of the same number.
+     */
+    float rlen0, rlen1, rlen2;
 } ScreenTri;
 
 typedef struct {
@@ -1037,6 +1045,9 @@ typedef struct {
 
     int   smooth;                   /* interpolate l0..l2 rather than use r,g,b flat */
     int   tex_w, tex_h;             /* 0 = untextured */
+
+    float wire;                     /* half stroke width in px; 0 = filled     */
+    int   aa;                       /* feather the outer silhouette by a pixel */
 } MeshParams;
 
 /*
@@ -1053,6 +1064,27 @@ typedef struct {
  * The cost is O(triangles) per pixel, so this suits models of hundreds to a few
  * thousand faces rather than scanned assets.
  */
+/*
+ * Squared distance from a point to a line *segment* — the projection clamped to
+ * the segment's ends, so a point beyond an endpoint measures to that endpoint
+ * rather than to the infinite line.
+ *
+ * `rlen` is the reciprocal of the segment's length, already to hand.
+ */
+VR_PIX float vr_seg_dist2(float px, float py,
+                          float ax, float ay, float bx, float by, float rlen)
+{
+    float vx = bx - ax, vy = by - ay;
+    float wx = px - ax, wy = py - ay;
+
+    float t = (vx * wx + vy * wy) * rlen * rlen;
+    if (t < 0.0f) t = 0.0f;
+    if (t > 1.0f) t = 1.0f;
+
+    float dx = wx - t * vx, dy = wy - t * vy;
+    return dx * dx + dy * dy;
+}
+
 VR_PIX void vr_px_mesh(uchar4 *VR_RESTRICT fb, float *VR_RESTRICT depth,
                        const ScreenTri *VR_RESTRICT tris,
                        const uchar4 *VR_RESTRICT tex,
@@ -1083,6 +1115,7 @@ VR_PIX void vr_px_mesh(uchar4 *VR_RESTRICT fb, float *VR_RESTRICT depth,
     float best_z = (depth != NULL) ? depth[idx] : 1e30f;
     float cr = 0.0f, cg = 0.0f, cb = 0.0f;
     float cov = 1.0f;          /* the texture's own alpha at the winning pixel */
+    float cov_sum = 0.0f;      /* geometric coverage summed over the mesh      */
     bool  hit = false;
 
     for (int t = 0; t < p->tri_count; t++) {
@@ -1095,29 +1128,116 @@ VR_PIX void vr_px_mesh(uchar4 *VR_RESTRICT fb, float *VR_RESTRICT depth,
         float e2 = (tr->x0 - tr->x2) * (py - tr->y2) - (tr->y0 - tr->y2) * (px - tr->x2);
 
         /* The sum is twice the signed area — a constant for the triangle,
-         * whatever the point — so it also sets the scale for the test below. */
+         * whatever the point — so it also normalises the barycentrics below. */
         float area = e0 + e1 + e2;
         if (area <= 1e-9f) {
             continue;
         }
 
         /*
-         * One winding only: the host has already discarded back faces when the
-         * mesh asked for culling, so anything arriving here is front-facing.
-         *
-         * The tolerance is what closes the seam along a shared edge. Two
-         * triangles meeting on a diagonal compute that edge from opposite ends,
-         * and the two expressions are exact negations only in real arithmetic —
-         * in floats both can land a hair below zero, so neither claims the
-         * pixel and a one-pixel crack opens down the middle of a flat face. A
-         * relative epsilon lets both claim it instead; the second then loses the
-         * depth test to the first, which costs nothing because on a shared edge
-         * they agree about depth and colour anyway.
+         * The edge functions become distances in pixels, which is the form both
+         * the wireframe and the anti-aliasing need: how far inside this
+         * triangle the pixel centre sits, measured perpendicular to each edge.
          */
-        float eps = 1e-6f * area;
-        if (e0 < -eps || e1 < -eps || e2 < -eps) {
+        float d0 = e0 * tr->rlen0;
+        float d1 = e1 * tr->rlen1;
+        float d2 = e2 * tr->rlen2;
+        float din = (d0 < d1) ? d0 : d1;
+        if (d2 < din) din = d2;
+
+        /*
+         * How far outside the triangle a pixel may still count.
+         *
+         * A hair of slack even in the hard-edged case, because two triangles
+         * sharing a diagonal compute that edge from opposite ends and the two
+         * expressions are exact negations only in real arithmetic: in floats
+         * both can land a shade below zero, neither claims the pixel, and a
+         * one-pixel crack opens down the middle of a flat face. With
+         * anti-aliasing the slack widens to half a pixel, which is the width
+         * the coverage ramp needs.
+         */
+        float slack = (p->aa || p->wire > 0.0f) ? 0.5f : 1e-3f;
+        if (din < -slack) {
             continue;
         }
+
+        /*
+         * Geometric coverage: 0 just outside the edge, 1 half a pixel inside.
+         *
+         * A wireframe measures from the edge inwards instead, keeping the
+         * band and discarding the interior — which is why the test sits here,
+         * before the depth is committed: a hollow triangle must let whatever
+         * is behind it through rather than occluding with an invisible face.
+         */
+        float ecov = 1.0f;
+        if (p->aa || p->wire > 0.0f) {
+            /*
+             * Outside the triangle, distance is measured to the triangle as a
+             * *shape* rather than to its edges' infinite lines.
+             *
+             * The difference only shows at a sharp vertex, and there it is the
+             * whole story. Offsetting three lines outward by half a pixel and
+             * keeping the intersection grows the triangle by half a pixel along
+             * each edge — but past an acute corner the two offset lines run on
+             * and meet far beyond it, by 0.5/sin(half the angle). A sphere's
+             * poles are slivers of a couple of degrees, so that is tens of
+             * pixels, and they threw faint spikes out into empty space that
+             * flickered as the mesh turned.
+             *
+             * Clamping the projection to each segment removes the overshoot
+             * exactly, and changes nothing along an edge — where the foot of the
+             * perpendicular lies on the segment and the two measures agree — so
+             * two triangles sharing an edge still contribute halves that sum to
+             * a whole and no seam appears.
+             */
+            float sd = din;
+            if (sd < 0.0f) {
+                float q0 = vr_seg_dist2(px, py, tr->x0, tr->y0, tr->x1, tr->y1, tr->rlen0);
+                float q1 = vr_seg_dist2(px, py, tr->x1, tr->y1, tr->x2, tr->y2, tr->rlen1);
+                float q2 = vr_seg_dist2(px, py, tr->x2, tr->y2, tr->x0, tr->y0, tr->rlen2);
+                float q  = (q0 < q1) ? q0 : q1;
+                if (q2 < q) q = q2;
+                sd = -sqrtf(q);
+            }
+
+            ecov = sd + 0.5f;
+            if (ecov <= 0.0f) {
+                continue;
+            }
+            if (ecov > 1.0f) ecov = 1.0f;
+
+            if (p->wire > 0.0f) {
+                /* Keep the band near an edge and drop the interior, gated by
+                 * the coverage above so the stroke fades at the silhouette. */
+                float band = p->wire - din + 0.5f;
+                if (band <= 0.0f) {
+                    continue;
+                }
+                if (band > 1.0f) band = 1.0f;
+                if (band < ecov) ecov = band;
+            }
+        }
+
+        /*
+         * Coverage adds up across the whole mesh, and is banked here — before
+         * the depth test, so a surface hidden behind another still counts.
+         *
+         * That is what makes the anti-aliasing correct rather than merely
+         * blurry. Two triangles meeting on an interior edge each cover about
+         * half the pixel; summed they fill it, so no seam appears along the
+         * diagonal. Where a nearer surface only half-covers a pixel and a
+         * farther part of the same mesh lies behind it, the two again sum to
+         * one and nothing shows through — which is right, because the mesh
+         * really is opaque there. Only on the outer silhouette, with nothing
+         * behind, does the sum stay below one and let the background in.
+         *
+         * Counting triangles instead of summing coverage was the first attempt
+         * and it failed exactly where meshes are hardest: at the limb of a
+         * sphere, where triangles are foreshortened into slivers that do not
+         * reliably both reach a shared edge, it cut thin dark slits into the
+         * silhouette.
+         */
+        cov_sum += ecov;
 
         /* Barycentric depth. Interpolating camera-space z linearly in screen
          * space is not strictly correct under perspective, but across a single
@@ -1132,6 +1252,29 @@ VR_PIX void vr_px_mesh(uchar4 *VR_RESTRICT fb, float *VR_RESTRICT depth,
         /* Barycentric weights. e1 belongs to vertex 0, e2 to vertex 1 and e0 to
          * vertex 2 — the edge opposite each. */
         float b0 = e1 * inv, b1 = e2 * inv, b2 = e0 * inv;
+
+        /*
+         * Clamped back onto the triangle before anything is interpolated.
+         *
+         * Anti-aliasing accepts a pixel whose centre lies just outside a
+         * triangle, so it can measure how much of the pixel the triangle
+         * covers. That is the right thing for coverage and the wrong thing for
+         * colour: outside the triangle a barycentric goes negative, and a
+         * shading term or texture coordinate read there is extrapolated past
+         * the vertex that bounds it. Projecting back onto the triangle costs a
+         * divide on the handful of fragments that need it and keeps every
+         * interpolated value inside the range its vertices define.
+         */
+        if (b0 < 0.0f || b1 < 0.0f || b2 < 0.0f) {
+            if (b0 < 0.0f) b0 = 0.0f;
+            if (b1 < 0.0f) b1 = 0.0f;
+            if (b2 < 0.0f) b2 = 0.0f;
+            float bs = b0 + b1 + b2;
+            if (bs > 1e-9f) {
+                float rb = 1.0f / bs;
+                b0 *= rb; b1 *= rb; b2 *= rb;
+            }
+        }
 
         float shade = 1.0f;
         if (p->smooth) {
@@ -1225,7 +1368,8 @@ VR_PIX void vr_px_mesh(uchar4 *VR_RESTRICT fb, float *VR_RESTRICT depth,
      * fragment hides of the background — takes it. Multiplying both would
      * darken every semi-transparent pixel twice.
      */
-    float ea = a * cov;
+    float edge = (cov_sum < 1.0f) ? cov_sum : 1.0f;
+    float ea   = a * cov * edge;
 
     uchar4 d = fb[idx];
 
@@ -1233,8 +1377,11 @@ VR_PIX void vr_px_mesh(uchar4 *VR_RESTRICT fb, float *VR_RESTRICT depth,
     float dr = (float)d.x * inv255, dg = (float)d.y * inv255;
     float db = (float)d.z * inv255, da = (float)d.w * inv255;
 
-    /* Premultiplied source, matching every other layer in the pipeline. */
-    float sr = cr * a, sg = cg * a, sb = cb * a;
+    /* Premultiplied source, matching every other layer in the pipeline. The
+     * colour is scaled by the same coverage as the alpha, or a feathered edge
+     * would be the right shape and the wrong brightness. */
+    float acol = a * edge;
+    float sr = cr * acol, sg = cg * acol, sb = cb * acol;
     float r, g, b, outa;
 
     if (p->blend == 1) {

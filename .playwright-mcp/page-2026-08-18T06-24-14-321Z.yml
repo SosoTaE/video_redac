@@ -1,0 +1,229 @@
+- generic [active] [ref=f1e1]:
+  - generic [ref=f1e2]:
+    - generic [ref=f1e3]:
+      - generic [ref=f1e4]:
+        - link "Poly Haven" [ref=f1e5] [cursor=pointer]:
+          - /url: /
+        - generic [ref=f1e7]:
+          - heading [level=2] [ref=f1e8]:
+            - link "Models" [ref=f1e9] [cursor=pointer]:
+              - /url: /models
+            - text: /
+          - heading "Plastic Crate 01" [level=1] [ref=f1e10]
+        - generic [ref=f1e11]:
+          - link "Assets" [ref=f1e13] [cursor=pointer]:
+            - /url: /all
+          - link "Add-on" [ref=f1e15] [cursor=pointer]:
+            - /url: /plugins/blender
+          - link "Vaults" [ref=f1e21] [cursor=pointer]:
+            - /url: /vaults
+          - link "Learn" [ref=f1e28] [cursor=pointer]:
+            - /url: /learn
+          - link "Gallery" [ref=f1e33] [cursor=pointer]:
+            - /url: /gallery
+          - link "Support Us" [ref=f1e35] [cursor=pointer]:
+            - /url: https://www.patreon.com/polyhaven/join?cadence=12
+          - link "About/Contact" [ref=f1e39] [cursor=pointer]:
+            - /url: /about-contact
+          - link [ref=f1e41] [cursor=pointer]:
+            - /url: /account?returnTo=/a/plastic_crate_01
+        - button [ref=f1e47] [cursor=pointer]
+      - generic [ref=f1e51]:
+        - generic [ref=f1e52]:
+          - generic [ref=f1e53]:
+            - img "Free 4K model of a deep red plastic crate with lattice sides, cutout handles, and a worn GALLER STORAGE print. Realistic scuffs, grime, and sturdy ribs." [ref=f1e56]
+            - generic [ref=f1e58]:
+              - generic [ref=f1e61] [cursor=pointer]
+              - generic "Preview" [ref=f1e66] [cursor=pointer]:
+                - img "Plastic Crate 01 - Preview" [ref=f1e67]
+              - generic "clay.png" [ref=f1e68] [cursor=pointer]:
+                - img "Plastic Crate 01 - clay" [ref=f1e69]
+              - generic "orth_front.png" [ref=f1e70] [cursor=pointer]:
+                - img "Plastic Crate 01 - orth_front" [ref=f1e71]
+              - generic "orth_side.png" [ref=f1e72] [cursor=pointer]:
+                - img "Plastic Crate 01 - orth_side" [ref=f1e73]
+              - generic "orth_top.png" [ref=f1e74] [cursor=pointer]:
+                - img "Plastic Crate 01 - orth_top" [ref=f1e75]
+              - generic [ref=f1e76]:
+                - generic "AO" [ref=f1e77] [cursor=pointer]:
+                  - img "Plastic Crate 01 - AO map" [ref=f1e78]
+                - generic "arm" [ref=f1e79] [cursor=pointer]:
+                  - img "Plastic Crate 01 - arm map" [ref=f1e80]
+              - generic [ref=f1e81]:
+                - generic "Diffuse" [ref=f1e82] [cursor=pointer]:
+                  - img "Plastic Crate 01 - Diffuse map" [ref=f1e83]
+                - generic "Metal" [ref=f1e84] [cursor=pointer]:
+                  - img "Plastic Crate 01 - Metal map" [ref=f1e85]
+              - generic [ref=f1e86]:
+                - generic "nor_gl" [ref=f1e87] [cursor=pointer]:
+                  - img "Plastic Crate 01 - nor_gl map" [ref=f1e88]
+                - generic "Rough" [ref=f1e89] [cursor=pointer]:
+                  - img "Plastic Crate 01 - Rough map" [ref=f1e90]
+            - heading "Similar Assets" [level=2] [ref=f1e92]
+          - generic [ref=f1e95]:
+            - heading [level=2] [ref=f1e96]:
+              - text: Thanks to our
+              - link "Patrons" [ref=f1e97] [cursor=pointer]:
+                - /url: https://www.patreon.com/polyhaven/join?cadence=12
+              - text: for making Poly Haven possible
+            - link "Join the ranks, support Poly Haven on Patreon" [ref=f1e102] [cursor=pointer]:
+              - /url: https://www.patreon.com/polyhaven/join?cadence=12
+            - generic [ref=f1e105]:
+              - link [ref=f1e106] [cursor=pointer]:
+                - /url: /
+                - generic [ref=f1e107]:
+                  - heading "Poly Haven" [level=1] [ref=f1e108]
+                  - paragraph [ref=f1e109]: The Public 3D Asset Library
+              - generic [ref=f1e111]:
+                - link "Home" [ref=f1e112] [cursor=pointer]:
+                  - /url: /
+                - link "FAQ" [ref=f1e113] [cursor=pointer]:
+                  - /url: https://docs.polyhaven.com/en/faq
+                - link "About/Contact" [ref=f1e114] [cursor=pointer]:
+                  - /url: /about-contact
+                - link "Blog" [ref=f1e115] [cursor=pointer]:
+                  - /url: https://blog.polyhaven.com
+                - link "HDRI World Map" [ref=f1e116] [cursor=pointer]:
+                  - /url: /map
+              - generic [ref=f1e118]:
+                - link "Contribute" [ref=f1e119] [cursor=pointer]:
+                  - /url: /contribute
+                - link "Wiki" [ref=f1e120] [cursor=pointer]:
+                  - /url: https://docs.polyhaven.com
+                - link "Source" [ref=f1e121] [cursor=pointer]:
+                  - /url: https://github.com/Poly-Haven/polyhaven.com
+                - link "Stats" [ref=f1e122] [cursor=pointer]:
+                  - /url: /stats
+                - link "Status" [ref=f1e123] [cursor=pointer]:
+                  - /url: https://status.polyhaven.org/
+              - generic [ref=f1e125]:
+                - link "License" [ref=f1e126] [cursor=pointer]:
+                  - /url: /license
+                - link "Privacy" [ref=f1e127] [cursor=pointer]:
+                  - /url: /privacy
+                - link "API" [ref=f1e128] [cursor=pointer]:
+                  - /url: /our-api
+                - link "Logo" [ref=f1e129] [cursor=pointer]:
+                  - /url: /logo
+                - link "Finance Reports" [ref=f1e130] [cursor=pointer]:
+                  - /url: /finance-reports
+              - generic [ref=f1e131]:
+                - link [ref=f1e132] [cursor=pointer]:
+                  - /url: https://discord.gg/Dms7Mrs
+                - link [ref=f1e135] [cursor=pointer]:
+                  - /url: https://www.patreon.com/polyhaven
+                - link [ref=f1e138] [cursor=pointer]:
+                  - /url: https://masto.ai/@polyhaven
+                - link [ref=f1e141] [cursor=pointer]:
+                  - /url: https://bsky.app/profile/polyhaven.com
+                - link [ref=f1e144] [cursor=pointer]:
+                  - /url: https://www.facebook.com/polyhaven
+                - link [ref=f1e147] [cursor=pointer]:
+                  - /url: https://x.com/polyhaven
+                - link [ref=f1e150] [cursor=pointer]:
+                  - /url: https://www.instagram.com/polyhaven
+                - link [ref=f1e153] [cursor=pointer]:
+                  - /url: https://www.youtube.com/c/PolyHaven
+                - link [ref=f1e156] [cursor=pointer]:
+                  - /url: https://api.polyhaven.com/rss
+        - generic [ref=f1e160]:
+          - generic [ref=f1e162]:
+            - generic [ref=f1e163]: 4K
+            - generic [ref=f1e171] [cursor=pointer]
+            - generic [ref=f1e181] [cursor=pointer]:
+              - heading "Download" [level=3] [ref=f1e182]
+              - paragraph [ref=f1e183]: 35.09 MB
+            - generic [ref=f1e184] [cursor=pointer]
+          - generic [ref=f1e188]:
+            - generic [ref=f1e189]:
+              - strong [ref=f1e190]: "Author:"
+              - generic [ref=f1e192]:
+                - link [ref=f1e193] [cursor=pointer]:
+                  - /url: /all?a=PierreB3D
+                - generic [ref=f1e195]:
+                  - link [ref=f1e196] [cursor=pointer]:
+                    - /url: /all?a=PierreB3D
+                    - strong [ref=f1e197]: PierreB3D
+                  - generic [ref=f1e198]:
+                    - link [ref=f1e199] [cursor=pointer]:
+                      - /url: https://pierreb3d.fr/portfolio/
+                    - link [ref=f1e203] [cursor=pointer]:
+                      - /url: https://paypal.me/PierreBARON3D
+            - generic [ref=f1e209]:
+              - heading "Poly Haven's Biggest Project" [level=3] [ref=f1e210]
+              - paragraph [ref=f1e211]:
+                - text: This asset was made for Poly Haven's
+                - link "upcoming game" [ref=f1e212] [cursor=pointer]:
+                  - /url: https://store.steampowered.com/app/4162610/Project_Lighthouse/
+                - text: . Want to help us?
+              - link "Join Project Lighthouse" [ref=f1e213] [cursor=pointer]:
+                - /url: https://phvn.io/lighthouse
+            - generic [ref=f1e215]:
+              - link [ref=f1e216] [cursor=pointer]:
+                - /url: /license
+                - strong [ref=f1e217]: CC0
+                - paragraph [ref=f1e218]: License
+              - generic [ref=f1e219]:
+                - strong [ref=f1e220]: 0.4m
+                - paragraph [ref=f1e221]: wide
+              - generic [ref=f1e222]:
+                - strong [ref=f1e223]: "29.8"
+                - paragraph [ref=f1e224]: px/cm
+              - generic [ref=f1e225]:
+                - strong [ref=f1e226]: 18K
+                - paragraph [ref=f1e227]: tris
+            - generic [ref=f1e228]:
+              - strong [ref=f1e229]: "Downloads:"
+              - generic [ref=f1e230]: "923"
+              - generic [ref=f1e231] [cursor=pointer]
+            - generic [ref=f1e236]:
+              - heading "Sponsored by:" [level=4] [ref=f1e237]:
+                - text: "Sponsored by:"
+                - link [ref=f1e238] [cursor=pointer]:
+                  - /url: https://www.patreon.com/polyhaven/join?cadence=12
+              - paragraph [ref=f1e243]: No one yet :(
+            - generic [ref=f1e245]:
+              - generic [ref=f1e247]:
+                - strong [ref=f1e248]: "Category:"
+                - generic [ref=f1e249]:
+                  - link "Containers & Storage" [ref=f1e251] [cursor=pointer]:
+                    - /url: /models/containers-storage
+                  - link "Boxes & Crates" [ref=f1e256] [cursor=pointer]:
+                    - /url: /models/containers-storage/boxes-crates
+                  - link "Plastic Crates" [ref=f1e261] [cursor=pointer]:
+                    - /url: /models/containers-storage/boxes-crates/plastic-crates
+              - generic [ref=f1e262]:
+                - link "Plastic" [ref=f1e263] [cursor=pointer]:
+                  - /url: /models?material=plastic
+                - link "Worn" [ref=f1e264] [cursor=pointer]:
+                  - /url: /models?condition=worn
+              - generic [ref=f1e266]:
+                - strong [ref=f1e267]: "Tags:"
+                - generic [ref=f1e269]:
+                  - link "beverage crate" [ref=f1e270] [cursor=pointer]:
+                    - /url: /models?s=beverage%20crate
+                  - link "milk crate" [ref=f1e272] [cursor=pointer]:
+                    - /url: /models?s=milk%20crate
+                  - link "storage" [ref=f1e274] [cursor=pointer]:
+                    - /url: /models?s=storage
+                  - link "crate" [ref=f1e276] [cursor=pointer]:
+                    - /url: /models?s=crate
+                  - link "box" [ref=f1e278] [cursor=pointer]:
+                    - /url: /models?s=box
+                  - link "garage" [ref=f1e280] [cursor=pointer]:
+                    - /url: /models?s=garage
+                  - link "workshop" [ref=f1e282] [cursor=pointer]:
+                    - /url: /models?s=workshop
+                  - link "retail" [ref=f1e284] [cursor=pointer]:
+                    - /url: /models?s=retail
+                - generic [ref=f1e286] [cursor=pointer]: ...
+            - generic [ref=f1e287]:
+              - strong [ref=f1e288]: "Released:"
+              - text: 2 months ago
+    - generic [ref=f1e289]:
+      - generic [ref=f1e290]:
+        - text: This website uses cookies to enhance the user experience.
+        - link "Learn more." [ref=f1e291] [cursor=pointer]:
+          - /url: /privacy
+      - button "Accept cookies" [ref=f1e293] [cursor=pointer]: Got it!
+  - alert [ref=f1e294]

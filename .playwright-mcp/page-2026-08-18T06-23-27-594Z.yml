@@ -1,0 +1,184 @@
+- generic [active] [ref=e1]:
+  - generic [ref=e2]:
+    - generic [ref=e3]:
+      - generic [ref=e4]:
+        - link "Poly Haven" [ref=e5] [cursor=pointer]:
+          - /url: /
+        - generic:
+          - heading [level=2]
+          - heading [level=1]
+        - generic [ref=e7]:
+          - link "Assets" [ref=e9] [cursor=pointer]:
+            - /url: /all
+          - link "Add-on" [ref=e11] [cursor=pointer]:
+            - /url: /plugins/blender
+          - link "Vaults" [ref=e17] [cursor=pointer]:
+            - /url: /vaults
+          - link "Learn" [ref=e24] [cursor=pointer]:
+            - /url: /learn
+          - link "Gallery" [ref=e29] [cursor=pointer]:
+            - /url: /gallery
+          - link "Support Us" [ref=e31] [cursor=pointer]:
+            - /url: https://www.patreon.com/polyhaven/join?cadence=12
+          - link "About/Contact" [ref=e35] [cursor=pointer]:
+            - /url: /about-contact
+          - link [ref=e37] [cursor=pointer]:
+            - /url: /account?returnTo=/models
+        - button [ref=e43] [cursor=pointer]
+      - generic [ref=e45]:
+        - generic [ref=e46]:
+          - generic [ref=e48]:
+            - link [ref=e49] [cursor=pointer]:
+              - /url: /all
+            - link [ref=e53] [cursor=pointer]:
+              - /url: /hdris
+              - img "HDRIs" [ref=e54]
+            - link [ref=e55] [cursor=pointer]:
+              - /url: /textures
+              - img "Textures" [ref=e56]
+            - link [ref=e57] [cursor=pointer]:
+              - /url: /models
+              - img "Models" [ref=e58]
+            - heading "Models" [level=2] [ref=e59]
+          - separator [ref=e71]
+          - generic [ref=e73]:
+            - link "Contribute" [ref=e74] [cursor=pointer]:
+              - /url: /contribute
+            - paragraph [ref=e80]:
+              - link "FAQ" [ref=e81] [cursor=pointer]:
+                - /url: https://docs.polyhaven.com/en/faq
+              - link "License" [ref=e82] [cursor=pointer]:
+                - /url: /license
+        - generic [ref=e83]:
+          - generic [ref=e84]:
+            - generic [ref=e85]:
+              - heading "Categories:" [level=2] [ref=e86]
+              - generic [ref=e87]:
+                - link "Apparel & Personal Items":
+                  - /url: /models/apparel-personal-items
+                  - paragraph [ref=e88] [cursor=pointer]: Apparel & Personal Items
+                - link "Architecture":
+                  - /url: /models/architecture
+                  - paragraph [ref=e89] [cursor=pointer]: Architecture
+                - link "Containers & Storage":
+                  - /url: /models/containers-storage
+                  - paragraph [ref=e90] [cursor=pointer]: Containers & Storage
+                - link "Decor & Art":
+                  - /url: /models/decor-art
+                  - paragraph [ref=e91] [cursor=pointer]: Decor & Art
+                - link "Electronics & Appliances":
+                  - /url: /models/electronics-appliances
+                  - paragraph [ref=e92] [cursor=pointer]: Electronics & Appliances
+                - link "Food & Kitchen":
+                  - /url: /models/food-kitchen
+                  - paragraph [ref=e93] [cursor=pointer]: Food & Kitchen
+                - link "Furniture":
+                  - /url: /models/furniture
+                  - paragraph [ref=e94] [cursor=pointer]: Furniture
+                - link "Industrial & Infrastructure":
+                  - /url: /models/industrial-infrastructure
+                  - paragraph [ref=e95] [cursor=pointer]: Industrial & Infrastructure
+                - link "Leisure":
+                  - /url: /models/leisure
+                  - paragraph [ref=e96] [cursor=pointer]: Leisure
+                - link "Lighting":
+                  - /url: /models/lighting
+                  - paragraph [ref=e97] [cursor=pointer]: Lighting
+                - link "Nature":
+                  - /url: /models/nature
+                  - paragraph [ref=e98] [cursor=pointer]: Nature
+                - link "Office & Stationery":
+                  - /url: /models/office-stationery
+                  - paragraph [ref=e99] [cursor=pointer]: Office & Stationery
+                - link "Tools & Equipment":
+                  - /url: /models/tools-equipment
+                  - paragraph [ref=e100] [cursor=pointer]: Tools & Equipment
+                - link "Vehicles & Transport":
+                  - /url: /models/vehicles-transport
+                  - paragraph [ref=e101] [cursor=pointer]: Vehicles & Transport
+                - link "Weapons":
+                  - /url: /models/weapons
+                  - paragraph [ref=e102] [cursor=pointer]: Weapons
+            - generic [ref=e105]:
+              - heading [level=1] [ref=e107]:
+                - link "Models" [ref=e109] [cursor=pointer]:
+                  - /url: /models
+              - generic [ref=e110]:
+                - generic [ref=e118] [cursor=pointer]:
+                  - text: "Sort by:"
+                  - generic [ref=e119]: Hot
+                - textbox "Search..." [ref=e129]
+                - paragraph [ref=e130]: 0 results
+          - generic [ref=e142]:
+            - heading [level=2] [ref=e143]:
+              - text: Thanks to our
+              - link "Patrons" [ref=e144] [cursor=pointer]:
+                - /url: https://www.patreon.com/polyhaven/join?cadence=12
+              - text: for making Poly Haven possible
+            - link "Join the ranks, support Poly Haven on Patreon" [ref=e175] [cursor=pointer]:
+              - /url: https://www.patreon.com/polyhaven/join?cadence=12
+            - generic [ref=e178]:
+              - link [ref=e179] [cursor=pointer]:
+                - /url: /
+                - generic [ref=e180]:
+                  - heading "Poly Haven" [level=1] [ref=e181]
+                  - paragraph [ref=e182]: The Public 3D Asset Library
+              - generic [ref=e184]:
+                - link "Home" [ref=e185] [cursor=pointer]:
+                  - /url: /
+                - link "FAQ" [ref=e186] [cursor=pointer]:
+                  - /url: https://docs.polyhaven.com/en/faq
+                - link "About/Contact" [ref=e187] [cursor=pointer]:
+                  - /url: /about-contact
+                - link "Blog" [ref=e188] [cursor=pointer]:
+                  - /url: https://blog.polyhaven.com
+                - link "HDRI World Map" [ref=e189] [cursor=pointer]:
+                  - /url: /map
+              - generic [ref=e191]:
+                - link "Contribute" [ref=e192] [cursor=pointer]:
+                  - /url: /contribute
+                - link "Wiki" [ref=e193] [cursor=pointer]:
+                  - /url: https://docs.polyhaven.com
+                - link "Source" [ref=e194] [cursor=pointer]:
+                  - /url: https://github.com/Poly-Haven/polyhaven.com
+                - link "Stats" [ref=e195] [cursor=pointer]:
+                  - /url: /stats
+                - link "Status" [ref=e196] [cursor=pointer]:
+                  - /url: https://status.polyhaven.org/
+              - generic [ref=e198]:
+                - link "License" [ref=e199] [cursor=pointer]:
+                  - /url: /license
+                - link "Privacy" [ref=e200] [cursor=pointer]:
+                  - /url: /privacy
+                - link "API" [ref=e201] [cursor=pointer]:
+                  - /url: /our-api
+                - link "Logo" [ref=e202] [cursor=pointer]:
+                  - /url: /logo
+                - link "Finance Reports" [ref=e203] [cursor=pointer]:
+                  - /url: /finance-reports
+              - generic [ref=e204]:
+                - link [ref=e205] [cursor=pointer]:
+                  - /url: https://discord.gg/Dms7Mrs
+                - link [ref=e208] [cursor=pointer]:
+                  - /url: https://www.patreon.com/polyhaven
+                - link [ref=e211] [cursor=pointer]:
+                  - /url: https://masto.ai/@polyhaven
+                - link [ref=e214] [cursor=pointer]:
+                  - /url: https://bsky.app/profile/polyhaven.com
+                - link [ref=e217] [cursor=pointer]:
+                  - /url: https://www.facebook.com/polyhaven
+                - link [ref=e220] [cursor=pointer]:
+                  - /url: https://x.com/polyhaven
+                - link [ref=e223] [cursor=pointer]:
+                  - /url: https://www.instagram.com/polyhaven
+                - link [ref=e226] [cursor=pointer]:
+                  - /url: https://www.youtube.com/c/PolyHaven
+                - link [ref=e229] [cursor=pointer]:
+                  - /url: https://api.polyhaven.com/rss
+    - generic [ref=e232]:
+      - generic [ref=e233]:
+        - text: This website uses cookies to enhance the user experience.
+        - link "Learn more." [ref=e234] [cursor=pointer]:
+          - /url: /privacy
+      - button "Accept cookies" [ref=e236] [cursor=pointer]: Got it!
+  - alert [ref=e237]

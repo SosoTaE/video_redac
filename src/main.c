@@ -99,7 +99,8 @@ int main(int argc, char **argv)
             /* Handled before anything else: it needs no project file. */
             if (i + 1 >= argc || !vr_list_table(argv[i + 1])) {
                 fprintf(stderr, "error: --list expects one of: effects, transitions, "
-                                "easings, actions, properties, widgets, fonts.\n");
+                                "easings, actions, properties, widgets, shapes, "
+                                "fonts.\n");
                 free(defines);
                 return EXIT_FAILURE;
             }

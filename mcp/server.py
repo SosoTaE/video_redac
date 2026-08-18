@@ -225,7 +225,8 @@ PathArg = Annotated[
     description=(
         "The complete JSON scene reference: every key, type and default. Read "
         "this before authoring a scene. Pass `section` to get one part (e.g. "
-        "'emitter', 'timeline', 'path', 'repeat') instead of all ~800 lines."
+        "'mesh', 'camera', 'light', 'emitter', 'timeline', 'repeat') instead of "
+        "the whole reference, which is long."
     )
 )
 def get_authoring_guide(
@@ -237,25 +238,44 @@ def get_authoring_guide(
     if not section:
         return text
 
-    blocks = re.split(r"^(?=## )", text, flags=re.MULTILINE)
     want = section.strip().lower()
-    hits = [b for b in blocks if want in b.split("\n", 1)[0].lower()]
+
+    def split_on(pattern):
+        return re.split(pattern, text, flags=re.MULTILINE)
+
+    def match(blocks):
+        return [b for b in blocks if want in b.split("\n", 1)[0].lower()]
+
+    # Top-level sections first, then the subsections inside them. Splitting only
+    # on "## " missed everything documented one level down — which is where the
+    # object types live, so asking for "mesh" or "text", the likeliest request
+    # of all, answered that no such section existed.
+    top = split_on(r"^(?=## )")
+    hits = match(top) or match(split_on(r"^(?=### )"))
+
     if not hits:
         titles = [b.split("\n", 1)[0].lstrip("# ").strip()
-                  for b in blocks if b.startswith("## ")]
-        return f"No section matching {section!r}. Available:\n- " + "\n- ".join(titles)
+                  for b in top if b.startswith("## ")]
+        subs = re.findall(r"^### +(.+)$", text, flags=re.MULTILINE)
+        return (f"No section matching {section!r}.\n\nSections:\n- "
+                + "\n- ".join(titles)
+                + "\n\nSubsections:\n- " + "\n- ".join(subs))
     return "\n".join(hits)
 
 
 @server.tool(
     description=(
         "The exact names the engine accepts, straight from the binary: effects, "
-        "transitions, easings, timeline actions, animatable properties, or "
-        "object types. Use this rather than guessing a name."
+        "transitions, easings, timeline actions, animatable properties, object "
+        "types, mesh shapes, or installed fonts. Use this rather than guessing "
+        "a name — the lists come from the code that implements them, so they "
+        "cannot be out of date the way this description could."
     )
 )
 def list_vocabulary(
-    kind: Annotated[str, Field(description="effects | transitions | easings | actions | properties | widgets")],
+    kind: Annotated[str, Field(
+        description="effects | transitions | easings | actions | properties | "
+                    "widgets | shapes | fonts")],
 ) -> str:
     proc = _run(["--list", kind])
     if proc.returncode != 0:

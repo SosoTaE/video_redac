@@ -123,17 +123,23 @@ bool vr_video_slice(const WidgetBase *b, int local_ms, size_t *out_offset);
 bool vr_depth_order(const Scene *scene, const WidgetRuntime *rt, int *order);
 
 /*
- * Transforms, projects, shades and culls a mesh into `out` (which must have
- * room for m->tri_count entries), and fills `mp` with the screen bounding box.
+ * Transforms, projects, shades and culls a mesh into `out`, and fills `mp` with
+ * the screen bounding box.
+ *
+ * `cap` is how many entries `out` holds. It must be at least twice the mesh's
+ * triangle count: clipping against the near plane turns a triangle that
+ * straddles the eye into two.
  *
  * Returns the number of triangles actually written — culled and off-screen
  * faces never reach the rasterizer — or 0 when there is nothing to draw.
  *
- * `light` is a world-space point light, or NULL for the camera-mounted default.
+ * `lights` are world-space point lights; a count of 0 gives the camera-mounted
+ * default, where whatever faces the viewer is lit.
  */
 int vr_mesh_project(const MeshWidget *m, const WidgetRuntime *rt,
                     int fb_w, int fb_h, const float view[12],
-                    const float *light, ScreenTri *out, MeshParams *mp);
+                    const Light *lights, int light_count,
+                    ScreenTri *out, int cap, MeshParams *mp);
 
 /*
  * The camera's view transform at time `t`, as a 3x4 matrix (rotation then

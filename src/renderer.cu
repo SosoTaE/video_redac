@@ -412,7 +412,10 @@ bool renderer_init(EditorContext *ctx)
         size_t max_tris = 0;
         for (size_t mi = 0; mi < ctx->mesh_count; mi++) {
             ctx->meshes[mi].tri_base = max_tris;
-            max_tris += ctx->meshes[mi].tri_count;
+            /* Twice, because a triangle crossing the near plane clips into two.
+             * The slices must stay disjoint, so the room is reserved up front
+             * rather than discovered at render time. */
+            max_tris += ctx->meshes[mi].tri_count * 2;
         }
         if (max_tris > 0) {
             /* One depth buffer per slot, shared by every mesh in the scene —
@@ -702,15 +705,15 @@ static void render_scene_into(const EditorContext *ctx, RenderResources *res, in
         /* 2a'. A mesh is not a texture: project it, upload, rasterize. */
         if (b->kind == WIDGET_MESH) {
             const MeshWidget *mw = (const MeshWidget *)b;
-            if (slot->h_tris != NULL && mw->tri_base + mw->tri_count <= slot->tri_cap) {
+            if (slot->h_tris != NULL && mw->tri_base + mw->tri_count * 2 <= slot->tri_cap) {
                 /* This mesh's own slice of the staging buffer — see tri_base. */
                 ScreenTri *h_slice = slot->h_tris + mw->tri_base;
                 ScreenTri *d_slice = slot->d_tris + mw->tri_base;
 
                 MeshParams mp;
                 int nt = vr_mesh_project(mw, r, res->width, res->height, view,
-                                         scene->has_light ? scene->light : NULL,
-                                         h_slice, &mp);
+                                         scene->lights, scene->light_count,
+                                         h_slice, (int)(mw->tri_count * 2), &mp);
                 if (nt > 0) {
                     gpuErrchk(cudaMemcpyAsync(d_slice, h_slice,
                                               (size_t)nt * sizeof(ScreenTri),

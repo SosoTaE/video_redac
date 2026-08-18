@@ -376,7 +376,28 @@ shaded.
 
 ```json
 "light": { "x": 0, "y": 0, "z": 0 }
+
+"light": [ { "x": -1400, "y": -700, "z": -900 },
+           { "x":  1500, "y":  300, "z": -600, "intensity": 0.35 } ]
 ```
+
+| Key | Type | Meaning |
+|---|---|---|
+| `x`, `y`, `z` | float | position, in world units |
+| `intensity` | float | 1 by default; contributions add, then saturate |
+| `range` | float | distance at which the light is half strength; 0 = no falloff |
+
+Up to eight. The second one is usually a *fill*: a dim light from the opposite
+side whose only job is to keep the shadowed half off flat black without
+pretending to be a second sun. Lights have no colour — shading travels through
+the rasterizer as one interpolated scalar per vertex, and the mesh's `color`
+tints the result.
+
+**`range` is what makes a lamp a lamp.** With no falloff a light 50 units away
+and one 5000 units away land equally hard, so a lamp stops reading as a lamp and
+starts reading as a direction — the sense of a place with a light *in* it is
+precisely the falloff. A sun does not want it, and 0 is the default, so scenes
+written before this existed are unaffected.
 
 Without it, meshes are lit from the camera: whatever faces the viewer is bright
 and nothing is ever in shadow. That is the right default for a single object on
@@ -729,19 +750,46 @@ A triangle mesh — an OBJ file, or a named primitive.
 |---|---|---|
 | `path` / `src` | string | an OBJ file, relative to the JSON |
 | `shape` | `box` \| `sphere` \| `torus` \| `cylinder` \| `plane` \| `ring` | `box` when no path |
-| `size` | float | 300 — the mesh's longest axis, in pixels |
+| `size` | float or `[w,h,d]` | 300 — the mesh's extent in pixels; a number is uniform |
 | `color` | colour | `#7EE787` |
 | `ambient` | float 0..1 | 0.25 — the floor for faces turned away |
 | `cull` | bool | true for closed shapes, false for `plane` |
 | `smooth` | bool | true for curved primitives and imported models |
+| `wire` | bool or float | false — a number sets the stroke width in pixels |
+| `antialias` | bool | true — feather the silhouette by a pixel |
 | `texture` | string | an image to wrap onto the surface, relative to the JSON |
 
 Position, rotation, depth, `scale`, `opacity` and `blend` all work as on any
 other object. `rotate_x` / `rotate_y` / `rotation` turn the model in space.
 
+**Meshes are clipped against the near plane.** A triangle that straddles the
+eye plane cannot be projected — perspective division sends it to infinity — so
+it is split along the plane and the part in front is kept. This costs nothing
+for a scene the camera looks *at*, where nothing ever crosses the eye, and is
+the difference between working and not for a scene the camera is *inside*: a
+room's walls are single large boxes, every one of them crosses the eye plane,
+and without clipping every one of them vanishes.
+
 **This is the one widget that is not a texture.** Everything else is rasterized
 once and composited many times; a mesh is transformed, projected and filled
 every frame, because its silhouette changes with every degree of rotation.
+
+### `size` — one number, or three
+
+```json
+{ "type": "mesh", "shape": "cylinder", "size": [26, 620, 26] }
+```
+
+A single number scales every axis alike, which is what an imported model
+usually wants: it arrives with its own proportions and only needs to be made
+bigger or smaller. Three numbers set width, height and depth separately, which
+is what scenery needs — a lamp post is a cylinder eight times taller than it is
+wide, and a wall is a box with almost no depth.
+
+Normals are transformed by the reciprocal of the scale, not the scale itself.
+Squash a sphere into a disc and its normals must splay outward rather than
+squash with it; using the position scale would light a stretched object as
+though it were still round.
 
 **Imported models are normalised** into a unit cube centred on the origin before
 anything else happens. Without that, `size` would mean something different for
@@ -780,6 +828,38 @@ that strip across the disc instead.
 Like `plane` it is two-sided: `cull` defaults to false, and its lighting uses
 the magnitude of the light term rather than clamping at zero (see `light`).
 
+### `wire` — edges instead of faces
+
+```json
+{ "type": "mesh", "shape": "torus", "wire": 2 }
+```
+
+Draws a band along every triangle edge and discards the interior, so the far
+side shows through the near one. `true` picks a sensible width; a number sets it
+in pixels, which is usually what you want — a hairline across a
+fourteen-thousand-triangle model at 1080p is a grey haze rather than a mesh.
+
+The hollow interior does not write depth, so a wireframe genuinely lets things
+behind it through rather than occluding with invisible faces.
+
+### `antialias` — the silhouette
+
+On by default. A mesh edge is a hard polygon boundary, and without it every
+curved surface has a visibly stepped outline.
+
+Coverage is summed across the mesh rather than taken from one triangle, which
+is what keeps it from drawing a lattice of seams over flat surfaces: two
+triangles meeting on an interior edge each cover about half a pixel and together
+fill it, so nothing shows through. Only on the outer silhouette, with nothing
+behind, does the total stay below one.
+
+Two caveats, both narrow. Coverage assumes a single layer, so a *closed* mesh
+with `cull` turned off has its back wall contributing coverage at the silhouette
+and loses the feather there; open surfaces — `plane`, `ring` — are unaffected.
+And the mesh is antialiased against the background and against other meshes,
+not against itself: where one part of a model passes in front of another, the
+depth test still picks a winner per pixel.
+
 ### `texture` — wrapping an image onto the surface
 
 ```json
@@ -806,7 +886,7 @@ Every primitive carries UVs: the box and cylinder give each face the whole
 image, the sphere and torus wrap it around their parameterisation, and the
 plane maps it corner to corner.
 
-### File formats
+### File formats — OBJ and glTF
 
 **OBJ** — `v`, `vt`, `vn` and `f`. A face may reference any combination of the
 three (`f 1/2/3`, `f 1//3`, `f 1`); distinct combinations become distinct

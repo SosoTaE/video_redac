@@ -657,6 +657,30 @@
      "ambient": 0.24
     },
     {
+     "id": "cage",
+     "type": "mesh",
+     "shape": "sphere",
+     "x": 960,
+     "y": 480,
+     "z_depth": 400,
+     "anchor": "center",
+     "size": 900,
+     "color": "#9FE8FF",
+     "ambient": 0.55,
+     "wire": 1.8,
+     "rotate_y": [
+      {
+       "t": 0,
+       "v": 0
+      },
+      {
+       "t": 12.0,
+       "v": 90,
+       "ease": "linear"
+      }
+     ]
+    },
+    {
      "id": "block",
      "type": "mesh",
      "shape": "box",

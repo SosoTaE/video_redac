@@ -958,9 +958,26 @@ bool vr_depth_order(const Scene *scene, const WidgetRuntime *rt, int *order)
 
 static int b_blend_of(const MeshWidget *m) { return m->base.blend; }
 
+/*
+ * Inverse-square falloff, softened so it never blows up at the source.
+ *
+ * `range` is where the light is down to half. Zero means no falloff, which is
+ * what a sun wants and what every scene written before this existed assumes —
+ * so it is also the default.
+ */
+static float vr_falloff(float dist, float range)
+{
+    if (range <= 0.0f) {
+        return 1.0f;
+    }
+    float t = dist / range;
+    return 1.0f / (1.0f + t * t);
+}
+
 int vr_mesh_project(const MeshWidget *m, const WidgetRuntime *rt,
                     int fb_w, int fb_h, const float view[12],
-                    const float *light, ScreenTri *out, MeshParams *mp)
+                    const Light *lights, int light_count,
+                    ScreenTri *out, int cap, MeshParams *mp)
 {
     if (m->tri_count == 0 || m->vert_count == 0) {
         return 0;
@@ -975,7 +992,22 @@ int vr_mesh_project(const MeshWidget *m, const WidgetRuntime *rt,
     float r10 = sz_ * cy_, r11 = sz_ * sy_ * sx_ + cz_ * cx_, r12 = sz_ * sy_ * cx_ - cz_ * sx_;
     float r20 = -sy_,      r21 = cy_ * sx_,                   r22 = cy_ * cx_;
 
-    float scale = m->size * rt->scale * 0.5f;   /* the unit mesh spans -1..1 */
+    /* The unit mesh spans -1..1 on every axis, so half the requested extent is
+     * the factor. Per-axis, which is what lets a cylinder be a lamp post. */
+    float ax_ = m->size[0] * rt->scale * 0.5f;
+    float ay_ = m->size[1] * rt->scale * 0.5f;
+    float az_ = m->size[2] * rt->scale * 0.5f;
+
+    /*
+     * Normals do not scale the way positions do.
+     *
+     * Squash a sphere into a disc and its surface normals must splay outward,
+     * not squash with it — the correct transform is the inverse transpose,
+     * which for a pure axis scale is the reciprocal of each factor. Using the
+     * position scale instead would tilt every normal the wrong way and light a
+     * stretched object as though it were still round.
+     */
+    float nsx = 1.0f / ax_, nsy = 1.0f / ay_, nsz = 1.0f / az_;
     float ccx   = (float)fb_w * 0.5f;
     float ccy   = (float)fb_h * 0.5f;
 
@@ -1031,11 +1063,12 @@ int vr_mesh_project(const MeshWidget *m, const WidgetRuntime *rt,
      * the view transform is rigid — and this way the per-vertex cost stays what
      * it was.
      */
-    float Lv[3] = { 0.0f, 0.0f, 0.0f };
-    if (light != NULL) {
-        Lv[0] = view[0]*light[0] + view[1]*light[1] + view[2]*light[2]  + view[3];
-        Lv[1] = view[4]*light[0] + view[5]*light[1] + view[6]*light[2]  + view[7];
-        Lv[2] = view[8]*light[0] + view[9]*light[1] + view[10]*light[2] + view[11];
+    float Lv[VR_MAX_LIGHTS][3];
+    for (int li = 0; li < light_count; li++) {
+        const Light *L = &lights[li];
+        Lv[li][0] = view[0]*L->x + view[1]*L->y + view[2]*L->z  + view[3];
+        Lv[li][1] = view[4]*L->x + view[5]*L->y + view[6]*L->z  + view[7];
+        Lv[li][2] = view[8]*L->x + view[9]*L->y + view[10]*L->z + view[11];
     }
 
     float minx = 1e30f, miny = 1e30f, maxx = -1e30f, maxy = -1e30f;
@@ -1044,18 +1077,17 @@ int vr_mesh_project(const MeshWidget *m, const WidgetRuntime *rt,
     for (size_t t = 0; t < m->tri_count; t++) {
         const MeshTri *tri = &m->tris[t];
 
-        float sxp[3], syp[3], szp[3];
-        float wx[3], wy[3], wz[3];
+        float wx[3], wy[3], wz[3];      /* view space: x, y, and depth */
         float vlit[3], vu[3], vv[3];
-        bool  behind = false;
 
         for (int k = 0; k < 3; k++) {
             const float *v = &m->verts[(size_t)tri->v[k] * 3];
 
             /* model → rotated → scaled → world */
-            float Wx = (r00 * v[0] + r01 * v[1] + r02 * v[2]) * scale + ox;
-            float Wy = (r10 * v[0] + r11 * v[1] + r12 * v[2]) * scale + oy;
-            float Wz = (r20 * v[0] + r21 * v[1] + r22 * v[2]) * scale + rt->z;
+            float mx_ = v[0] * ax_, my_ = v[1] * ay_, mz_ = v[2] * az_;
+            float Wx = (r00 * mx_ + r01 * my_ + r02 * mz_) + ox;
+            float Wy = (r10 * mx_ + r11 * my_ + r12 * mz_) + oy;
+            float Wz = (r20 * mx_ + r21 * my_ + r22 * mz_) + rt->z;
 
             /* world → view */
             float X = V[0]*Wx + V[1]*Wy + V[2]*Wz  + V[3];
@@ -1068,27 +1100,36 @@ int vr_mesh_project(const MeshWidget *m, const WidgetRuntime *rt,
              * same loop so the vertex is touched once. */
             if (m->norms != NULL) {
                 const float *nv = &m->norms[(size_t)tri->v[k] * 3];
-                float NX = r00*nv[0] + r01*nv[1] + r02*nv[2];
-                float NY = r10*nv[0] + r11*nv[1] + r12*nv[2];
-                float NZ = r20*nv[0] + r21*nv[1] + r22*nv[2];
+                float na = nv[0] * nsx, nb = nv[1] * nsy, nc = nv[2] * nsz;
+                float NX = r00*na + r01*nb + r02*nc;
+                float NY = r10*na + r11*nb + r12*nc;
+                float NZ = r20*na + r21*nb + r22*nc;
                 float len2 = NX*NX + NY*NY + NZ*NZ;
                 float lam;
 
-                if (light != NULL) {
+                if (light_count > 0) {
                     /* Vertex normals point outward, so no sign correction is
                      * needed here — unlike the face normals below. Clamped at
                      * zero, which is what draws the terminator: past ninety
-                     * degrees the surface simply faces away from the light. */
+                     * degrees the surface simply faces away from the light.
+                     * Several lights add up, then saturate. */
                     float VNx = V[0]*NX + V[1]*NY + V[2]*NZ;
                     float VNy = V[4]*NX + V[5]*NY + V[6]*NZ;
                     float VNz = V[8]*NX + V[9]*NY + V[10]*NZ;
-                    float lx = Lv[0] - X, ly = Lv[1] - Y, lz = Lv[2] - Z;
-                    float ll = sqrtf(lx*lx + ly*ly + lz*lz);
                     float nl = sqrtf(VNx*VNx + VNy*VNy + VNz*VNz);
-                    float d = (ll > 1e-9f && nl > 1e-9f)
-                        ? (VNx*lx + VNy*ly + VNz*lz) / (ll * nl) : 1.0f;
-                    if (two_sided) d = fabsf(d);
-                    lam = (d > 0.0f) ? d : 0.0f;
+
+                    lam = 0.0f;
+                    for (int li = 0; li < light_count; li++) {
+                        float lx = Lv[li][0] - X, ly = Lv[li][1] - Y, lz = Lv[li][2] - Z;
+                        float ll = sqrtf(lx*lx + ly*ly + lz*lz);
+                        float d = (ll > 1e-9f && nl > 1e-9f)
+                            ? (VNx*lx + VNy*ly + VNz*lz) / (ll * nl) : 1.0f;
+                        if (two_sided) d = fabsf(d);
+                        if (d > 0.0f) {
+                            lam += d * lights[li].intensity * vr_falloff(ll, lights[li].range);
+                        }
+                    }
+                    if (lam > 1.0f) lam = 1.0f;
                 } else {
                     float VZ = V[8]*NX + V[9]*NY + V[10]*NZ;   /* rotation only */
                     lam = (len2 > 1e-12f) ? fabsf(VZ) / sqrtf(len2) : 1.0f;
@@ -1104,45 +1145,6 @@ int vr_mesh_project(const MeshWidget *m, const WidgetRuntime *rt,
                 vu[k] = 0.0f; vv[k] = 0.0f;
             }
 
-            /*
-             * Z is already the distance in front of the eye — the view matrix
-             * translated the eye to the origin. The old fixed viewpoint reached
-             * the same number as `focal + world z`, which is why this is not a
-             * behaviour change for a scene with no camera movement.
-             */
-            if (Z <= 1e-3f) {
-                behind = true;      /* at or behind the viewer */
-                break;
-            }
-            float s = f / Z;
-            sxp[k] = ccx + X * s;
-            syp[k] = ccy + Y * s;
-            szp[k] = Z;
-        }
-        if (behind) {
-            continue;
-        }
-
-        /* Signed area in screen space: its sign is the winding, which is how a
-         * back face is recognised after projection. */
-        float area = (sxp[1] - sxp[0]) * (syp[2] - syp[0])
-                   - (sxp[2] - sxp[0]) * (syp[1] - syp[0]);
-
-        if (fabsf(area) < 1e-6f) {
-            continue;               /* edge-on: nothing to fill */
-        }
-        if (m->cull && area < 0.0f) {
-            continue;
-        }
-
-        /*
-         * The rasterizer accepts one winding only, so a front face that
-         * projected the other way round is reversed here rather than
-         * complicating the pixel loop with a sign test.
-         */
-        int i0 = 0, i1 = 1, i2 = 2;
-        if (area < 0.0f) {
-            i1 = 2; i2 = 1;
         }
 
         /*
@@ -1162,7 +1164,7 @@ int vr_mesh_project(const MeshWidget *m, const WidgetRuntime *rt,
         float len = sqrtf(nx * nx + ny * ny + nz * nz);
         float lam;
 
-        if (light != NULL) {
+        if (light_count > 0) {
             /*
              * Negated: this renderer keeps the face whose cross product points
              * *away* from the viewer (y-down flips the projected winding), so
@@ -1173,16 +1175,110 @@ int vr_mesh_project(const MeshWidget *m, const WidgetRuntime *rt,
             float cx_w = (wx[0] + wx[1] + wx[2]) * (1.0f / 3.0f);
             float cy_w = (wy[0] + wy[1] + wy[2]) * (1.0f / 3.0f);
             float cz_w = (wz[0] + wz[1] + wz[2]) * (1.0f / 3.0f);
-            float lx = Lv[0] - cx_w, ly = Lv[1] - cy_w, lz = Lv[2] - cz_w;
-            float ll = sqrtf(lx*lx + ly*ly + lz*lz);
-            float d = (ll > 1e-9f && len > 1e-9f)
-                ? -(nx*lx + ny*ly + nz*lz) / (ll * len) : 1.0f;
-            if (two_sided) d = fabsf(d);
-            lam = (d > 0.0f) ? d : 0.0f;
+
+            lam = 0.0f;
+            for (int li = 0; li < light_count; li++) {
+                float lx = Lv[li][0] - cx_w, ly = Lv[li][1] - cy_w, lz = Lv[li][2] - cz_w;
+                float ll = sqrtf(lx*lx + ly*ly + lz*lz);
+                float d = (ll > 1e-9f && len > 1e-9f)
+                    ? -(nx*lx + ny*ly + nz*lz) / (ll * len) : 1.0f;
+                if (two_sided) d = fabsf(d);
+                if (d > 0.0f) {
+                    lam += d * lights[li].intensity * vr_falloff(ll, lights[li].range);
+                }
+            }
+            if (lam > 1.0f) lam = 1.0f;
         } else {
             lam = (len > 1e-9f) ? fabsf(nz) / len : 1.0f;
         }
         float lit = smooth ? 1.0f : (amb + (1.0f - amb) * lam);
+
+        /*
+         * Clip against the near plane before projecting.
+         *
+         * Perspective division is meaningless at or behind the eye — z goes to
+         * zero and the projected point flies to infinity — so a triangle that
+         * straddles the eye plane cannot simply be projected. Discarding it
+         * whole is the cheap answer and it is invisible as long as the camera
+         * stays outside its subject: an object you walk around is never cut by
+         * the eye plane. Put the camera *inside* something and it is fatal —
+         * the walls of a room are single large boxes, every one of them crosses
+         * the eye plane, and every one of them vanishes entirely, leaving the
+         * furniture floating in a void.
+         *
+         * Sutherland–Hodgman against the single plane z = NEAR. Three vertices
+         * in gives three or four out, so a clipped triangle becomes one or two.
+         */
+        const float NEAR = 1.0f;
+        float px4[4], py4[4], pz4[4], pl4[4], pu4[4], pv4[4];
+        int nc = 0;
+
+        for (int a = 0; a < 3; a++) {
+            int b = (a + 1) % 3;
+            bool ina = (wz[a] > NEAR), inb = (wz[b] > NEAR);
+
+            if (ina) {
+                px4[nc] = wx[a]; py4[nc] = wy[a]; pz4[nc] = wz[a];
+                pl4[nc] = vlit[a]; pu4[nc] = vu[a]; pv4[nc] = vv[a];
+                nc++;
+            }
+            if (ina != inb) {
+                /* Attributes interpolate linearly in view space, which is why
+                 * the split happens here and not after the divide. */
+                float ct = (NEAR - wz[a]) / (wz[b] - wz[a]);
+                px4[nc] = wx[a] + (wx[b] - wx[a]) * ct;
+                py4[nc] = wy[a] + (wy[b] - wy[a]) * ct;
+                pz4[nc] = NEAR;
+                pl4[nc] = vlit[a] + (vlit[b] - vlit[a]) * ct;
+                pu4[nc] = vu[a] + (vu[b] - vu[a]) * ct;
+                pv4[nc] = vv[a] + (vv[b] - vv[a]) * ct;
+                nc++;
+            }
+        }
+        if (nc < 3) {
+            continue;               /* wholly behind the eye */
+        }
+
+        /* Fan the polygon back into triangles and project each. */
+        for (int fan = 2; fan < nc; fan++) {
+            const int fi[3] = { 0, fan - 1, fan };
+
+            float sxp[3], syp[3], szp[3], flit[3], fu[3], fv[3];
+            for (int k = 0; k < 3; k++) {
+                int q = fi[k];
+                float sc = f / pz4[q];
+                sxp[k] = ccx + px4[q] * sc;
+                syp[k] = ccy + py4[q] * sc;
+                szp[k] = pz4[q];
+                flit[k] = pl4[q];
+                fu[k] = pu4[q];
+                fv[k] = pv4[q];
+            }
+
+            /* Signed area in screen space: its sign is the winding, which is
+             * how a back face is recognised after projection. */
+            float area = (sxp[1] - sxp[0]) * (syp[2] - syp[0])
+                       - (sxp[2] - sxp[0]) * (syp[1] - syp[0]);
+
+            if (fabsf(area) < 1e-6f) {
+                continue;           /* edge-on: nothing to fill */
+            }
+            if (m->cull && area < 0.0f) {
+                continue;
+            }
+            if (n >= cap) {
+                break;              /* the staging buffer is full */
+            }
+
+            /*
+             * The rasterizer accepts one winding only, so a front face that
+             * projected the other way round is reversed here rather than
+             * complicating the pixel loop with a sign test.
+             */
+            int i0 = 0, i1 = 1, i2 = 2;
+            if (area < 0.0f) {
+                i1 = 2; i2 = 1;
+            }
 
         ScreenTri *o = &out[n++];
         o->x0 = sxp[i0]; o->y0 = syp[i0]; o->z0 = szp[i0];
@@ -1192,7 +1288,7 @@ int vr_mesh_project(const MeshWidget *m, const WidgetRuntime *rt,
         o->g = base_g * lit;
         o->b = base_b * lit;
 
-        o->l0 = vlit[i0]; o->l1 = vlit[i1]; o->l2 = vlit[i2];
+        o->l0 = flit[i0]; o->l1 = flit[i1]; o->l2 = flit[i2];
 
         /*
          * u/z and 1/z, not u and v directly: those interpolate linearly in
@@ -1203,15 +1299,31 @@ int vr_mesh_project(const MeshWidget *m, const WidgetRuntime *rt,
         float iz1 = 1.0f / szp[i1];
         float iz2 = 1.0f / szp[i2];
 
-        o->u0 = vu[i0] * iz0; o->v0 = vv[i0] * iz0; o->w0 = iz0;
-        o->u1 = vu[i1] * iz1; o->v1 = vv[i1] * iz1; o->w1 = iz1;
-        o->u2 = vu[i2] * iz2; o->v2 = vv[i2] * iz2; o->w2 = iz2;
+        o->u0 = fu[i0] * iz0; o->v0 = fv[i0] * iz0; o->w0 = iz0;
+        o->u1 = fu[i1] * iz1; o->v1 = fv[i1] * iz1; o->w1 = iz1;
+        o->u2 = fu[i2] * iz2; o->v2 = fv[i2] * iz2; o->w2 = iz2;
+
+        /* Reciprocal edge lengths, so the rasterizer can turn its edge
+         * functions into pixel distances without three square roots per pixel.
+         * A degenerate edge would divide by zero; it gets a huge reciprocal,
+         * which reads as "always far outside" and is harmless because a
+         * triangle with a zero-length edge has no area to fill anyway. */
+        float ex0 = o->x1 - o->x0, ey0 = o->y1 - o->y0;
+        float ex1 = o->x2 - o->x1, ey1 = o->y2 - o->y1;
+        float ex2 = o->x0 - o->x2, ey2 = o->y0 - o->y2;
+        float ln0 = sqrtf(ex0*ex0 + ey0*ey0);
+        float ln1 = sqrtf(ex1*ex1 + ey1*ey1);
+        float ln2 = sqrtf(ex2*ex2 + ey2*ey2);
+        o->rlen0 = (ln0 > 1e-6f) ? 1.0f / ln0 : 1e6f;
+        o->rlen1 = (ln1 > 1e-6f) ? 1.0f / ln1 : 1e6f;
+        o->rlen2 = (ln2 > 1e-6f) ? 1.0f / ln2 : 1e6f;
 
         for (int k = 0; k < 3; k++) {
             if (sxp[k] < minx) minx = sxp[k];
             if (sxp[k] > maxx) maxx = sxp[k];
             if (syp[k] < miny) miny = syp[k];
             if (syp[k] > maxy) maxy = syp[k];
+        }
         }
     }
 
@@ -1231,7 +1343,7 @@ int vr_mesh_project(const MeshWidget *m, const WidgetRuntime *rt,
         fprintf(stderr, "[mesh] tris=%zu kept=%d  bbox x %.0f..%.0f y %.0f..%.0f  "
                         "size=%.0f scale=%.2f focal=%.0f ox=%.0f oy=%.0f z=%.0f\n",
                 m->tri_count, n, (double)minx, (double)maxx, (double)miny, (double)maxy,
-                (double)m->size, (double)rt->scale, (double)f,
+                (double)m->size[1], (double)rt->scale, (double)f,
                 (double)ox, (double)oy, (double)rt->z);
     }
     if (n == 0) {
@@ -1256,6 +1368,10 @@ int vr_mesh_project(const MeshWidget *m, const WidgetRuntime *rt,
     mp->alpha  = rt->opacity;
     mp->blend  = b_blend_of(m);
     mp->smooth = smooth ? 1 : 0;
+    /* Half the stroke: the rasterizer measures from the edge in both
+     * directions, so a 2px line reaches 1px either side of it. */
+    mp->wire   = m->wire * 0.5f;
+    mp->aa     = m->antialias ? 1 : 0;
     mp->tex_w  = (m->tex.pixels != NULL) ? m->tex.width  : 0;
     mp->tex_h  = (m->tex.pixels != NULL) ? m->tex.height : 0;
     return n;

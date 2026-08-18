@@ -612,11 +612,35 @@ typedef struct {
     char    *path;           /* NULL for a procedural primitive */
     char    *shape;          /* "box" | "sphere" | "torus" | "cylinder" | "plane" */
 
-    float    size;           /* the unit mesh is scaled to this, in pixels */
+    /*
+     * Extent in pixels, per axis.
+     *
+     * A single number was enough while a mesh meant "an object on a card",
+     * where a model arrives with its own proportions and only needs to be made
+     * bigger or smaller. It stops being enough the moment the mesh is a piece
+     * of scenery: a lamp post is a cylinder eight times taller than it is wide,
+     * a wall is a box with almost no depth, and with one scale factor both come
+     * out as lumps. Uniform `"size": 300` fills all three.
+     */
+    float    size[3];
     Color    color;
     float    ambient;        /* 0..1 floor, so faces turned away are not black */
     bool     cull;           /* drop back-facing triangles (true for closed shapes) */
-    bool     wire;           /* draw edges rather than filled faces */
+    /*
+     * Wireframe stroke width in pixels; 0 draws filled faces.
+     *
+     * A width rather than a flag because a hairline is the one thing a
+     * wireframe must not be: at 1080p a single pixel of a 14,000-triangle model
+     * is a grey haze, and the useful setting is nearly always thicker.
+     */
+    float    wire;
+
+    /*
+     * Feather the silhouette by a pixel. On by default — a mesh edge is a hard
+     * polygon boundary and without it every curved surface has a visibly
+     * stepped outline.
+     */
+    bool     antialias;
 } MeshWidget;
 
 /* A raster image (PNG/JPG), loaded with stb_image. */
@@ -883,6 +907,37 @@ typedef struct {
     Track roll;                 /* degrees about the view axis */
 } Camera3D;
 
+/*
+ * A point light.
+ *
+ * `intensity` is what makes more than one of them useful: a lit scene is
+ * usually one bright key plus a dim fill from the other side, whose whole job
+ * is to keep the shadowed half off flat black without pretending to be a second
+ * sun.
+ *
+ * Deliberately colourless. Shading travels through the rasterizer as a single
+ * interpolated scalar per vertex; giving lights colours would make that three,
+ * for something no scene here has needed. A mesh's `color` tints the result.
+ */
+typedef struct {
+    float x, y, z;
+    float intensity;
+
+    /*
+     * Distance at which the light is down to half strength; 0 means no falloff
+     * at all.
+     *
+     * A sun does not need it — every planet is effectively the same distance
+     * away, and the direction is the whole story. A room does. Without falloff
+     * a lamp lights the far wall exactly as hard as the near one, so the light
+     * stops reading as a lamp and starts reading as a direction; the sense of
+     * a place with a light *in* it is precisely the falloff.
+     */
+    float range;
+} Light;
+
+#define VR_MAX_LIGHTS 8
+
 typedef struct {
     bool  present;
 
@@ -944,8 +999,8 @@ typedef struct {
      * Absent by default, so every existing project keeps the camera-mounted
      * shading it was authored against.
      */
-    bool           has_light;
-    float          light[3];
+    Light          lights[VR_MAX_LIGHTS];
+    int            light_count;
 
     /*
      * The scene's own effects — applied *before* the transition, so a clip's

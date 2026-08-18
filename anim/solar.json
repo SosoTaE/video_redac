@@ -4,7 +4,7 @@
  "project": {
   "width": 1920,
   "height": 1080,
-  "fps": 60,
+  "fps": 120,
   "bg_color": "#02030A"
  },
  "output": {
