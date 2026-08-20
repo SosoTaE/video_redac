@@ -54,6 +54,11 @@ static const struct {
     { "duotone",      FX_GRADIENT_MAP },
     { "lut",          FX_LUT          },
     { "look",         FX_LUT          },
+    { "lift_gamma_gain", FX_LGG       },
+    { "lgg",          FX_LGG          },
+    { "three_way",    FX_LGG          },
+    { "bloom",        FX_BLOOM        },
+    { "glow",         FX_BLOOM        },
     { "blur",         FX_BLUR         },
     { "pixelate",     FX_PIXELATE     },
     { "rgb_split",    FX_RGB_SPLIT    },
@@ -87,6 +92,7 @@ const char *effect_name(EffectType t)
 bool effect_needs_neighbors(EffectType t)
 {
     switch (t) {
+        case FX_BLOOM:
         case FX_BLUR:
         case FX_PIXELATE:
         case FX_RGB_SPLIT:
@@ -105,6 +111,9 @@ void effect_free(Effect *fx)
     for (int i = 0; i < FXP_MAX; i++) {
         track_free(&fx->param[i]);
     }
+    track_free(&fx->win_cx); track_free(&fx->win_cy);
+    track_free(&fx->win_rx); track_free(&fx->win_ry);
+    track_free(&fx->win_feather);
     free(fx->lut_path);
     free(fx->lut);
     fx->lut_path = NULL;

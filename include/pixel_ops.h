@@ -244,7 +244,209 @@ typedef struct {
     float ca[4];   /* color_a 0..1 */
     float cb[4];   /* color_b 0..1 */
     int   lut_size;   /* FX_LUT: edge length of the cube; 0 = no table */
+
+    /* Power window, in canvas fractions. shape 0 = the whole frame. */
+    int   win_shape;
+    float win_cx, win_cy, win_rx, win_ry, win_feather;
+    int   win_invert;
+
+    /* HSL qualifier. 0 = every colour passes. */
+    int   qual_on, qual_invert;
 } EffectGPU;
+
+/* The four converters every effect starts and ends with. They sit here,
+ * above the effects themselves, because the qualifier and the window both
+ * need luma and a colour load before any effect has run. */
+
+VR_PIX float3 vr_fx_load(uchar4 c)
+{
+    const float inv = 1.0f / 255.0f;
+    return make_float3(c.x * inv, c.y * inv, c.z * inv);
+}
+
+VR_PIX uchar4 vr_fx_store(float3 c, unsigned char a)
+{
+    return make_uchar4(vr_u8(c.x), vr_u8(c.y), vr_u8(c.z), a);
+}
+
+/* BT.709 luma — the same weights as in the NV12 conversion. */
+VR_PIX float vr_fx_luma(float3 c)
+{
+    return 0.2126f * c.x + 0.7152f * c.y + 0.0722f * c.z;
+}
+
+VR_PIX float3 vr_fx_mix(float3 a, float3 b, float t)
+{
+    return make_float3(a.x + (b.x - a.x) * t,
+                       a.y + (b.y - a.y) * t,
+                       a.z + (b.z - a.z) * t);
+}
+
+/*
+ * How far `v` is inside the band [lo, hi], with a soft edge of width `soft`.
+ *
+ * 1 well inside, 0 well outside, and a smoothstep between. The softness is what
+ * makes a qualifier usable rather than a party trick: a hard selection on a
+ * photographic image chatters along every edge where the hue crosses the
+ * threshold, and the chatter is far more visible than the correction.
+ */
+VR_PIX float vr_fx_band(float v, float lo, float hi, float soft)
+{
+    if (soft <= 1e-6f) {
+        return (v >= lo && v <= hi) ? 1.0f : 0.0f;
+    }
+    float a = (v - (lo - soft)) / soft;      /* rising edge  */
+    float b = ((hi + soft) - v) / soft;      /* falling edge */
+    float t = fminf(a, b);
+    if (t <= 0.0f) return 0.0f;
+    if (t >= 1.0f) return 1.0f;
+    return t * t * (3.0f - 2.0f * t);
+}
+
+/*
+ * The qualifier: how much this colour belongs to the selection, 0..1.
+ *
+ * Hue, saturation and luma are tested separately and multiplied, which is what
+ * makes the control usable — "green, but only the saturated ones, and not in
+ * the shadows" is three independent thoughts and a colourist adjusts them one
+ * at a time.
+ *
+ * Hue wraps. A selection from 340 to 20 degrees is reds through magenta and has
+ * to work; testing it as a plain interval selects everything except reds, which
+ * is the exact opposite and looks like a sign error somewhere else entirely.
+ */
+VR_PIX float vr_fx_qualifier(float3 c, const EffectGPU *fx)
+{
+    float mx = fmaxf(c.x, fmaxf(c.y, c.z));
+    float mn = fminf(c.x, fminf(c.y, c.z));
+    float d  = mx - mn;
+
+    float sat = (mx > 1e-6f) ? d / mx : 0.0f;
+    float lum = vr_fx_luma(c);
+
+    float hue = 0.0f;
+    if (d > 1e-6f) {
+        if (mx == c.x)      hue = 60.0f * fmodf((c.y - c.z) / d + 6.0f, 6.0f);
+        else if (mx == c.y) hue = 60.0f * ((c.z - c.x) / d + 2.0f);
+        else                hue = 60.0f * ((c.x - c.y) / d + 4.0f);
+    }
+
+    float soft = fx->p[FXP_Q_SOFT];
+    float h0 = fx->p[FXP_Q_HUE0], h1 = fx->p[FXP_Q_HUE1];
+
+    float ch;
+    if (h1 >= h0) {
+        ch = vr_fx_band(hue, h0, h1, soft * 360.0f);
+    } else {
+        /* Wrapped: the union of [h0, 360] and [0, h1]. */
+        float a = vr_fx_band(hue, h0, 360.0f, soft * 360.0f);
+        float b = vr_fx_band(hue, 0.0f, h1,   soft * 360.0f);
+        ch = fmaxf(a, b);
+    }
+
+    float cs = vr_fx_band(sat, fx->p[FXP_Q_SAT0],  fx->p[FXP_Q_SAT1],  soft);
+    float cl = vr_fx_band(lum, fx->p[FXP_Q_LUMA0], fx->p[FXP_Q_LUMA1], soft);
+
+    float cov = ch * cs * cl;
+    return fx->qual_invert ? (1.0f - cov) : cov;
+}
+
+/*
+ * How much of this pixel the window covers, 0..1.
+ *
+ * A signed-distance formulation rather than an inside/outside test, because the
+ * edge is the whole point: a correction that stops at a hard boundary announces
+ * itself as a correction. `feather` is the width of the ramp as a fraction of
+ * the canvas, and the ellipse's distance is normalised by its own radii so a
+ * long thin window feathers evenly along both axes rather than mostly along the
+ * short one.
+ */
+VR_PIX float vr_fx_window(const EffectGPU *fx, int x, int y, int w, int h)
+{
+    if (fx->win_shape == 0) {
+        return 1.0f;
+    }
+
+    float nx = ((float)x + 0.5f) / (float)w;
+    float ny = ((float)y + 0.5f) / (float)h;
+
+    float rx = (fx->win_rx > 1e-5f) ? fx->win_rx : 1e-5f;
+    float ry = (fx->win_ry > 1e-5f) ? fx->win_ry : 1e-5f;
+
+    float dx = (nx - fx->win_cx) / rx;
+    float dy = (ny - fx->win_cy) / ry;
+
+    /*
+     * `d` is 1 exactly on the boundary and grows outward, in units of "window
+     * radii". Converting the feather into the same units is what keeps the ramp
+     * the requested width in canvas terms on both axes.
+     */
+    float d;
+    if (fx->win_shape == 1) {
+        d = sqrtf(dx * dx + dy * dy);
+    } else {
+        d = fmaxf(fabsf(dx), fabsf(dy));
+    }
+
+    float cov;
+    float fe = fx->win_feather;
+    if (fe <= 1e-5f) {
+        cov = (d <= 1.0f) ? 1.0f : 0.0f;
+    } else {
+        /* The ramp measured along whichever axis this pixel lies on, so a
+         * feather of 0.1 is a tenth of the canvas either way round. */
+        float scale = (fx->win_shape == 1)
+            ? sqrtf((dx * rx) * (dx * rx) + (dy * ry) * (dy * ry))
+            : fmaxf(fabsf(dx) * rx, fabsf(dy) * ry);
+        float rad = (d > 1e-6f) ? scale / d : rx;   /* the radius in this direction */
+        float t = (d - 1.0f) * rad / fe;            /* 0 at the edge, 1 a feather out */
+        if (t <= 0.0f)      cov = 1.0f;
+        else if (t >= 1.0f) cov = 0.0f;
+        else                cov = 1.0f - t * t * (3.0f - 2.0f * t);
+    }
+
+    return fx->win_invert ? (1.0f - cov) : cov;
+}
+
+/*
+ * Blends an effect's output back toward the untouched frame outside its window.
+ *
+ * A separate pass rather than a test inside every effect, and that is the whole
+ * reason it works on all of them: blur, glitch and pixelate read neighbouring
+ * pixels, so "skip this pixel" is not something they can honour — a blur whose
+ * taps are half-skipped is not a narrower blur, it is a wrong one. Letting the
+ * effect run over the frame and then choosing per pixel how much of it to keep
+ * is correct for every effect there is, at the cost of one pass.
+ */
+VR_PIX void vr_px_fx_window(uchar4 *VR_RESTRICT dst, const uchar4 *VR_RESTRICT keep,
+                            int w, int h, const EffectGPU *fx, int x, int y)
+{
+    size_t i = (size_t)y * w + x;
+
+    float cov = vr_fx_window(fx, x, y, w, h);
+    if (fx->qual_on) {
+        /*
+         * The qualifier is judged on the frame as it was, not as the effect
+         * left it. Testing the output would make the selection chase its own
+         * correction — push the greens toward cyan and they stop being green,
+         * so the selection shrinks, so the push weakens.
+         */
+        cov *= vr_fx_qualifier(vr_fx_load(keep[i]), fx);
+    }
+    if (cov >= 1.0f) {
+        return;
+    }
+    if (cov <= 0.0f) {
+        dst[i] = keep[i];
+        return;
+    }
+    uchar4 a = keep[i];
+    uchar4 b = dst[i];
+    dst[i] = make_uchar4(vr_u8((a.x + (b.x - a.x) * cov) * (1.0f / 255.0f)),
+                         vr_u8((a.y + (b.y - a.y) * cov) * (1.0f / 255.0f)),
+                         vr_u8((a.z + (b.z - a.z) * cov) * (1.0f / 255.0f)),
+                         vr_u8((a.w + (b.w - a.w) * cov) * (1.0f / 255.0f)));
+}
 
 /*
  * Trilinear lookup in a 3D colour cube.
@@ -311,30 +513,6 @@ VR_PIX float3 vr_fx_lut3(const float *VR_RESTRICT lut, int n, float3 c)
     return o;
 }
 
-VR_PIX float3 vr_fx_load(uchar4 c)
-{
-    const float inv = 1.0f / 255.0f;
-    return make_float3(c.x * inv, c.y * inv, c.z * inv);
-}
-
-VR_PIX uchar4 vr_fx_store(float3 c, unsigned char a)
-{
-    return make_uchar4(vr_u8(c.x), vr_u8(c.y), vr_u8(c.z), a);
-}
-
-/* BT.709 luma — the same weights as in the NV12 conversion. */
-VR_PIX float vr_fx_luma(float3 c)
-{
-    return 0.2126f * c.x + 0.7152f * c.y + 0.0722f * c.z;
-}
-
-VR_PIX float3 vr_fx_mix(float3 a, float3 b, float t)
-{
-    return make_float3(a.x + (b.x - a.x) * t,
-                       a.y + (b.y - a.y) * t,
-                       a.z + (b.z - a.z) * t);
-}
-
 /*
  * Integer hash → a pseudo-random value in [0,1).
  *
@@ -356,6 +534,36 @@ VR_PIX float3 vr_fx_apply_point(float3 c, const EffectGPU *fx,
                                 int x, int y, int w, int h, unsigned int seed)
 {
     switch (fx->type) {
+        case FX_LGG: {
+            /*
+             * out = (in + lift * (1 - in)) * gain, then gamma.
+             *
+             * Lift is scaled by (1 - in) rather than added flat, which is what
+             * confines it to the shadows: at white it does nothing, at black it
+             * is the whole of the change. A flat offset would move the
+             * highlights just as far and there would be no difference between
+             * lift and gain at all.
+             */
+            float3 o = c;
+            const float *p = fx->p;
+            float ch[3] = { o.x, o.y, o.z };
+            for (int k = 0; k < 3; k++) {
+                float lift = p[FXP_LIFT_R + k];
+                float gain = p[FXP_GAIN_R + k];
+                float gam  = p[FXP_GAMMA_R + k];
+
+                float v = ch[k];
+                v = v + lift * (1.0f - v);
+                v = v * gain;
+                if (v < 0.0f) v = 0.0f;
+                if (gam > 1e-4f && gam != 1.0f) {
+                    v = powf(v, 1.0f / gam);
+                }
+                ch[k] = v;
+            }
+            float3 lit = make_float3(ch[0], ch[1], ch[2]);
+            return vr_fx_mix(c, lit, vr_sat(fx->p[FXP_AMOUNT]));
+        }
         case FX_LUT: {
             if (lut == NULL || fx->lut_size < 2) {
                 return c;
@@ -521,6 +729,57 @@ VR_PIX void vr_px_fx_point(uchar4 *VR_RESTRICT dst, const uchar4 *VR_RESTRICT sr
     uchar4 s = src[i];
     dst[i]   = vr_fx_store(vr_fx_apply_point(vr_fx_load(s), fx, lut,
                                              x, y, w, h, seed), s.w);
+}
+
+/*
+ * Bloom, first half: keep only what is brighter than the threshold.
+ *
+ * The excess is kept, not the pixel — a pixel at 0.8 against a threshold of
+ * 0.75 contributes 0.05, not 0.8. That is what makes the effect scale with how
+ * bright a thing actually is instead of turning everything above the line into
+ * the same glow, and it is why a specular glint blooms and a white wall does
+ * not.
+ *
+ * The ramp is softened over a small knee. A hard threshold makes the bloom
+ * appear and disappear as a highlight drifts across it, which on moving footage
+ * reads as flicker.
+ */
+VR_PIX void vr_px_fx_bloom_cut(uchar4 *VR_RESTRICT dst, const uchar4 *VR_RESTRICT src,
+                               int w, int h, float threshold, int x, int y)
+{
+    (void)h;
+    size_t i = (size_t)y * w + x;
+    float3 c = vr_fx_load(src[i]);
+    float  l = vr_fx_luma(c);
+
+    const float knee = 0.10f;
+    float t;
+    if (l <= threshold)             t = 0.0f;
+    else if (l >= threshold + knee) t = 1.0f;
+    else {
+        float u = (l - threshold) / knee;
+        t = u * u * (3.0f - 2.0f * u);
+    }
+
+    float excess = (l > threshold) ? (l - threshold) * t : 0.0f;
+    /* Scaled by the pixel's own colour, normalised by its luma, so the glow
+     * takes the hue of whatever is glowing rather than coming out white. */
+    float k = (l > 1e-4f) ? excess / l : 0.0f;
+    dst[i] = vr_fx_store(make_float3(c.x * k, c.y * k, c.z * k), src[i].w);
+}
+
+/* Bloom, second half: the blurred excess added back on top. */
+VR_PIX void vr_px_fx_bloom_add(uchar4 *VR_RESTRICT dst, const uchar4 *VR_RESTRICT src,
+                               const uchar4 *VR_RESTRICT glow, int w, int h,
+                               float intensity, int x, int y)
+{
+    (void)h;
+    size_t i = (size_t)y * w + x;
+    float3 c = vr_fx_load(src[i]);
+    float3 g = vr_fx_load(glow[i]);
+    dst[i] = vr_fx_store(make_float3(c.x + g.x * intensity,
+                                     c.y + g.y * intensity,
+                                     c.z + g.z * intensity), src[i].w);
 }
 
 /*
@@ -1726,12 +1985,51 @@ VR_PIX void vr_px_mesh(uchar4 *VR_RESTRICT fb, float *VR_RESTRICT depth,
 
             float diff = 0.0f;
             for (int li = 0; li < p->light_count; li++) {
-                float lx = p->lights[li].x - Xv;
-                float ly = p->lights[li].y - Yv;
-                float lz = p->lights[li].z - Zv;
-                float ll = sqrtf(lx * lx + ly * ly + lz * lz);
-                if (ll < 1e-9f) {
-                    continue;
+                const Light *L = &p->lights[li];
+
+                /*
+                 * The vector from the surface to the light, and how far away it
+                 * is. A directional light has no position: every surface is lit
+                 * from the same angle, so the vector is just the negated aim
+                 * and the distance is meaningless — which is why `ll` is forced
+                 * to 1 there rather than left to produce a falloff.
+                 */
+                float lx, ly, lz, ll;
+                if (L->type == VR_LIGHT_DIR) {
+                    lx = -L->dx; ly = -L->dy; lz = -L->dz;
+                    ll = sqrtf(lx * lx + ly * ly + lz * lz);
+                    if (ll < 1e-9f) {
+                        continue;
+                    }
+                    lx /= ll; ly /= ll; lz /= ll;
+                    ll = 1.0f;
+                } else {
+                    lx = L->x - Xv;
+                    ly = L->y - Yv;
+                    lz = L->z - Zv;
+                    ll = sqrtf(lx * lx + ly * ly + lz * lz);
+                    if (ll < 1e-9f) {
+                        continue;
+                    }
+                }
+
+                /*
+                 * The spot cone. The test is on the angle between the light's
+                 * aim and the direction to *this* surface point, smoothed
+                 * across the penumbra — a hard cone edge is the one thing that
+                 * makes a spotlight look like a stencil rather than a lamp.
+                 */
+                float cone = 1.0f;
+                if (L->type == VR_LIGHT_SPOT) {
+                    float sx = -lx / ll, sy = -ly / ll, sz = -lz / ll;
+                    float cd = sx * L->dx + sy * L->dy + sz * L->dz;
+                    if (cd <= L->cos_outer) {
+                        continue;                 /* outside the beam entirely */
+                    }
+                    if (cd < L->cos_inner) {
+                        float ct = (cd - L->cos_outer) / (L->cos_inner - L->cos_outer);
+                        cone = ct * ct * (3.0f - 2.0f * ct);
+                    }
                 }
 
                 float d = (nx * lx + ny * ly + nz * lz) / (ll * nl);
@@ -1742,8 +2040,10 @@ VR_PIX void vr_px_mesh(uchar4 *VR_RESTRICT fb, float *VR_RESTRICT depth,
                     continue;
                 }
 
-                float att = p->lights[li].intensity
-                          * vr_falloff(ll, p->lights[li].range);
+                float att = L->intensity * cone;
+                if (L->type != VR_LIGHT_DIR) {
+                    att *= vr_falloff(ll, L->range);
+                }
                 diff += d * att;
 
                 if (p->specular > 0.0f) {

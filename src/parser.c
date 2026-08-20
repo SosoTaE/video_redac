@@ -470,6 +470,7 @@ typedef struct {
 } EaseTable;
 
 static float vr_clampf01(float v) { return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v); }
+static float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
 /* y at x for a CSS-style cubic-bezier through (0,0), (x1,y1), (x2,y2), (1,1). */
 static float bezier_solve(float x1, float y1, float x2, float y2, float x)
@@ -789,6 +790,23 @@ static void effect_set_defaults(Effect *fx)
     track_set_constant(&fx->param[FXP_LEVEL],      0.5f);
     track_set_constant(&fx->param[FXP_LEVELS],     6.0f);
 
+    /* Lift is an offset (neutral 0); gamma and gain are multipliers (neutral
+     * 1). Getting these wrong makes an unmentioned channel crush to black. */
+    for (int k = 0; k < 3; k++) {
+        track_set_constant(&fx->param[FXP_GAMMA_R + k], 1.0f);
+        track_set_constant(&fx->param[FXP_GAIN_R  + k], 1.0f);
+    }
+
+    /* A qualifier that selects everything, so the slots are safe to read even
+     * when the JSON never mentioned one. */
+    track_set_constant(&fx->param[FXP_Q_HUE0],  0.0f);
+    track_set_constant(&fx->param[FXP_Q_HUE1],  360.0f);
+    track_set_constant(&fx->param[FXP_Q_SAT0],  0.0f);
+    track_set_constant(&fx->param[FXP_Q_SAT1],  1.0f);
+    track_set_constant(&fx->param[FXP_Q_LUMA0], 0.0f);
+    track_set_constant(&fx->param[FXP_Q_LUMA1], 1.0f);
+    track_set_constant(&fx->param[FXP_Q_SOFT],  0.06f);
+
     switch (fx->type) {
         case FX_VIGNETTE:
             track_set_constant(&fx->param[FXP_AMOUNT],   0.35f);
@@ -801,6 +819,17 @@ static void effect_set_defaults(Effect *fx)
             break;
         case FX_PIXELATE:
             track_set_constant(&fx->param[FXP_SIZE], 8.0f);
+            break;
+        case FX_BLOOM:
+            /* A threshold near the top of the range: bloom is the light that
+             * spills off things that are *bright*, and a low threshold blooms
+             * the whole picture into haze. */
+            track_set_constant(&fx->param[FXP_LEVEL],  0.75f);
+            track_set_constant(&fx->param[FXP_RADIUS], 18.0f);
+            track_set_constant(&fx->param[FXP_AMOUNT], 0.7f);
+            break;
+        case FX_LGG:
+            track_set_constant(&fx->param[FXP_AMOUNT], 1.0f);
             break;
         case FX_SCANLINES:
             track_set_constant(&fx->param[FXP_AMOUNT], 0.35f);
@@ -881,6 +910,111 @@ static bool parse_effects_into(struct Effect **list, size_t *count, size_t *cap,
          * font or audio file does — a film delivered without its grade is worse
          * than one that refused to render.
          */
+        /* --- lift / gamma / gain ---------------------------------------- */
+        {
+            static const struct { const char *key; int base; } kTriples[] = {
+                { "lift", FXP_LIFT_R }, { "gamma", FXP_GAMMA_R }, { "gain", FXP_GAIN_R },
+            };
+            static const char *const kCh[3] = { "r", "g", "b" };
+
+            for (size_t q = 0; q < sizeof kTriples / sizeof *kTriples; q++) {
+                const cJSON *o = cJSON_GetObjectItemCaseSensitive(item, kTriples[q].key);
+                if (o == NULL) {
+                    continue;
+                }
+                /*
+                 * A bare number is the master: it moves all three channels
+                 * together, which is how a colourist reaches for the wheel
+                 * before deciding the shot has a cast at all.
+                 *
+                 * `gamma` is deliberately shared with color_grade's own scalar
+                 * gamma — same key, same meaning — so the triple form only
+                 * applies to the three-way corrector.
+                 */
+                if (!cJSON_IsObject(o)) {
+                    for (int c = 0; c < 3; c++) {
+                        parse_track(o, &fx->param[kTriples[q].base + c],
+                                    fx->param[kTriples[q].base + c].constant);
+                    }
+                    continue;
+                }
+                for (int c = 0; c < 3; c++) {
+                    const cJSON *v = cJSON_GetObjectItemCaseSensitive(o, kCh[c]);
+                    if (v != NULL) {
+                        parse_track(v, &fx->param[kTriples[q].base + c],
+                                    fx->param[kTriples[q].base + c].constant);
+                    }
+                }
+            }
+        }
+
+        /* --- HSL qualifier ---------------------------------------------- */
+        const cJSON *ql = cJSON_GetObjectItemCaseSensitive(item, "qualifier");
+        if (ql == NULL) {
+            ql = cJSON_GetObjectItemCaseSensitive(item, "key");
+        }
+        if (cJSON_IsObject(ql)) {
+            fx->qual_on = true;
+            /*
+             * Each band is [lo, hi] as a two-element array, which is how the
+             * range reads in one glance — "hue 80 to 160" rather than two keys
+             * that have to be matched up by eye.
+             */
+            static const struct { const char *key; int lo, hi; } kBands[] = {
+                { "hue",  FXP_Q_HUE0,  FXP_Q_HUE1  },
+                { "sat",  FXP_Q_SAT0,  FXP_Q_SAT1  },
+                { "luma", FXP_Q_LUMA0, FXP_Q_LUMA1 },
+            };
+            for (size_t q = 0; q < sizeof kBands / sizeof *kBands; q++) {
+                const cJSON *b = cJSON_GetObjectItemCaseSensitive(ql, kBands[q].key);
+                if (cJSON_IsArray(b) && cJSON_GetArraySize(b) >= 2) {
+                    parse_track(cJSON_GetArrayItem(b, 0), &fx->param[kBands[q].lo],
+                                fx->param[kBands[q].lo].constant);
+                    parse_track(cJSON_GetArrayItem(b, 1), &fx->param[kBands[q].hi],
+                                fx->param[kBands[q].hi].constant);
+                }
+            }
+            const cJSON *sf = cJSON_GetObjectItemCaseSensitive(ql, "softness");
+            if (sf != NULL) {
+                parse_track(sf, &fx->param[FXP_Q_SOFT], fx->param[FXP_Q_SOFT].constant);
+            }
+            fx->qual_invert = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(ql, "invert"));
+        }
+
+        /* --- power window --------------------------------------------- */
+        const cJSON *wn = cJSON_GetObjectItemCaseSensitive(item, "window");
+        if (wn == NULL) {
+            wn = cJSON_GetObjectItemCaseSensitive(item, "mask");
+        }
+        track_set_constant(&fx->win_cx, 0.5f);
+        track_set_constant(&fx->win_cy, 0.5f);
+        track_set_constant(&fx->win_rx, 0.35f);
+        track_set_constant(&fx->win_ry, 0.35f);
+        track_set_constant(&fx->win_feather, 0.08f);
+        if (cJSON_IsObject(wn)) {
+            const char *shape = json_str(wn, "shape", "ellipse");
+            fx->win_shape = (strcmp(shape, "rect") == 0 ||
+                             strcmp(shape, "rectangle") == 0) ? 2 : 1;
+
+            static const char *const kWin[] = { "cx", "cy", "rx", "ry", "feather" };
+            Track *ws[] = { &fx->win_cx, &fx->win_cy, &fx->win_rx,
+                            &fx->win_ry, &fx->win_feather };
+            for (size_t q = 0; q < sizeof ws / sizeof *ws; q++) {
+                const cJSON *v = cJSON_GetObjectItemCaseSensitive(wn, kWin[q]);
+                if (v != NULL) {
+                    parse_track(v, ws[q], ws[q]->constant);
+                }
+            }
+            /* "r" sets both radii — a circular window is the common case and
+             * writing the same number twice invites them drifting apart. */
+            const cJSON *r = cJSON_GetObjectItemCaseSensitive(wn, "r");
+            if (r != NULL) {
+                parse_track(r, &fx->win_rx, fx->win_rx.constant);
+                parse_track(r, &fx->win_ry, fx->win_ry.constant);
+            }
+            fx->win_invert = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(wn, "invert"));
+        }
+
         if (type == FX_LUT) {
             const char *lp = json_str(item, "path", json_str(item, "file", NULL));
             if (lp == NULL) {
@@ -1928,6 +2062,55 @@ static bool parse_audio(EditorContext *ctx, const cJSON *arr, const char *base_f
 
         const cJSON *lp = cJSON_GetObjectItemCaseSensitive(item, "loop");
         a->loop = cJSON_IsBool(lp) ? cJSON_IsTrue(lp) : false;
+
+        const char *aid = json_str(item, "id", NULL);
+        a->id = (aid != NULL) ? dup_string(aid) : NULL;
+
+        a->pan = clampf(json_float(item, "pan", 0.0f), -1.0f, 1.0f);
+
+        const cJSON *eq = cJSON_GetObjectItemCaseSensitive(item, "eq");
+        if (cJSON_IsObject(eq)) {
+            a->eq_low  = json_float(eq, "low",  0.0f);
+            a->eq_mid  = json_float(eq, "mid",  0.0f);
+            a->eq_high = json_float(eq, "high", 0.0f);
+            /* All-zero is a bypass, so an "eq": {} does not add three filters
+             * that each do nothing. */
+            a->has_eq = (a->eq_low != 0.0f || a->eq_mid != 0.0f || a->eq_high != 0.0f);
+        }
+
+        const cJSON *cp = cJSON_GetObjectItemCaseSensitive(item, "compress");
+        if (cp == NULL) {
+            cp = cJSON_GetObjectItemCaseSensitive(item, "compressor");
+        }
+        if (cJSON_IsObject(cp) || cJSON_IsTrue(cp)) {
+            a->has_comp          = true;
+            a->comp_threshold_db = json_float(cp, "threshold", -18.0f);
+            a->comp_ratio        = json_float(cp, "ratio", 4.0f);
+            a->comp_attack_ms    = json_float(cp, "attack", 20.0f);
+            a->comp_release_ms   = json_float(cp, "release", 250.0f);
+            a->comp_makeup       = json_float(cp, "makeup", 1.0f);
+
+            /* ffmpeg's acompressor refuses values outside these, and a refusal
+             * arrives as an opaque ffmpeg error long after the render. */
+            a->comp_ratio      = clampf(a->comp_ratio, 1.0f, 20.0f);
+            a->comp_attack_ms  = clampf(a->comp_attack_ms, 0.01f, 2000.0f);
+            a->comp_release_ms = clampf(a->comp_release_ms, 0.01f, 9000.0f);
+            a->comp_makeup     = clampf(a->comp_makeup, 1.0f, 64.0f);
+            a->comp_threshold_db = clampf(a->comp_threshold_db, -60.0f, 0.0f);
+        }
+
+        const cJSON *dk = cJSON_GetObjectItemCaseSensitive(item, "duck");
+        if (cJSON_IsObject(dk)) {
+            const char *by = json_str(dk, "by", NULL);
+            a->duck_by         = (by != NULL) ? dup_string(by) : NULL;
+            a->duck_amount     = clampf(json_float(dk, "amount", 0.7f), 0.0f, 1.0f);
+            a->duck_release_ms = clampf(json_float(dk, "release", 300.0f),
+                                           0.01f, 9000.0f);
+            if (a->duck_by == NULL) {
+                fprintf(stderr, "warning: audio 'duck' needs \"by\": the id of the "
+                                "track to duck under — ignoring it.\n");
+            }
+        }
 
         if (a->start    < 0.0f) a->start    = 0.0f;
         if (a->in       < 0.0f) a->in       = 0.0f;
@@ -3605,34 +3788,84 @@ static bool parse_scene(EditorContext *ctx, const cJSON *node, const cJSON *styl
             if (!cJSON_IsObject(l)) {
                 continue;
             }
-            Light *dst = &sc->lights[sc->light_count++];
-            dst->x = json_float(l, "x", 0.0f);
-            dst->y = json_float(l, "y", 0.0f);
-            dst->z = json_float(l, "z", 0.0f);
-            dst->intensity = json_float(l, "intensity", 1.0f);
-            dst->range     = json_float(l, "range", 0.0f);
+            int         idx = sc->light_count++;
+            LightTrack *anim = &sc->light_anim[idx];
 
             /*
-             * A light is fixed for the whole scene, and a keyframe array in one
-             * of its fields reads as zero rather than as motion.
-             *
-             * Worth saying out loud, because every other numeric field in this
-             * format takes a track and the shape of the value gives no hint
-             * that this one does not. Silently placing the light at the origin
-             * produces a scene that renders, looks merely wrong, and sends the
-             * author looking at their geometry.
+             * Every channel is a track. A plain number parses into a constant
+             * one, so a scene whose lights never move costs five constants and
+             * behaves exactly as it did when these were bare floats.
              */
-            const struct { const char *key; float value; } lf[] = {
-                { "x", dst->x }, { "y", dst->y }, { "z", dst->z },
-                { "intensity", dst->intensity }, { "range", dst->range },
+            static const char *const kLightKeys[] = {
+                "x", "y", "z", "intensity", "range", "dx", "dy", "dz"
             };
-            for (size_t q = 0; q < sizeof lf / sizeof *lf; q++) {
-                if (cJSON_IsArray(cJSON_GetObjectItemCaseSensitive(l, lf[q].key))) {
-                    fprintf(stderr, "warning: scene '%s' — light '%s' is a keyframe "
-                                    "track, but lights do not animate; using %g.\n",
-                            sc->id ? sc->id : "(unnamed)", lf[q].key, (double)lf[q].value);
-                }
+            static const float kLightDefs[] = {
+                0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 1.0f, 0.0f
+            };
+            Track *slots[] = { &anim->x, &anim->y, &anim->z,
+                               &anim->intensity, &anim->range,
+                               &anim->dx, &anim->dy, &anim->dz };
+
+            for (size_t q = 0; q < sizeof slots / sizeof *slots; q++) {
+                parse_track_ex(cJSON_GetObjectItemCaseSensitive(l, kLightKeys[q]),
+                               slots[q], kLightDefs[q], eases);
             }
+
+            /* The value at t=0, so anything reading the scene before a frame is
+             * rendered — --check, --dump — sees a sensible light rather than
+             * zeros. The renderer overwrites this every frame. */
+            sc->lights[idx].x         = track_sample(&anim->x, 0.0f);
+            sc->lights[idx].y         = track_sample(&anim->y, 0.0f);
+            sc->lights[idx].z         = track_sample(&anim->z, 0.0f);
+            sc->lights[idx].intensity = track_sample(&anim->intensity, 0.0f);
+            sc->lights[idx].range     = track_sample(&anim->range, 0.0f);
+
+            /*
+             * The kind of source. "point" is the default and what every scene
+             * written before this got, so leaving `type` out changes nothing.
+             */
+            const char *lt = json_str(l, "type", "point");
+            if (strcmp(lt, "sun") == 0 || strcmp(lt, "directional") == 0) {
+                sc->lights[idx].type = VR_LIGHT_DIR;
+            } else if (strcmp(lt, "spot") == 0) {
+                sc->lights[idx].type = VR_LIGHT_SPOT;
+            } else {
+                sc->lights[idx].type = VR_LIGHT_POINT;
+            }
+
+            /*
+             * A cone given in degrees from the axis, which is how a lamp is
+             * described; the renderer wants cosines and converts once here
+             * rather than per pixel. `penumbra` is the soft margin *outside*
+             * the stated angle, so "angle" stays the edge of full brightness.
+             */
+            float ang = json_float(l, "angle", 35.0f);
+            float pen = json_float(l, "penumbra", 8.0f);
+            ang = clampf(ang, 0.5f, 89.0f);
+            pen = clampf(pen, 0.0f, 89.0f);
+            sc->lights[idx].cos_inner = cosf(ang * (float)(M_PI / 180.0));
+            sc->lights[idx].cos_outer = cosf(clampf(ang + pen, 0.5f, 89.9f)
+                                             * (float)(M_PI / 180.0));
+
+            /*
+             * A spot may be aimed at a point instead of given a direction,
+             * which is nearly always the more natural way to say it: you point
+             * a lamp *at* something.
+             */
+            const cJSON *tgt = cJSON_GetObjectItemCaseSensitive(l, "target");
+            if (cJSON_IsArray(tgt) && cJSON_GetArraySize(tgt) >= 3) {
+                float t3[3] = { 0.0f, 0.0f, 0.0f };
+                for (int c = 0; c < 3; c++) {
+                    const cJSON *v = cJSON_GetArrayItem(tgt, c);
+                    if (cJSON_IsNumber(v)) t3[c] = (float)v->valuedouble;
+                }
+                track_set_constant(&anim->dx, t3[0] - sc->lights[idx].x);
+                track_set_constant(&anim->dy, t3[1] - sc->lights[idx].y);
+                track_set_constant(&anim->dz, t3[2] - sc->lights[idx].z);
+            }
+            sc->lights[idx].dx = track_sample(&anim->dx, 0.0f);
+            sc->lights[idx].dy = track_sample(&anim->dy, 0.0f);
+            sc->lights[idx].dz = track_sample(&anim->dz, 0.0f);
         }
         if (cJSON_IsArray(lit) && cJSON_GetArraySize(lit) > VR_MAX_LIGHTS) {
             fprintf(stderr, "warning: scene '%s' — %d lights given, only %d are used.\n",
@@ -3849,6 +4082,41 @@ EditorContext *parse_video_project_ex(const char *filepath, char **defines, int 
     ctx->config.bg_color    = json_color(project, "bg_color", (Color){ 0, 0, 0, 255 });
     ctx->config.duration_ms = json_int(project, "duration_ms", 0);
 
+    /* --- motion blur ------------------------------------------------------ */
+    {
+        const cJSON *mb = cJSON_GetObjectItemCaseSensitive(project, "motion_blur");
+        if (mb == NULL) {
+            mb = cJSON_GetObjectItemCaseSensitive(root, "motion_blur");
+        }
+        ctx->config.mb_samples = 0;
+        ctx->config.mb_shutter = 0.5f;
+
+        if (cJSON_IsNumber(mb)) {
+            /* "motion_blur": 8 — the sample count alone, at a 180° shutter. */
+            ctx->config.mb_samples = (int)mb->valuedouble;
+        } else if (cJSON_IsTrue(mb)) {
+            ctx->config.mb_samples = 8;
+        } else if (cJSON_IsObject(mb)) {
+            ctx->config.mb_samples = json_int(mb, "samples", 8);
+            ctx->config.mb_shutter = json_float(mb, "shutter", 0.5f);
+        }
+
+        /*
+         * Capped at 32. Cost is linear in the sample count — 32 samples is 32
+         * full renders of every frame — and the returns stop well before that:
+         * a sample count high enough to smear a fast object smoothly is set by
+         * how far it travels in pixels, and past about 16 the difference is
+         * below a code value on anything moving slowly enough to look at.
+         */
+        if (ctx->config.mb_samples < 0)  ctx->config.mb_samples = 0;
+        if (ctx->config.mb_samples > 32) {
+            fprintf(stderr, "warning: motion_blur samples capped at 32 (asked %d).\n",
+                    ctx->config.mb_samples);
+            ctx->config.mb_samples = 32;
+        }
+        ctx->config.mb_shutter = vr_clampf01(ctx->config.mb_shutter);
+    }
+
     /* --- 1b. output { } — encoding parameters ----------------------------- */
     {
         const cJSON *out_cfg = cJSON_GetObjectItemCaseSensitive(root, "output");
@@ -3858,6 +4126,9 @@ EditorContext *parse_video_project_ex(const char *filepath, char **defines, int 
 
         const char *br = json_str(out_cfg, "bitrate", NULL);
         ctx->output.bitrate = (br != NULL) ? dup_string(br) : NULL;
+
+        ctx->output.alpha = cJSON_IsTrue(
+            cJSON_GetObjectItemCaseSensitive(out_cfg, "alpha"));
 
         if (ctx->output.cq < 0)  ctx->output.cq = 0;
         if (ctx->output.cq > 51) ctx->output.cq = 51;
@@ -4086,6 +4357,8 @@ void editor_context_free(EditorContext *ctx)
 
     for (size_t i = 0; i < ctx->audio_count; i++) {
         free(ctx->audio[i].path);
+        free(ctx->audio[i].id);
+        free(ctx->audio[i].duck_by);
     }
     free(ctx->audio);
 
@@ -4120,6 +4393,12 @@ void editor_context_free(EditorContext *ctx)
         track_free(&sc->camera.eye.pz); track_free(&sc->camera.eye.tx);
         track_free(&sc->camera.eye.ty); track_free(&sc->camera.eye.tz);
         track_free(&sc->camera.eye.roll);
+        for (int li = 0; li < VR_MAX_LIGHTS; li++) {
+            LightTrack *lt = &sc->light_anim[li];
+            track_free(&lt->x); track_free(&lt->y); track_free(&lt->z);
+            track_free(&lt->intensity); track_free(&lt->range);
+            track_free(&lt->dx); track_free(&lt->dy); track_free(&lt->dz);
+        }
         track_free(&sc->camera.zoom);     track_free(&sc->camera.x);
         track_free(&sc->camera.y);        track_free(&sc->camera.rotation);
         track_free(&sc->camera.shake);
@@ -4359,6 +4638,22 @@ bool vr_list_table(const char *what)
             }
             printf("%s\"%s\"", first ? "" : ", ", n);
             first = 0;
+        }
+        printf("]\n");
+        return true;
+    }
+
+    if (strcmp(what, "lights") == 0) {
+        /*
+         * Spelled out rather than derived, because unlike the effects there is
+         * no name table in the code to read: the parser matches these strings
+         * directly. Keep the two in step — a name here that the parser does not
+         * accept is worse than no list at all, because it is discoverable.
+         */
+        static const char *kL[] = { "point", "sun", "directional", "spot" };
+        printf("[");
+        for (size_t i = 0; i < sizeof kL / sizeof kL[0]; i++) {
+            printf("%s\"%s\"", i ? ", " : "", kL[i]);
         }
         printf("]\n");
         return true;

@@ -62,10 +62,10 @@ static bool widget_has_action(const Scene *scene, int widget_index, ActionType a
  * fade/scale/rotate overwrite each other (the last event has the final say).
  */
 void vr_evaluate_scene(const EditorContext *ctx, const Scene *scene,
-                       WidgetRuntime *rt, int local_ms)
+                       WidgetRuntime *rt, float local_ms)
 {
     /* Time inside a scene is local — the tracks use the same origin. */
-    float t_sec = (float)local_ms * 0.001f;
+    float t_sec = local_ms * 0.001f;
 
     for (size_t i = 0; i < scene->widget_count; i++) {
         const WidgetBase *b = ctx->widgets[scene->first_widget + i];
@@ -193,7 +193,7 @@ void vr_evaluate_scene(const EditorContext *ctx, const Scene *scene,
             continue;
         }
 
-        int ev_ms = local_ms - ev->time_ms;
+        float ev_ms = local_ms - (float)ev->time_ms;
         if (ev_ms < 0) {
             continue;
         }
@@ -250,7 +250,7 @@ void vr_evaluate_scene(const EditorContext *ctx, const Scene *scene,
             continue; /* unresolved target, a group event, or an unknown action */
         }
 
-        int ev_ms = local_ms - ev->time_ms;
+        float ev_ms = local_ms - (float)ev->time_ms;
         if (ev_ms < 0) {
             continue; /* the event has not started yet */
         }
@@ -907,7 +907,7 @@ bool vr_highlight_setup(const CompositeParams *geom, const WidgetBase *b,
     return out->last_line >= out->first_line;
 }
 
-bool vr_video_slice(const WidgetBase *b, int local_ms, size_t *out_offset)
+bool vr_video_slice(const WidgetBase *b, float local_ms, size_t *out_offset)
 {
     if (b->kind != WIDGET_VIDEO) {
         return false;
@@ -924,7 +924,7 @@ bool vr_video_slice(const WidgetBase *b, int local_ms, size_t *out_offset)
      * depends only on `local_ms`, a clip stays a pure function of time like
      * everything else.
      */
-    long idx = (long)((float)local_ms * 0.001f * v->src_fps);
+    long idx = (long)(local_ms * 0.001f * v->src_fps);
 
     if (idx < 0) {
         idx = 0;
@@ -1070,11 +1070,25 @@ int vr_mesh_project(const MeshWidget *m, const WidgetRuntime *rt,
      * it was.
      */
     float Lv[VR_MAX_LIGHTS][3];
+    float Ld[VR_MAX_LIGHTS][3];
     for (int li = 0; li < light_count; li++) {
         const Light *L = &lights[li];
         Lv[li][0] = view[0]*L->x + view[1]*L->y + view[2]*L->z  + view[3];
         Lv[li][1] = view[4]*L->x + view[5]*L->y + view[6]*L->z  + view[7];
         Lv[li][2] = view[8]*L->x + view[9]*L->y + view[10]*L->z + view[11];
+
+        /*
+         * The aim is a direction, so it takes the rotation and not the
+         * translation — applying the translation column would move the aim by
+         * the camera's position and swing the beam whenever the camera did.
+         * Normalised here so the pixel loop's cone test is a plain dot product.
+         */
+        float dx = view[0]*L->dx + view[1]*L->dy + view[2]*L->dz;
+        float dy = view[4]*L->dx + view[5]*L->dy + view[6]*L->dz;
+        float dz = view[8]*L->dx + view[9]*L->dy + view[10]*L->dz;
+        float dl = sqrtf(dx*dx + dy*dy + dz*dz);
+        if (dl < 1e-9f) { dx = 0.0f; dy = 1.0f; dz = 0.0f; dl = 1.0f; }
+        Ld[li][0] = dx / dl; Ld[li][1] = dy / dl; Ld[li][2] = dz / dl;
     }
 
     float minx = 1e30f, miny = 1e30f, maxx = -1e30f, maxy = -1e30f;
@@ -1424,6 +1438,9 @@ int vr_mesh_project(const MeshWidget *m, const WidgetRuntime *rt,
         mp->lights[li].x = Lv[li][0];
         mp->lights[li].y = Lv[li][1];
         mp->lights[li].z = Lv[li][2];
+        mp->lights[li].dx = Ld[li][0];
+        mp->lights[li].dy = Ld[li][1];
+        mp->lights[li].dz = Ld[li][2];
     }
     mp->ambient   = amb;
     mp->specular  = (m->norms != NULL || !smooth) ? m->specular : 0.0f;
@@ -1432,6 +1449,66 @@ int vr_mesh_project(const MeshWidget *m, const WidgetRuntime *rt,
     mp->ccx = ccx;
     mp->ccy = ccy;
     mp->focal = f;
+    return n;
+}
+
+bool vr_any_effect(const EditorContext *ctx, int type)
+{
+    for (size_t i = 0; i < ctx->effect_count; i++) {
+        if ((int)ctx->effects[i].type == type) {
+            return true;
+        }
+    }
+    for (size_t s = 0; s < ctx->scene_count; s++) {
+        const Scene *sc = &ctx->scenes[s];
+        for (size_t i = 0; i < sc->effect_count; i++) {
+            if ((int)sc->effects[i].type == type) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool vr_any_windowed(const EditorContext *ctx)
+{
+    for (size_t i = 0; i < ctx->effect_count; i++) {
+        if (ctx->effects[i].win_shape != 0 || ctx->effects[i].qual_on) {
+            return true;
+        }
+    }
+    for (size_t s = 0; s < ctx->scene_count; s++) {
+        const Scene *sc = &ctx->scenes[s];
+        for (size_t i = 0; i < sc->effect_count; i++) {
+            if (sc->effects[i].win_shape != 0 || sc->effects[i].qual_on) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+int vr_scene_lights(const Scene *scene, float t_sec, Light *out)
+{
+    int n = scene->light_count;
+    if (n > VR_MAX_LIGHTS) {
+        n = VR_MAX_LIGHTS;
+    }
+    for (int i = 0; i < n; i++) {
+        const LightTrack *a = &scene->light_anim[i];
+        /* The non-animated fields — type and the cone cosines — are carried
+         * from the parsed light rather than resampled; they are shape, not
+         * motion. */
+        out[i] = scene->lights[i];
+        out[i].x         = track_sample(&a->x, t_sec);
+        out[i].y         = track_sample(&a->y, t_sec);
+        out[i].z         = track_sample(&a->z, t_sec);
+        out[i].intensity = track_sample(&a->intensity, t_sec);
+        out[i].range     = track_sample(&a->range, t_sec);
+        out[i].dx        = track_sample(&a->dx, t_sec);
+        out[i].dy        = track_sample(&a->dy, t_sec);
+        out[i].dz        = track_sample(&a->dz, t_sec);
+    }
     return n;
 }
 
@@ -1533,6 +1610,16 @@ EffectGPU vr_effect_sample(const Effect *fx, float t)
     g.cb[0] = fx->color_b.r * inv; g.cb[1] = fx->color_b.g * inv;
     g.cb[2] = fx->color_b.b * inv; g.cb[3] = fx->color_b.a * inv;
     g.lut_size = fx->lut_size;
+
+    g.win_shape   = fx->win_shape;
+    g.win_cx      = track_sample(&fx->win_cx, t);
+    g.win_cy      = track_sample(&fx->win_cy, t);
+    g.win_rx      = track_sample(&fx->win_rx, t);
+    g.win_ry      = track_sample(&fx->win_ry, t);
+    g.win_feather = track_sample(&fx->win_feather, t);
+    g.win_invert  = fx->win_invert ? 1 : 0;
+    g.qual_on     = fx->qual_on ? 1 : 0;
+    g.qual_invert = fx->qual_invert ? 1 : 0;
     return g;
 }
 
@@ -1800,16 +1887,61 @@ FILE *vr_open_ffmpeg_pipe(const EditorContext *ctx, const char *output_file,
     size_t olen = strlen(output_file);
     bool   is_png = (olen > 4 && strcmp(output_file + olen - 4, ".png") == 0);
 
+    /*
+     * An image sequence: a `%` followed by digits and a `d` anywhere in the
+     * name, which is ffmpeg's own image2 pattern. Detected rather than
+     * requested by a flag, because the name already says it — `frame_%04d.png`
+     * means one file per frame in every tool that reads such a name.
+     */
+    bool is_seq = false;
+    for (const char *q = strchr(output_file, '%'); q != NULL; q = strchr(q + 1, '%')) {
+        const char *r = q + 1;
+        while (*r == '0') r++;
+        while (*r >= '1' && *r <= '9') r++;
+        if (*r == 'd') { is_seq = true; break; }
+    }
+
+    /*
+     * Alpha changes the format on the wire, not just the codec: NV12 has no
+     * alpha channel to carry one in, so the frame crosses as RGBA and the
+     * colour conversion is skipped. The input tagging goes with it — RGBA is
+     * not a YUV format and the matrix flags would be meaningless.
+     */
+    const char *in_fmt = ctx->output.alpha ? "rgba" : "nv12";
+    const char *in_tag = ctx->output.alpha
+        ? ""
+        : "-colorspace bt709 -color_primaries bt709 -color_trc bt709 -color_range tv ";
+
+    if (is_seq) {
+        char cmd_seq[4096];
+        /* PNG for a sequence: it is lossless and the only common still format
+         * that carries alpha, which is most of why anyone wants a sequence. */
+        int  m = snprintf(cmd_seq, sizeof cmd_seq,
+                          "ffmpeg -hide_banner -loglevel error -y "
+                          "-f rawvideo -pixel_format %s -video_size %dx%d -framerate %d "
+                          "%s-i - -pix_fmt %s %s",
+                          in_fmt, ctx->config.width, ctx->config.height, ctx->config.fps,
+                          in_tag, ctx->output.alpha ? "rgba" : "rgb24", quoted_out);
+        if (m < 0 || (size_t)m >= sizeof cmd_seq) {
+            fprintf(stderr, "error: the ffmpeg command did not fit in the buffer.\n");
+            return NULL;
+        }
+        fprintf(stderr, "FFmpeg: %s\n", cmd_seq);
+        FILE *pipe_seq = popen(cmd_seq, "w");
+        if (pipe_seq == NULL) {
+            fprintf(stderr, "error: could not start ffmpeg (is it on PATH?).\n");
+        }
+        return pipe_seq;
+    }
+
     if (is_png) {
         char cmd_png[4096];
         int  m = snprintf(cmd_png, sizeof cmd_png,
                           "ffmpeg -hide_banner -loglevel error -y "
-                          "-f rawvideo -pixel_format nv12 -video_size %dx%d -framerate %d "
-                          "-colorspace bt709 -color_primaries bt709 -color_trc bt709 "
-                          "-color_range tv -i - "
-                          "-frames:v 1 -pix_fmt rgb24 %s",
-                          ctx->config.width, ctx->config.height, ctx->config.fps,
-                          quoted_out);
+                          "-f rawvideo -pixel_format %s -video_size %dx%d -framerate %d "
+                          "%s-i - -frames:v 1 -pix_fmt %s %s",
+                          in_fmt, ctx->config.width, ctx->config.height, ctx->config.fps,
+                          in_tag, ctx->output.alpha ? "rgba" : "rgb24", quoted_out);
         if (m < 0 || (size_t)m >= sizeof cmd_png) {
             fprintf(stderr, "error: the ffmpeg command did not fit in the buffer.\n");
             return NULL;
@@ -1825,7 +1957,7 @@ FILE *vr_open_ffmpeg_pipe(const EditorContext *ctx, const char *output_file,
     char cmd[4096];
     int  n = snprintf(cmd, sizeof cmd,
                       "ffmpeg -hide_banner -loglevel error -y "
-                      "-f rawvideo -pixel_format nv12 -video_size %dx%d -framerate %d "
+                      "-f rawvideo -pixel_format %s -video_size %dx%d -framerate %d "
                       /*
                        * Tagging the *input* stream's colour properties is
                        * mandatory. Without it ffmpeg cannot know the NV12 is
@@ -1835,14 +1967,18 @@ FILE *vr_open_ffmpeg_pipe(const EditorContext *ctx, const char *output_file,
                        * That both corrupted colours (up to 15/255 of error)
                        * and burned CPU on every frame.
                        */
-                      "-colorspace bt709 -color_primaries bt709 -color_trc bt709 "
-                      "-color_range tv -i - "
+                      "%s-i - "
                       /* nv12 is NVENC's native format → no conversion at all. */
-                      "-c:v %s -preset %s %s%s -pix_fmt nv12 "
-                      "-colorspace bt709 -color_primaries bt709 -color_trc bt709 "
-                      "-color_range tv -movflags +faststart %s",
-                      ctx->config.width, ctx->config.height, ctx->config.fps,
-                      quoted_enc, quoted_preset, tune, rate, quoted_out);
+                      "-c:v %s -preset %s %s%s -pix_fmt %s "
+                      "%s-movflags +faststart %s",
+                      in_fmt, ctx->config.width, ctx->config.height, ctx->config.fps,
+                      in_tag, quoted_enc, quoted_preset, tune, rate,
+                      ctx->output.alpha ? "yuva420p" : "nv12",
+                      ctx->output.alpha
+                          ? ""
+                          : "-colorspace bt709 -color_primaries bt709 -color_trc bt709 "
+                            "-color_range tv ",
+                      quoted_out);
 
     if (n < 0 || (size_t)n >= sizeof cmd) {
         fprintf(stderr, "error: the ffmpeg command did not fit in the buffer.\n");

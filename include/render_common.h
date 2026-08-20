@@ -54,7 +54,7 @@ double vr_seconds_since(const struct timespec *start);
  * `rt` must have room for scene->widget_count entries.
  */
 void vr_evaluate_scene(const EditorContext *ctx, const Scene *scene,
-                       WidgetRuntime *rt, int local_ms);
+                       WidgetRuntime *rt, float local_ms);
 
 /*
  * Typewriter cutoffs: `reveal` (0..1) → one x threshold per line.
@@ -109,7 +109,7 @@ bool vr_highlight_setup(const CompositeParams *geom, const WidgetBase *b,
  * Returns false for anything that is not a video, so a caller can use it as
  * "does this widget need a per-frame slice?".
  */
-bool vr_video_slice(const WidgetBase *b, int local_ms, size_t *out_offset);
+bool vr_video_slice(const WidgetBase *b, float local_ms, size_t *out_offset);
 
 /*
  * Fills `order` with the scene's widget indices, farthest first.
@@ -136,6 +136,28 @@ bool vr_depth_order(const Scene *scene, const WidgetRuntime *rt, int *order);
  * `lights` are world-space point lights; a count of 0 gives the camera-mounted
  * default, where whatever faces the viewer is lit.
  */
+/*
+ * True if any effect anywhere in the project has a power window.
+ *
+ * Asked once at init, so the extra full-frame buffer a window needs is only
+ * allocated by projects that use one.
+ */
+bool vr_any_windowed(const EditorContext *ctx);
+
+/* True if any effect anywhere in the project is of this type — asked at init so
+ * an effect needing its own scratch buffer only costs projects that use it. */
+bool vr_any_effect(const EditorContext *ctx, int type);
+
+/*
+ * Resolves a scene's lights for one instant into `out` (at least VR_MAX_LIGHTS
+ * entries) and returns how many there are.
+ *
+ * Called once per frame rather than once per mesh: every mesh in a scene sees
+ * the same lights, and sampling five tracks per light per mesh would repeat the
+ * same arithmetic for nothing.
+ */
+int vr_scene_lights(const Scene *scene, float t_sec, Light *out);
+
 int vr_mesh_project(const MeshWidget *m, const WidgetRuntime *rt,
                     int fb_w, int fb_h, const float view[12],
                     const Light *lights, int light_count,

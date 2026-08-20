@@ -39,7 +39,8 @@ static void print_usage(const char *prog)
             "  -f, --frame T        render one frame at T seconds (use a .png output)\n"
             "  -j, --json           machine-readable --check / --dump output\n"
             "      --list WHAT      effects | transitions | easings | actions |\n"
-            "                       properties | widgets | fonts, as JSON\n"
+            "                       properties | widgets | shapes | lights |\n"
+            "                       fonts, as JSON\n"
             "  -h, --help           this help\n"
             "\n"
             "Audio: a top-level 'audio' array of files (no speech synthesis).\n"
@@ -100,7 +101,7 @@ int main(int argc, char **argv)
             if (i + 1 >= argc || !vr_list_table(argv[i + 1])) {
                 fprintf(stderr, "error: --list expects one of: effects, transitions, "
                                 "easings, actions, properties, widgets, shapes, "
-                                "fonts.\n");
+                                "lights, fonts.\n");
                 free(defines);
                 return EXIT_FAILURE;
             }

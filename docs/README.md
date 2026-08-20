@@ -12,7 +12,7 @@ the CPU, if there is no GPU to be had (see [09-backends.md](09-backends.md)).
 | [02-data-model.md](02-data-model.md) | Every struct and field |
 | [03-json-reference.md](03-json-reference.md) | Complete JSON schema: every key, type, default |
 | [04-modules.md](04-modules.md) | Every host-side module and function |
-| [05-cuda-kernels.md](05-cuda-kernels.md) | All nine kernels, device helpers, the maths |
+| [05-cuda-kernels.md](05-cuda-kernels.md) | Every kernel, the device helpers, the maths |
 | [06-algorithms.md](06-algorithms.md) | The algorithms in depth — and why they are what they are |
 | [07-cli-and-build.md](07-cli-and-build.md) | CLI, Makefile, sanitizers, troubleshooting |
 | [08-performance.md](08-performance.md) | Measurements and bottleneck analysis |
@@ -61,4 +61,7 @@ Three rules hold throughout the codebase. Breaking any of them is a bug source:
 2. **Textures are premultiplied alpha.** Cairo produces them that way, and both
    bilinear interpolation and fading are only correct in that space.
 3. **Frame evaluation is a pure function of time.** A frame depends only on its
-   own timestamp, never on the previous frame — which is why `--range` works.
+   own timestamp, never on the previous frame. That is why `--range` works, why
+   the two backends can be compared frame by frame, and why motion blur is a
+   loop around the existing renderer rather than a feature inside it. See
+   [01-architecture.md](01-architecture.md#why-a-frame-is-a-pure-function-of-time).

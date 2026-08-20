@@ -909,6 +909,7 @@ typedef struct {
  * Files only — speech synthesis (TTS) is deliberately not part of the project.
  */
 typedef struct {
+    char  *id;        /* optional name, so another track can duck under it  */
     char  *path;      /* audio (or video) file to take the sound from       */
     float  start;     /* when it starts on the video timeline               */
     float  in;        /* in-point *within the source* (skip the first N s)      */
@@ -917,6 +918,46 @@ typedef struct {
     float  fade_in;   /* fade-in length at the clip's start                 */
     float  fade_out;  /* fade-out length at the clip's end                  */
     bool   loop;      /* repeat the source until `duration` is filled       */
+
+    /*
+     * Stereo placement, −1 hard left to +1 hard right.
+     *
+     * Constant power rather than a linear crossfade: a source panned to the
+     * centre with linear gains is audibly quieter than the same source hard
+     * left, because two half-amplitude copies sum to less energy than one full
+     * one. The cosine law keeps the loudness constant across the sweep.
+     */
+    float  pan;
+
+    /*
+     * A three-band tone control, in decibels. All zero is a bypass and emits no
+     * filter at all, so a project that never mentions EQ has the same graph it
+     * always had.
+     */
+    float  eq_low, eq_mid, eq_high;
+    bool   has_eq;
+
+    /*
+     * Compression. `threshold` is in dB (negative), `ratio` is n:1.
+     *
+     * Worth having for the same reason a mixing desk has it: music under speech
+     * has a huge dynamic range, and riding the fader by hand is what `duck`
+     * below automates for the coarse case and compression handles for the rest.
+     */
+    bool   has_comp;
+    float  comp_threshold_db, comp_ratio, comp_attack_ms, comp_release_ms, comp_makeup;
+
+    /*
+     * Ducking: pull this track down whenever another one is loud.
+     *
+     * `duck_by` names another track's `id`. This is the one audio feature that
+     * cannot be a serial filter — it needs the *other* track's signal as a
+     * second input — so it restructures the graph rather than adding a link to
+     * the chain.
+     */
+    char  *duck_by;
+    float  duck_amount;      /* 0 = none, 1 = as hard as the ratio allows */
+    float  duck_release_ms;
 } AudioTrack;
 
 /* ------------------------------------------------------------------------- */
@@ -1007,8 +1048,52 @@ typedef struct {
  * interpolated scalar per vertex; giving lights colours would make that three,
  * for something no scene here has needed. A mesh's `color` tints the result.
  */
+/*
+ * A light's five channels as keyframe tracks — the animatable form of `Light`.
+ *
+ * Separate from `Light` rather than replacing its fields, because `Light` is
+ * copied by value into MeshParams and handed to the GPU, where a Track (which
+ * owns a heap allocation) cannot go.
+ */
 typedef struct {
+    Track x, y, z, intensity, range;
+    /* The aim, as tracks too — a spot that cannot be pointed somewhere over
+     * the course of a shot is barely a spot. */
+    Track dx, dy, dz;
+} LightTrack;
+
+/* What kind of source a Light is. */
+enum { VR_LIGHT_POINT = 0, VR_LIGHT_DIR = 1, VR_LIGHT_SPOT = 2 };
+
+typedef struct {
+    /*
+     * Which of the three the light is. A point light was the only kind for a
+     * long time and is still the default, so `type` 0 keeps every scene
+     * written before this rendering identically.
+     */
+    int   type;
+
     float x, y, z;
+
+    /*
+     * The direction the light points, for the two kinds that have one.
+     *
+     * A directional light has *only* this: it is a sun, infinitely far away, so
+     * every surface in the scene is lit from the same angle and there is no
+     * position and no falloff. That is the difference that matters — a point
+     * light placed very far away is not the same thing, because its falloff and
+     * its spread still vary across a large scene.
+     */
+    float dx, dy, dz;
+
+    /*
+     * Spot cone, stored as cosines because the pixel loop compares against a
+     * dot product and would otherwise need an acos per light per pixel.
+     * `cos_inner` is where the beam is still at full strength and `cos_outer`
+     * where it has fallen to nothing; between them is the penumbra.
+     */
+    float cos_inner, cos_outer;
+
     float intensity;
 
     /*
@@ -1091,6 +1176,23 @@ typedef struct {
     int            light_count;
 
     /*
+     * The same lights as tracks, so they can move.
+     *
+     * A light used to be five numbers read once, which made it the only thing
+     * in a scene that could not be animated — and it showed the moment anyone
+     * tried, because a keyframe array in `x` read as zero and put the lamp at
+     * the origin without a word. A travelling light is also the only way to
+     * demonstrate a normal map honestly: painted-in shading and a real one look
+     * identical until something moves relative to the surface.
+     *
+     * `lights[]` above is still what the renderer reads; it holds the value
+     * resolved for the current frame. These tracks are the source it is
+     * resolved from, and a scene whose lights never move samples five constant
+     * tracks, which is what the parser leaves behind when it sees plain numbers.
+     */
+    LightTrack     light_anim[VR_MAX_LIGHTS];
+
+    /*
      * The scene's own effects — applied *before* the transition, so a clip's
      * look carries into it. The global stack works on the finished frame.
      */
@@ -1146,6 +1248,23 @@ typedef struct {
     int   fps;
     Color bg_color;
     int   duration_ms;   /* 0 → derived from the timeline */
+
+    /*
+     * Motion blur, by sampling the frame several times across the shutter and
+     * averaging.
+     *
+     * This is the one thing the architecture makes cheap that would be
+     * expensive anywhere else. A frame here is a pure function of time — that
+     * property is what `--range` and the two-backend equivalence already rest
+     * on — so a sub-frame sample is not a special case at all: it is the same
+     * renderer, asked for a slightly different instant.
+     *
+     * `mb_samples` is how many, 0 or 1 meaning off. `mb_shutter` is the open
+     * fraction of the frame interval, so the film convention of a 180-degree
+     * shutter is 0.5.
+     */
+    int   mb_samples;
+    float mb_shutter;
 } ProjectConfig;
 
 /*
@@ -1157,6 +1276,20 @@ typedef struct {
     char *preset;     /* p1..p7 (nvenc) or ultrafast..veryslow (x264)    */
     int   cq;         /* quality: lower is better                        */
     char *bitrate;    /* e.g. "12M"; NULL → constant quality (cq)        */
+
+    /*
+     * Keep the alpha channel instead of flattening to NV12.
+     *
+     * NV12 has no alpha at all, so this is not a codec setting but a different
+     * path through the whole back end: the frame crosses the bus as RGBA and
+     * the colour conversion is skipped entirely. That costs two thirds more
+     * bandwidth per frame, which is exactly why it is not the default.
+     *
+     * The encoder has to be able to carry alpha — `png`, `qtrle`, `prores_ks`
+     * with `-profile:v 4444`. A file name with a `%d` in it becomes an image
+     * sequence, which is the usual way to hand a matte to another program.
+     */
+    bool  alpha;
 } OutputConfig;
 
 /* ------------------------------------------------------------------------- */

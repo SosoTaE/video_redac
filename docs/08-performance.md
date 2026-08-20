@@ -84,6 +84,12 @@ encode") was reasonable and simply wrong for this workload.
 it. This is where the architecture pays off relative to a CPU compositor, where
 the same stack would cost tens of milliseconds per frame.
 
+**What that figure does and does not say.** `showcase.json` is encoder-bound at
+1080×1920, so the measurement says the effect stack fits inside headroom that
+already existed — which is the useful claim — but it is not a measurement of the
+effects' own cost. On a render-bound project they will not be free in the same
+way; see the motion-blur numbers below for what that looks like.
+
 ## Memory
 
 At 1080×1920, per pipeline slot:
@@ -92,12 +98,46 @@ At 1080×1920, per pipeline slot:
 |---|---|---|
 | `d_frame` (RGBA) | 7.91 MB | always |
 | `d_nv12` | 2.97 MB | always |
-| `h_frame` (pinned) | 2.97 MB | always |
+| `h_frame` (pinned) | 2.97 MB | always — 7.91 MB when `output.alpha` is set |
+| `d_depth` | 7.91 MB | a scene contains meshes |
 | `d_fx` | 7.91 MB | any effect exists |
+| `d_keep` | 7.91 MB | an effect has a power window or a qualifier |
+| `d_bloom` | 7.91 MB | a `bloom` effect exists |
+| `d_accum` (float4) | 31.6 MB | `motion_blur` with more than one sample |
 | `d_scene[2]` | 15.82 MB | more than one scene |
 
 With two slots that is 21.8 MB of frame buffers for a simple project, up to
-~69 MB with effects and scenes.
+~69 MB with effects and scenes, and ~200 MB for a project using motion blur,
+bloom and windows at once.
+
+`d_accum` is four times a frame because it is `float4`. That is deliberate:
+rounding each sub-frame back to a byte before summing throws away exactly the
+fractional detail the averaging exists to recover, and a slow pan comes out
+stepped instead of smooth.
+
+## Motion blur
+
+Cost is linear in the sample count, because each sample is a full render of the
+scene stage. Measured on `anim/materials.json` (3D, 1600×900, seconds 7–10 —
+imported props with normal, occlusion and emissive maps):
+
+| Samples | Time | fps | vs off |
+|---|---|---|---|
+| off | 6.47 s | 27.8 | — |
+| 8 | 39.80 s | 4.5 | 6.2× |
+| 16 | 89.48 s | 2.0 | 13.9× |
+
+Slightly better than N× because the film-wide effects, the NV12 conversion and
+the encode still happen once per output frame.
+
+**On a 2D project it is free, and that is not a good thing.** `showcase.json`
+with 8 samples measures the same as without, because the pipeline there is
+encoder-bound rather than render-bound — and the frame is also nearly identical
+(0.06% of pixels differ, max delta 2), since almost nothing in it moves fast
+enough to smear. Motion blur is worth its cost only where something is actually
+travelling: the blur length follows the subject's speed, so if you cannot see
+it, you did not need it.
+
 
 Textures dominate for image-heavy projects — `listing_60.json` uses 164 MB
 because photos are stored at full resolution (2048×1365) even when displayed

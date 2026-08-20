@@ -302,8 +302,18 @@ typedef struct {
     bool           has_bg;
     struct Effect *effects;       /* applied BEFORE the transition */
     size_t         effect_count, effect_cap;
+
+    Camera         camera;        /* 2.5D projection + the 3D eye */
+    Light          lights[VR_MAX_LIGHTS];   /* resolved for the current frame */
+    LightTrack     light_anim[VR_MAX_LIGHTS];  /* what they are resolved from */
+    int            light_count;
 } Scene;
 ```
+
+`lights[]` holds the value for the frame being rendered and `light_anim[]` is
+the source it is sampled from, once per frame. They are separate because `Light`
+is copied by value into `MeshParams` and handed to the GPU, where a `Track` —
+which owns a heap allocation — cannot go.
 
 ```c
 typedef enum {
@@ -330,6 +340,82 @@ All mask parameters are canvas fractions.
 
 ---
 
+## 3D — lights, camera, meshes
+
+```c
+enum { VR_LIGHT_POINT = 0, VR_LIGHT_DIR = 1, VR_LIGHT_SPOT = 2 };
+
+typedef struct {
+    int   type;
+    float x, y, z;
+    float dx, dy, dz;         /* the aim: sun and spot only */
+    float cos_inner, cos_outer;   /* the spot cone, as cosines */
+    float intensity;
+    float range;              /* distance at which it is half strength; 0 = none */
+} Light;
+
+typedef struct { Track x, y, z, intensity, range, dx, dy, dz; } LightTrack;
+```
+
+The cone is stored as cosines rather than degrees because the pixel loop
+compares against a dot product and would otherwise need an `acos` per light per
+pixel. `type` 0 is a point light and the default, so every scene written before
+the other two existed renders identically.
+
+Lights are **deliberately colourless**: a mesh's own `color` tints the result,
+and giving each light a colour would triple what the shading term carries for
+something no scene here has needed.
+
+```c
+typedef struct {
+    int   v[3];               /* indices into the vertex array */
+} MeshTri;
+
+typedef struct {
+    WidgetBase base;
+
+    float   *verts;           /* 3 floats each, model space */
+    float   *norms;           /* 3 each; NULL when the mesh has none */
+    float   *uvs;             /* 2 each */
+    float   *tans;            /* 4 each: xyz + handedness */
+    size_t   vert_count;
+    MeshTri *tris;
+    size_t   tri_count;
+
+    bool     smooth;
+    Texture  tex,  ao,  nrm,  emis;        /* the four maps a surface wears */
+    char    *tex_path, *ao_path, *nrm_path, *emis_path;
+    float    ao_strength, normal_scale;
+    Color    emissive;
+    float    emissive_strength;
+
+    float    specular, shininess;
+    size_t   tri_base;        /* this mesh's slice of the staging buffer */
+
+    char    *path, *shape;
+    float    size[3];
+    Color    color;
+    float    ambient;
+    bool     cull, antialias, filter;
+    float    wire;
+} MeshWidget;
+```
+
+Vertices live in the mesh's own space, centred on the origin and scaled so the
+longest axis spans 1.0. That normalisation is what lets `size` mean the same
+thing whatever model is loaded.
+
+`tans` is only allocated for a mesh that actually has a normal map — it is
+another third of the position array again, and on a scanned prop that is real
+memory spent on nothing. The fourth float is handedness: a UV layout is free to
+mirror across a seam, and on the mirrored side the bitangent runs the other way.
+
+`tri_base` matters for correctness, not tidiness: the host writes the next
+mesh's triangles while the previous one's DMA may still be in flight, so each
+mesh owns a disjoint region of the shared staging buffer.
+
+---
+
 ## Effects
 
 `include/effects.h`
@@ -340,27 +426,59 @@ typedef enum {
     /* pointwise — no neighbour reads */
     FX_GRAYSCALE, FX_INVERT, FX_SEPIA, FX_POSTERIZE, FX_THRESHOLD,
     FX_VIGNETTE, FX_GRAIN, FX_SCANLINES, FX_COLOR_GRADE, FX_VIBRANCE,
-    FX_SPLIT_TONE, FX_GRADIENT_MAP,
+    FX_SPLIT_TONE, FX_GRADIENT_MAP, FX_LUT, FX_LGG,
     /* neighbourhood — needs a ping-pong buffer */
-    FX_BLUR, FX_PIXELATE, FX_RGB_SPLIT, FX_GLITCH
+    FX_BLOOM, FX_BLUR, FX_PIXELATE, FX_RGB_SPLIT, FX_GLITCH
 } EffectType;
 
 typedef enum {
     FXP_AMOUNT = 0, FXP_RADIUS, FXP_SOFTNESS, FXP_ANGLE, FXP_COUNT,
     FXP_SIZE, FXP_LEVEL, FXP_LEVELS, FXP_BALANCE, FXP_EXPOSURE,
     FXP_BRIGHTNESS, FXP_CONTRAST, FXP_GAMMA, FXP_SATURATION,
-    FXP_VIBRANCE, FXP_HUE, FXP_TEMPERATURE, FXP_TINT, FXP_MAX
+    FXP_VIBRANCE, FXP_HUE, FXP_TEMPERATURE, FXP_TINT,
+    /* three-way corrector, three channels each */
+    FXP_LIFT_R, FXP_LIFT_G, FXP_LIFT_B,
+    FXP_GAMMA_R, FXP_GAMMA_G, FXP_GAMMA_B,
+    FXP_GAIN_R, FXP_GAIN_G, FXP_GAIN_B,
+    /* HSL qualifier */
+    FXP_Q_HUE0, FXP_Q_HUE1, FXP_Q_SAT0, FXP_Q_SAT1,
+    FXP_Q_LUMA0, FXP_Q_LUMA1, FXP_Q_SOFT,
+    FXP_MAX
 } EffectParam;
 
 typedef struct Effect {
     EffectType type;
     Track      param[FXP_MAX];
     Color      color_a, color_b;
+
+    /* FX_LUT: the colour cube */
+    char      *lut_path;
+    float     *lut;          /* size³ RGB triples, red fastest */
+    int        lut_size;
+    void      *d_lut;        /* the renderer's device copy */
+
+    /* Power window — geometry in canvas fractions */
+    int        win_shape;    /* 0 none, 1 ellipse, 2 rect */
+    Track      win_cx, win_cy, win_rx, win_ry, win_feather;
+    bool       win_invert;
+
+    /* HSL qualifier — the bands live in param[] above */
+    bool       qual_on, qual_invert;
 } Effect;
 ```
 
 One shared parameter table for all effects; which slots are read depends on the
 type. Every parameter is a `Track`, so a blur radius can ramp from 18 to 0.
+
+**The LUT cannot ride in `param[]`.** Every other effect's parameters are a
+handful of scalars that fit in a struct passed by value to the kernel; a 33-cube
+is 108 KB. So the table is uploaded once at init and the kernel takes a pointer
+— `d_lut` on CUDA, `lut` itself on the CPU backend, where they are the same
+memory.
+
+**The window and the qualifier are the same thing** as far as the renderer is
+concerned: a per-pixel coverage mask. They multiply, and are applied by a
+separate pass after the effect rather than a test inside it.
 
 `struct Effect` carries an explicit tag because `types.h` forward-declares it —
 that is how `EditorContext` can hold a pointer without including `effects.h`.
@@ -396,6 +514,7 @@ as `TOK_TEXT`. That makes rendering a straight walk with no gaps to handle.
 
 ```c
 typedef struct {
+    char  *id;        /* optional — so another track can duck under it */
     char  *path;      /* file only — TTS is deliberately out of scope */
     float  start;     /* position on the video timeline, seconds */
     float  in;        /* in-point within the source */
@@ -403,8 +522,22 @@ typedef struct {
     float  volume;    /* linear gain */
     float  fade_in, fade_out;
     bool   loop;
+
+    float  pan;                   /* −1 hard left … +1 hard right */
+    float  eq_low, eq_mid, eq_high;   /* dB */
+    bool   has_eq;
+
+    bool   has_comp;
+    float  comp_threshold_db, comp_ratio,
+           comp_attack_ms, comp_release_ms, comp_makeup;
+
+    char  *duck_by;               /* the id of the key track */
+    float  duck_amount, duck_release_ms;
 } AudioTrack;
 ```
+
+`has_eq` and `has_comp` exist so an all-neutral block emits no filter at all —
+a project that never mentions either gets exactly the graph it always had.
 
 ---
 
@@ -415,6 +548,9 @@ typedef struct {
     int   width, height, fps;
     Color bg_color;
     int   duration_ms;   /* 0 → derived from the timeline */
+
+    int   mb_samples;    /* motion blur: sub-frames averaged; 0/1 = off */
+    float mb_shutter;    /* open fraction of the frame interval; 0.5 = 180° */
 } ProjectConfig;
 
 typedef struct {
@@ -422,8 +558,12 @@ typedef struct {
     char *preset;    /* p1..p7, or x264 presets */
     int   cq;        /* quality: lower is better */
     char *bitrate;   /* e.g. "12M"; NULL → constant quality */
+    bool  alpha;     /* keep the alpha channel — RGBA on the wire, no NV12 */
 } OutputConfig;
 ```
+
+`alpha` is not a codec setting: NV12 has no alpha channel, so it selects a
+different path through the whole back end.
 
 ---
 
@@ -468,9 +608,16 @@ Defined inside `renderer.cu`; not visible to the rest of the program.
 ```c
 struct FrameSlot {
     uchar4      *d_frame;     /* RGBA compositing target */
+    float       *d_depth;     /* the scene's shared z-buffer */
+    ScreenTri   *d_tris;      /* projected mesh triangles, re-uploaded per frame */
+    ScreenTri   *h_tris;      /* pinned staging for that upload */
+    size_t       tri_cap;
     uchar4      *d_fx;        /* effect ping-pong */
+    uchar4      *d_keep;      /* the pre-effect frame, for windowed effects */
+    float4      *d_accum;     /* motion-blur accumulator */
+    uchar4      *d_bloom;     /* the isolated highlights */
     uchar4      *d_scene[2];  /* two scenes during a transition */
-    uint8_t     *d_nv12;      /* only this is copied to the host */
+    uint8_t     *d_nv12;
     uint8_t     *h_frame;     /* pinned staging */
     cudaStream_t stream;
     cudaEvent_t  done;
@@ -479,12 +626,28 @@ struct FrameSlot {
 struct RenderResources {
     FrameSlot slot[VR_PIPELINE_DEPTH];
     size_t    frame_bytes;    /* RGBA size in VRAM */
-    size_t    nv12_bytes;     /* w*h*3/2 — what actually crosses PCIe */
+    size_t    nv12_bytes;     /* w*h*3/2 */
+    size_t    pipe_bytes;     /* what actually crosses PCIe: NV12, or RGBA
+                               * when output.alpha keeps the matte */
+    bool      alpha_out;
     int       width, height;
     size_t    texture_bytes;
     int       texture_count;
 };
 ```
 
-`d_fx` is allocated only if any effect exists; `d_scene[]` only if there is more
-than one scene.
+**Every optional buffer is allocated only when the project needs it**, which is
+the pattern to follow when adding another:
+
+| Buffer | Allocated when |
+|---|---|
+| `d_depth`, `d_tris`, `h_tris` | a scene contains meshes |
+| `d_fx` | any effect exists |
+| `d_keep` | an effect has a power window or a qualifier |
+| `d_bloom` | a `bloom` effect exists |
+| `d_accum` | `project.motion_blur` has more than one sample |
+| `d_scene[]` | there is more than one scene |
+
+`d_accum` is `float4` rather than `uchar4` deliberately — rounding each
+sub-frame back to a byte before summing throws away the fractional detail the
+averaging exists to recover.

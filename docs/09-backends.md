@@ -71,10 +71,22 @@ pixel on one backend and a black one on the other — a difference that only sho
 up on the rare frame that generates a NaN.
 
 The exported per-pixel entry points are `vr_px_composite`, `vr_px_highlight`,
-`vr_px_nv12`, `vr_px_transition`, `vr_px_fx_point`, `vr_px_fx_blur`,
+`vr_px_mesh`, `vr_px_nv12`, `vr_px_transition`, `vr_px_fx_point`,
+`vr_px_fx_window`, `vr_px_fx_bloom_cut`, `vr_px_fx_bloom_add`, `vr_px_fx_blur`,
 `vr_px_fx_pixelate`, `vr_px_fx_rgb_split` and `vr_px_fx_glitch`. Each CUDA
-kernel is now a five-line wrapper: map a thread to a pixel, bounds-check, call
-the shared function.
+kernel is a five-line wrapper: map a thread to a pixel, bounds-check, call the
+shared function.
+
+`vr_px_mesh` is the one whose loop is inverted — triangles inside a pixel rather
+than pixels inside a triangle — and that inversion exists precisely so this
+header can serve both backends. A conventional rasterizer would need a shared
+depth buffer and atomics, which have no host equivalent; here the depth test is
+a local variable.
+
+The material and lighting state travels as structs rather than widening argument
+lists: `MeshTextures` for the four maps a surface wears, `MeshParams` for the
+lighting environment. That is deliberate — the material is a set that grows, and
+without it every new map would change a signature in four places.
 
 ### `render_common.c` — the per-frame decisions
 
@@ -88,6 +100,10 @@ Everything a frame's appearance depends on, none of it aware of a device:
 | `vr_composite_setup` | inverse matrix, destination centre, clipped bounding box |
 | `vr_highlight_setup` | the highlight band's line range, colour and stencil |
 | `vr_effect_sample` | Tracks → the flat `EffectGPU` POD |
+| `vr_any_windowed` / `vr_any_effect` | which optional buffers to allocate at init |
+| `vr_scene_lights` | the scene's light tracks → `Light[]` for one instant |
+| `vr_mesh_project` | model → view → screen triangles, near-plane clipped |
+| `vr_camera_view` | the look-at matrix for a moving camera |
 | `vr_transition_preset` / `vr_transition_apply_inline` | the 17 presets, then the JSON's overrides |
 | `vr_open_ffmpeg_pipe` | starts the encoder, with the colour tagging both backends need |
 | `vr_frame_range` | `--range` → first/last frame |

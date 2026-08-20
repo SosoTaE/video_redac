@@ -14,7 +14,14 @@ video_redac [project.json] [options]
 | `-s`, `--set KEY=VALUE` | set a `${variable}`; repeatable |
 | `-d`, `--dump` | print the parsed project and continue |
 | `-n`, `--dry-run` | parse and rasterize, never touch the GPU |
+| `-f`, `--frame T` | render one frame at T **seconds** (write a `.png`) |
+| `-j`, `--json` | machine-readable `--check` / `--dump` output |
+| `--list WHAT` | print a vocabulary as JSON — see below |
 | `-h`, `--help` | usage |
+
+`--frame` takes **seconds, not a frame index**, and a value past the end is
+clamped to the last frame — so `--frame 60` on a 20-second film gives the final
+frame rather than the one at 1 s.
 
 Environment: `VIDEO_REDAC_ENCODER` overrides `output.encoder`.
 
@@ -35,6 +42,38 @@ Ranges past the end are clamped; `B <= A` or a malformed value is rejected.
 Two things it makes practical: iterating on one moment of a long video, and
 running `compute-sanitizer`, which is 10–100× slower than a normal run.
 
+### `--list`
+
+```bash
+./video_redac --list effects
+["grayscale", "invert", …, "lut", "lift_gamma_gain", "bloom", "blur", …]
+```
+
+| `WHAT` | Contents |
+|---|---|
+| `effects` | every effect name and its aliases |
+| `transitions` | the transition presets |
+| `easings` | the built-in easing curves |
+| `actions` | timeline action names |
+| `properties` | what an `animate` event can drive |
+| `widgets` | object types |
+| `shapes` | mesh primitives |
+| `lights` | `point`, `sun`, `directional`, `spot` |
+| `fonts` | families Cairo can actually find on this machine |
+
+**These come from the code that implements them**, not from a list maintained
+alongside it. `effects` walks the same name table `effect_from_name` uses and
+`shapes` the same table `mesh_load` dispatches on, so neither can drift out of
+date the way this page could.
+
+`lights` is the exception and is spelled out literally, because the parser
+matches those strings directly and there is no table to read. Keep the two in
+step — a name that is discoverable but rejected is worse than one that is
+neither.
+
+This is what the MCP server's `list_vocabulary` returns; it shells out to the
+binary rather than keeping its own copy, for the same reason.
+
 ### `--check`
 
 Reports, per scene where relevant:
@@ -51,6 +90,54 @@ Reports, per scene where relevant:
 ```bash
 ./video_redac listing/listing_60.json --check && echo OK
 ```
+
+---
+
+## The MCP server
+
+`mcp/server.py` exposes the engine to an agent over MCP. It is a thin wrapper —
+every tool shells out to the binary rather than reimplementing anything, which
+is why the vocabulary lists and the authoring guide cannot drift from the code.
+
+| Tool | Does |
+|---|---|
+| `get_authoring_guide` | serves `docs/03-json-reference.md`, whole or one section |
+| `list_vocabulary` | `--list WHAT`, verbatim |
+| `validate_scene` | `--check --json` |
+| `describe_scene` | `--dump --json` |
+| `preview_frames` | `--frame` at several times, returned as images |
+| `render_video` | a full render, returning the path |
+
+`get_authoring_guide` splits on `## ` headings first and then on `### `. The
+second pass matters more than it looks: the object types are documented one
+level down, so asking for "mesh" — the likeliest request there is — answered
+that no such section existed until it was added.
+
+### Relative asset paths and `base_dir`
+
+A scene can arrive two ways, and they resolve relative paths differently:
+
+* **`path`** — a real file. Relative paths resolve against its directory, the
+  same as running the binary by hand.
+* **`scene`** — inline JSON. It has no directory, so it is written into a fresh
+  temporary one. `"assets/x.png"` then resolves *inside that temporary
+  directory* and finds nothing.
+
+That default is deliberate: an inline scene should not silently reach a file
+from wherever the server happens to be running. But it is also a dead end for
+any inline scene that wants the project's own assets, and the engine's error
+("cannot load …") does not explain why.
+
+`base_dir` is the explicit way out — the scene is written there instead, so
+relative paths mean what they would mean in a real project file:
+
+```python
+preview_frames(scene=obj, times=[3.0], base_dir="anim")
+```
+
+The temp file is deleted afterwards, and when an inline scene fails on a missing
+asset the error now carries a hint naming `base_dir`, because the failure
+otherwise looks like a missing file rather than a resolution question.
 
 ---
 
@@ -170,7 +257,7 @@ of uninitialised device memory — worth running separately, because it is the
 tool that would catch a ping-pong or scene buffer being read before it is
 written.
 
-All nine kernels pass both with zero errors and zero leaked bytes.
+Every kernel passes both with zero errors and zero leaked bytes.
 
 ---
 

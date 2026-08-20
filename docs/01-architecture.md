@@ -20,15 +20,21 @@ VRAM ─── textures uploaded once; frame buffers, effect ping-pong,
     │
     ▼  render_video() — the frame loop
     │
-    ├─ [CPU] evaluate_scene()          → WidgetRuntime[] in the arena
-    ├─ [GPU] k_clear_background        → scene background
-    ├─ [GPU] k_composite_texture × N   → layers, via inverse matrix
-    ├─ [GPU] scene effects             → ping-pong
-    ├─ [GPU] k_transition              → two scenes into one frame (if needed)
-    ├─ [GPU] global effects
-    ├─ [GPU] k_rgba_to_nv12            → 8.29 MB → 3.11 MB
+    ├─ per motion-blur sub-frame (once when blur is off):
+    │   ├─ [CPU] evaluate_scene()      → WidgetRuntime[] in the arena
+    │   ├─ [CPU] vr_scene_lights()     → the lights, for this instant
+    │   ├─ [GPU] k_clear_background    → scene background
+    │   ├─ [GPU] k_depth_clear         → the scene's shared z-buffer
+    │   ├─ [CPU] vr_mesh_project × N   → triangles → pinned staging → VRAM
+    │   ├─ [GPU] k_mesh × N            → solids, depth-tested
+    │   ├─ [GPU] k_composite_texture × N → layers, via inverse matrix
+    │   ├─ [GPU] scene effects         → ping-pong
+    │   └─ [GPU] k_transition          → two scenes into one (if needed)
+    ├─ [GPU] k_mb_accum / k_mb_resolve → the sub-frames averaged
+    ├─ [GPU] global effects            → ping-pong (+ window / bloom passes)
+    ├─ [GPU] k_rgba_to_nv12            → 8.29 MB → 3.11 MB   (skipped for alpha)
     ├─ [D2H] cudaMemcpyAsync           → pinned host RAM
-    └─ [PIPE] fwrite → ffmpeg/NVENC    → .mp4
+    └─ [PIPE] fwrite → ffmpeg/NVENC    → .mp4 | .png sequence
                                             │
                                             ▼  audio_mux() [audio.c]
                                         second pass: audio + `-c:v copy`
@@ -53,6 +59,29 @@ and again writing into the ffmpeg pipe. On top of that, the RGB→YUV conversion
 used to be done *by ffmpeg on the CPU*, every frame.
 
 Measured: 306 → 361 fps (≈17%). See [08-performance.md](08-performance.md).
+
+**Unless the project keeps its alpha.** NV12 has no alpha channel, so
+`"output": { "alpha": true }` skips the conversion entirely and the frame
+crosses as RGBA — paying back that 2.67× in exchange for a matte. It is the one
+place the pipeline's shape changes rather than a parameter of it.
+
+## Why a frame is a pure function of time
+
+The rule that a frame depends only on its own timestamp, never on the previous
+one, started as what makes `--range` correct. It has since paid for itself three
+more times, and each was free:
+
+* **Two backends** can be compared frame by frame, because both are asked the
+  same question rather than being run in lockstep.
+* **Motion blur** is not a special case at all — a sub-frame sample is the same
+  renderer asked for a slightly different instant. That is why it is a loop
+  around the existing scene stage rather than a feature inside it.
+* **Pipelining** across CUDA streams is safe, because frames in flight cannot
+  observe one another.
+
+The corollary is a constraint worth stating: anything that would make a frame
+depend on its predecessor — a temporal denoiser, optical-flow retiming, a
+feedback effect — cannot be added without giving all four of those up.
 
 ## The scene model
 

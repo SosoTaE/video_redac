@@ -38,8 +38,10 @@ typedef enum {
     FX_SPLIT_TONE,    /* color_a=shadows, color_b=highlights, balance, amount */
     FX_GRADIENT_MAP,  /* color_a=shadow, color_b=highlight, amount */
     FX_LUT,           /* amount — a .cube table, see `lut` below   */
+    FX_LGG,           /* lift / gamma / gain, per channel           */
 
     /* --- neighbourhood reads (needs a ping-pong buffer) --- */
+    FX_BLOOM,         /* level=threshold, radius, amount=intensity */
     FX_BLUR,          /* radius — separable, two passes            */
     FX_PIXELATE,      /* size                                      */
     FX_RGB_SPLIT,     /* amount, angle                             */
@@ -69,6 +71,29 @@ typedef enum {
     FXP_HUE,
     FXP_TEMPERATURE,
     FXP_TINT,
+
+    /*
+     * Lift / gamma / gain, three channels each — the three-way corrector every
+     * grading tool puts front and centre, because "the shadows are too blue"
+     * and "the highlights are too warm" are different complaints and a single
+     * brightness control answers neither.
+     */
+    FXP_LIFT_R, FXP_LIFT_G, FXP_LIFT_B,
+    FXP_GAMMA_R, FXP_GAMMA_G, FXP_GAMMA_B,
+    FXP_GAIN_R, FXP_GAIN_G, FXP_GAIN_B,
+
+    /*
+     * HSL qualifier: which colours an effect is allowed to touch.
+     *
+     * Structurally the same thing as a power window — a per-pixel coverage
+     * mask — and multiplied with it, which is exactly how the two combine in a
+     * grading tool: "this hue, but only inside this shape".
+     */
+    FXP_Q_HUE0, FXP_Q_HUE1,
+    FXP_Q_SAT0, FXP_Q_SAT1,
+    FXP_Q_LUMA0, FXP_Q_LUMA1,
+    FXP_Q_SOFT,
+
     FXP_MAX
 } EffectParam;
 
@@ -93,6 +118,31 @@ typedef struct Effect {
     float     *lut;
     int        lut_size;
     void      *d_lut;
+
+    /*
+     * Power window: confine this effect to a region of the frame.
+     *
+     * The one thing missing that separates "you can apply a look" from "you can
+     * grade": a colourist's work is almost never global. Darkening a sky,
+     * lifting a face, drawing the eye to one corner — all of them are the same
+     * correction applied *here and not there*, and without a window the only
+     * available answer is to apply it everywhere.
+     *
+     * Every parameter is a track, because a window that cannot follow its
+     * subject is only useful on a locked-off shot.
+     *
+     * shape 0 = none (the whole frame), 1 = ellipse, 2 = rectangle. Geometry is
+     * in canvas fractions, so a window survives a change of resolution.
+     */
+    int        win_shape;
+    Track      win_cx, win_cy, win_rx, win_ry, win_feather;
+    bool       win_invert;
+
+    /* Whether an HSL qualifier was given at all — the slots above always hold
+     * a full-range default, and a full range is indistinguishable from "no
+     * qualifier" except that evaluating one costs something. */
+    bool       qual_on;
+    bool       qual_invert;
 } Effect;
 
 /* "vignette", "color_grade", "rgbSplit"… → EffectType. Unknown → FX_NONE. */

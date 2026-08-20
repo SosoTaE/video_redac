@@ -36,9 +36,56 @@ present, it wins.
 | `fps` | int | 60 | 1–480 |
 | `bg_color` | colour | `#000000FF` | shows through slides and zooms |
 | `duration_ms` | int | 0 | 0 → derived. In scene mode it is *computed* from the scenes |
+| `motion_blur` | int / bool / object | off | see below |
 
 Invalid resolution or fps is a hard error — a corrupt config would otherwise ask
 for absurd amounts of VRAM.
+
+### `motion_blur`
+
+```json
+"project": { "fps": 60, "motion_blur": 8 }
+"project": { "fps": 60, "motion_blur": { "samples": 16, "shutter": 0.5 } }
+```
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `samples` | int | 8 | sub-frames averaged; 0 or 1 is off, capped at 32 |
+| `shutter` | float 0..1 | 0.5 | the open fraction of the frame interval |
+
+`0.5` is a 180-degree shutter, the film convention. `true` turns it on with the
+defaults, and a bare number sets the sample count.
+
+**How it works, and why it is cheap here.** A frame in this renderer is a pure
+function of time — the property `--range` and the two-backend equivalence
+already rest on — so a sub-frame sample is not a special case at all: it is the
+same renderer asked for a slightly different instant. The frame is rendered
+`samples` times across the open shutter and averaged.
+
+Samples sit at the **centres** of equal slices of the shutter, not at its ends.
+Sampling the endpoints double-weights the two extremes of the movement once the
+neighbouring frames are considered, which reads as a smear with a hard bright
+edge at each end.
+
+The blur is physical, so its length follows the subject's speed: an object
+crossing the frame in a quarter of a second smears about 57 px at 30 fps and a
+180-degree shutter, and one drifting slowly smears a few. If you cannot see it,
+nothing is moving fast enough to warrant it.
+
+**Cost is linear in `samples`** — 16 samples is sixteen full renders of every
+frame. Past about 16 the difference is below a code value on anything moving
+slowly enough to look at.
+
+**Scene selection is not sub-sampled.** The scene on screen, and a transition's
+progress, use the frame's own millisecond; only objects, the camera and the
+lights are evaluated at the sub-frame instants. Otherwise a sample near a cut
+would land in the neighbouring scene and leave a ghost of the next shot inside
+this one.
+
+**Effects are averaged along with everything else**, which is right for a grade
+and wrong for `grain` — the noise is averaged across the samples and comes out
+weaker. Put grain in the film-wide `effects` stack rather than a scene's, since
+that runs once on the finished frame.
 
 ## `output`
 
@@ -48,8 +95,47 @@ for absurd amounts of VRAM.
 | `preset` | string | `p5` |
 | `cq` | int | 21 (clamped 0–51) |
 | `bitrate` | string | *(none)* — constant-quality mode |
+| `alpha` | bool | false — keep the alpha channel |
 
 `VIDEO_REDAC_ENCODER` overrides `encoder` for quick experiments.
+
+### Image sequences
+
+An output name containing a `%d` pattern writes one file per frame:
+
+```
+./video_redac scene.json -o out/frame_%04d.png
+```
+
+Detected from the name rather than requested by a flag, because the name already
+says it — `frame_%04d.png` means one file per frame in every tool that reads
+such a name.
+
+### `alpha` — keeping the matte
+
+```json
+"output": { "alpha": true, "encoder": "png" }
+```
+
+```
+./video_redac scene.json -o out/matte_%04d.png
+```
+
+Set `bg_color` to something fully transparent (`"#00000000"`) and only the
+objects carry coverage.
+
+This is **not a codec setting**: NV12 has no alpha channel to put one in, so the
+whole back end takes a different path — the frame crosses the bus as RGBA and
+the colour conversion is skipped entirely. That costs two thirds more bandwidth
+per frame, which is why it is not the default.
+
+The encoder has to be able to carry alpha. A PNG sequence is the usual answer
+and what another program will want; `qtrle` and `prores_ks -profile:v 4444` are
+the movie-container options.
+
+Antialiased edges come out as genuine partial coverage rather than being rounded
+to in or out — measured on a circle and some text, 1.2% of the frame is
+partially transparent — so the matte composites cleanly instead of fringing.
 
 ## `vars` and `${substitution}`
 
@@ -408,6 +494,59 @@ each body must be dark, or a product turning under a fixed key light.
 `ambient` sets the floor, so a body's night side is not pure black; a light
 source itself takes `"ambient": 1.0`, which is how the Sun in
 `anim/solar.json` stays bright while lighting everything else.
+
+### Three kinds of light
+
+```json
+"light": [
+  { "type": "point", "x": 0, "y": -450, "z": 100, "intensity": 1.4, "range": 1400 },
+  { "type": "sun",   "dx": -0.5, "dy": 1.0, "dz": 0.35, "intensity": 1.1 },
+  { "type": "spot",  "x": 0, "y": -700, "z": 100, "target": [0, 200, 300],
+    "angle": 16, "penumbra": 9, "intensity": 3.0, "range": 2600 }
+]
+```
+
+| `type` | Reads | Ignores |
+|---|---|---|
+| `point` (default) | `x,y,z`, `range` | the aim, the cone |
+| `sun` / `directional` | `dx,dy,dz` | position and `range` |
+| `spot` | `x,y,z`, the aim, `angle`, `penumbra`, `range` | — |
+
+`point` is the default, so a scene that never says `type` renders exactly as it
+did before these existed.
+
+**A sun is not a distant point light.** It has no position at all: every surface
+in the scene is lit from the same angle and there is no falloff. Placing a point
+light very far away is a different thing, because its falloff and its spread
+still vary across a large scene — a floor lit by a sun is perfectly even, and
+one lit by a distant lamp still has a bright patch.
+
+**A spot may be aimed rather than pointed.** `"target": [x, y, z]` is nearly
+always the more natural way to say it — you point a lamp *at* something — and
+sets the direction from the light's own position. `dx/dy/dz` is the alternative.
+
+`angle` is degrees from the axis to the edge of full brightness, and `penumbra`
+is the soft margin *outside* it. The cone is stored as cosines so the pixel loop
+compares a dot product instead of taking an arccosine per light per pixel, and
+the falloff across the penumbra is smoothed — a hard cone edge makes a spotlight
+look like a stencil rather than a lamp.
+
+**Every channel is a track**, so a light can move:
+
+```json
+"light": [ { "x": [ {"t":0,"v":-1100}, {"t":4,"v":1100,"ease":"linear"} ],
+             "y": -560, "z": -300, "intensity": 1.3, "range": 3400 } ]
+```
+
+This used to be the one thing in a scene that could not be animated, and it
+failed quietly: a keyframe array in `x` read as zero and put the lamp at the
+origin without a word. A plain number still parses into a constant track, so a
+scene whose lights never move behaves exactly as it did.
+
+A travelling light is also the only honest way to show a normal map. Shading
+painted into an albedo and shading computed from a map look identical in a still
+frame; they stop looking identical the moment the light moves, because painted
+shading does not.
 
 **Two-sided geometry is lit two-sided.** A surface with `cull` off is being
 shown from both faces and so has no outward direction for light to fall on;
@@ -1592,13 +1731,152 @@ Run in array order, after compositing. Every numeric parameter is a track.
 | `gradient_map` | `shadow`, `highlight`, `amount` | black/white, 1 |
 | `color_grade` | `exposure`, `brightness`, `contrast`, `gamma`, `saturation`, `vibrance`, `hue`, `temperature`, `tint` | 0,0,1,1,1,0,0,0,0 |
 | `lut` | `path` (**required**), `amount` | —, 1 |
+| `lift_gamma_gain` | `lift`, `gamma`, `gain` (each a number or `{r,g,b}`), `amount` | 0, 1, 1, 1 |
+| `bloom` | `level` (threshold), `radius`, `amount` | 0.75, 18, 0.7 |
 | `blur` | `radius` | 8 (capped at 128) |
 | `pixelate` | `size` | 8 |
 | `rgb_split` | `amount`, `angle` | 3, 0 |
 | `glitch` | `amount` | 0.05 |
 
 Aliases: `greyscale`, `noise` → `grain`, `grade` → `color_grade`, `chromatic` →
-`rgb_split`, `duotone` → `gradient_map`, `look` → `lut`.
+`rgb_split`, `duotone` → `gradient_map`, `look` → `lut`, `lgg` / `three_way` →
+`lift_gamma_gain`, `glow` → `bloom`.
+
+Every effect additionally accepts a **`window`** and a **`qualifier`** — see
+below. They multiply, which is how the two combine in a grading tool: *this
+colour, but only inside this shape*.
+
+### `lift_gamma_gain` — the three-way corrector
+
+```json
+{ "type": "lift_gamma_gain",
+  "lift":  { "r": 0.00, "g": 0.02, "b": 0.10 },
+  "gain":  { "r": 1.12, "g": 1.00, "b": 0.86 },
+  "gamma": { "b": 0.95 } }
+```
+
+Three controls that each own a different part of the tonal range, because "the
+shadows are too blue" and "the highlights are too warm" are different complaints
+and one brightness slider answers neither.
+
+The maths, per channel: `out = pow((in + lift·(1−in)) · gain, 1/gamma)`.
+
+**Lift is scaled by `(1 − in)`,** which is what confines it to the shadows: at
+white it does nothing, at black it is the whole of the change. A flat offset
+would move the highlights exactly as far and there would be no difference
+between lift and gain at all.
+
+A bare number instead of an object is the **master** — it moves all three
+channels together, which is how you reach for the wheel before deciding the shot
+has a cast at all. Any channel left out keeps its neutral (0 for lift, 1 for
+gamma and gain), so `{"b": 0.95}` really does mean "only blue".
+
+Every channel is a track, so a grade can ramp across a shot.
+
+### `bloom` — light spilling off the bright parts
+
+```json
+{ "type": "bloom", "level": 0.62, "radius": 26, "amount": 1.1 }
+```
+
+| Key | Meaning |
+|---|---|
+| `level` | luma threshold — only what is brighter than this blooms |
+| `radius` | how far the glow spreads |
+| `amount` | how much of it is added back |
+
+**The excess is kept, not the pixel.** A pixel at 0.8 against a threshold of
+0.75 contributes 0.05, not 0.8 — which is what makes the glow scale with how
+bright a thing actually is, instead of turning everything above the line into
+the same haze. A specular glint blooms; a white wall does not.
+
+The threshold has a small knee rather than being a hard line, because a hard one
+makes the glow appear and disappear as a highlight drifts across it, and on
+moving footage that reads as flicker.
+
+The glow takes the colour of whatever is glowing, normalised by its own luma, so
+a cyan lamp glows cyan rather than white.
+
+Costs one extra full-frame buffer, allocated only when a project uses bloom.
+
+### `qualifier` — which colours an effect may touch
+
+```json
+{ "type": "color_grade", "saturation": 0.0,
+  "qualifier": { "hue": [70, 170], "sat": [0.25, 1.0], "softness": 0.05,
+                 "invert": true } }
+```
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `hue` | `[lo, hi]` tracks | `[0, 360]` | degrees; **wraps**, so `[340, 20]` is the reds |
+| `sat` | `[lo, hi]` tracks | `[0, 1]` | |
+| `luma` | `[lo, hi]` tracks | `[0, 1]` | |
+| `softness` | track | 0.06 | edge width of every band |
+| `invert` | bool | false | select everything *but* |
+
+The HSL secondary: an effect that applies only to the colours you name. The
+example above is the classic — desaturate everything **except** the greens.
+
+The three bands are tested separately and multiplied, because "green, but only
+the saturated ones, and not in the shadows" is three independent thoughts and
+they get adjusted one at a time.
+
+**Hue wraps.** A selection from 340 to 20 degrees is reds through magenta and has
+to work; testing it as a plain interval selects everything *except* the reds,
+which is the exact opposite and looks like a sign error somewhere else entirely.
+
+**Softness is not optional in practice.** A hard selection on a photographic
+image chatters along every edge where the hue crosses the threshold, and the
+chatter is far more visible than the correction.
+
+**The selection is judged on the frame as it was**, not as the effect left it.
+Testing the output would make the selection chase its own correction: push the
+greens toward cyan and they stop being green, so the selection shrinks, so the
+push weakens.
+
+A qualifier and a `window` multiply, so the two together are "this hue, inside
+this shape" — which is most of what a secondary grade ever is.
+
+### `window` — a power window on any effect
+
+```json
+{ "type": "color_grade", "exposure": 0.6,
+  "window": { "shape": "ellipse", "cx": 0.34, "cy": 0.5,
+              "rx": 0.2, "ry": 0.3, "feather": 0.06 } }
+```
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `shape` | `ellipse` \| `rect` | `ellipse` | |
+| `cx`, `cy` | track | 0.5 | centre, as canvas fractions |
+| `rx`, `ry` | track | 0.35 | radii, as canvas fractions |
+| `r` | track | — | sets both radii at once |
+| `feather` | track | 0.08 | ramp width, as a canvas fraction |
+| `invert` | bool | false | affect everything *outside* the window instead |
+
+Any effect takes one. Without it every correction is global, which is not how
+grading works: darkening a sky, lifting a face, drawing the eye to one corner
+are all the same correction applied *here and not there*.
+
+Every parameter is a track, so a window can follow its subject — one that cannot
+move is only useful on a locked-off shot. Geometry is in canvas fractions, so a
+window survives a change of resolution.
+
+Two windows on two effects, one of them inverted, is the ordinary secondary
+grade: sharpen and lift inside, blur and crush outside.
+
+**It works on every effect, including the ones that read neighbouring pixels.**
+That is why it is a separate pass rather than a test inside each effect: a blur
+cannot honour "skip this pixel", because a blur with half its taps skipped is
+not a narrower blur, it is a wrong one. The effect runs over the whole frame and
+the window then chooses, per pixel, how much of the result to keep. The cost is
+one extra full-frame buffer, allocated only when some effect actually has a
+window.
+
+The feather is a smoothstep in canvas units on both axes, so a long thin window
+ramps by the same distance along its short side as its long one rather than
+mostly along the short one.
 
 ### `lut` — a look from somewhere else
 
@@ -1657,3 +1935,65 @@ thousands of frames.
 
 There is no text-to-speech; a track with `"text"` is refused with an explanatory
 message.
+
+### `pan`, `eq`, `compress` — the channel strip
+
+```json
+{ "id": "music", "path": "bed.mp3", "volume": 0.8,
+  "pan": -0.5,
+  "eq": { "low": 4, "mid": 0, "high": -3 },
+  "compress": { "threshold": -20, "ratio": 3, "attack": 20, "release": 250, "makeup": 1 } }
+```
+
+The chain runs in the order a mixing desk uses:
+
+```
+trim -> volume -> eq -> compressor -> pan -> fades -> timeline delay
+```
+
+Trim first, because everything after it is about the part that plays. Then the
+fader, then tone, then dynamics — a compressor has to see the level it is
+actually going to act on, so it sits *after* the fader and the EQ. Pan next,
+because placing a signal in the stereo field is the last thing done to its
+content. The fades and the delay last: those are about *when*, not what.
+
+**`pan` is constant power.** Linear gains would make a centred source quieter
+than a hard-panned one — two half-amplitude copies carry less energy than one
+full one — so the sweep would dip in the middle.
+
+**`eq`** is a low shelf at 110 Hz, a wide bell at 1 kHz and a high shelf at
+8 kHz, in dB. All three zero emits no filter at all.
+
+**`compress.threshold` is in dB** and negative. It is converted to the linear
+value ffmpeg's `acompressor` actually wants; passing dB straight through would
+be read as a linear level far above any signal and the compressor would simply
+never engage. `ratio` is n:1, `attack`/`release` are milliseconds, `makeup` is a
+linear multiplier.
+
+### `duck` — pull one track down under another
+
+```json
+[ { "id": "voice", "path": "vo.wav" },
+  { "id": "music", "path": "bed.mp3",
+    "duck": { "by": "voice", "amount": 0.85, "release": 400 } } ]
+```
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `by` | string | **required** | the `id` of the track to duck under |
+| `amount` | float 0..1 | 0.7 | how hard — it picks the ratio, 1:1 to 20:1 |
+| `release` | float (ms) | 300 | how quickly the level comes back |
+
+This is the one audio feature that cannot be a link in the serial chain: it
+needs a *second* signal, the track being ducked under. So the graph is built in
+three parts — the chains, then a split of each key into one copy per ducker plus
+one for the mix, then the sidechain compressors — rather than one.
+
+`amount` sets the ratio rather than a gain, deliberately. A gain would pull the
+music down for the whole clip; a sidechain compressor only acts while the key is
+actually loud. Measured on a bed under a voice speaking during seconds 2–4 and
+5–7: **0.0 dB change while the voice is silent, −2.0 dB while it speaks.**
+
+How deep the duck goes also depends on how far the key sits above the sidechain
+threshold, so a quiet voice ducks less than a loud one at the same `amount` —
+which is what you want, and worth knowing before reaching for a bigger number.

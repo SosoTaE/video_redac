@@ -89,14 +89,25 @@ def _run(args: list[str], timeout: int = QUICK_TIMEOUT) -> subprocess.CompletedP
         raise EngineError(f"the engine did not finish within {timeout}s") from exc
 
 
-def _scene_to_path(scene: Any, path: str | None) -> tuple[Path, Path | None]:
+def _scene_to_path(scene: Any, path: str | None,
+                   base_dir: str | None = None) -> tuple[Path, Path | None]:
     """
-    Resolve the two ways a scene can arrive: inline, or as a file.
+    Resolve the three ways a scene can arrive: as a file, inline, or inline with
+    a base directory for its relative asset paths.
 
-    Returns (json_path, tempdir_to_remove). An inline scene is written into a
-    fresh temporary directory, which then becomes the base for any relative
-    asset path it mentions — so `"photos/1.jpg"` cannot silently pick up a file
-    from somewhere else on disk.
+    Returns (json_path, path_to_remove).
+
+    The engine resolves every relative asset path against **the JSON file's own
+    directory**. An inline scene has no directory, so by default it is written
+    into a fresh temporary one: `"photos/1.jpg"` then resolves inside that
+    temporary directory and finds nothing, rather than silently picking up a
+    file from wherever the server happens to be running.
+
+    That is the safe default and it is also a dead end for any scene that wants
+    the project's own assets. `base_dir` is the explicit way out: the scene is
+    written there instead, so relative paths mean what they would mean in a real
+    project file. Explicit, because "which directory do relative paths mean" is
+    exactly the question that should not be answered by accident.
     """
     if path:
         p = Path(path).expanduser()
@@ -115,15 +126,48 @@ def _scene_to_path(scene: Any, path: str | None) -> tuple[Path, Path | None]:
         except json.JSONDecodeError as exc:
             raise EngineError(f"`scene` is not valid JSON: {exc}") from exc
 
+    if base_dir:
+        d = Path(base_dir).expanduser()
+        if not d.is_absolute():
+            d = (ROOT / d).resolve()
+        if not d.is_dir():
+            raise EngineError(f"base_dir is not a directory: {d}")
+        # A single file rather than a directory, deleted afterwards — writing
+        # into someone's project is acceptable only if nothing is left behind.
+        fd, name = tempfile.mkstemp(prefix=".vr_scene_", suffix=".json", dir=d)
+        os.close(fd)
+        f = Path(name)
+        f.write_text(json.dumps(scene), encoding="utf-8")
+        return f, f
+
     tmp = Path(tempfile.mkdtemp(prefix="vr_scene_"))
     f = tmp / "scene.json"
     f.write_text(json.dumps(scene), encoding="utf-8")
     return f, tmp
 
 
+# Assets an inline scene could not reach, which is nearly always the base_dir
+# question rather than a missing file.
+_ASSET_MISS = re.compile(r"cannot load|could not load image|rasterizing .* failed")
+
+
+def _asset_hint(stderr: str, tmp: Path | None) -> str:
+    """A pointer to `base_dir` when an isolated inline scene lost its assets."""
+    if tmp is None or not _ASSET_MISS.search(stderr or ""):
+        return ""
+    return ("\n\nHint: this scene was passed inline, so its relative asset paths "
+            "resolved inside a temporary directory and found nothing. Pass "
+            "`base_dir` (the directory the paths are relative to, e.g. the "
+            "project root or 'anim'), or use `path` to point at a real file.")
+
+
 def _cleanup(tmp: Path | None) -> None:
-    if tmp is not None:
+    if tmp is None:
+        return
+    if tmp.is_dir():
         shutil.rmtree(tmp, ignore_errors=True)
+    else:
+        tmp.unlink(missing_ok=True)
 
 
 def _safe_name(name: str) -> str:
@@ -224,9 +268,14 @@ PathArg = Annotated[
 @server.tool(
     description=(
         "The complete JSON scene reference: every key, type and default. Read "
-        "this before authoring a scene. Pass `section` to get one part (e.g. "
-        "'mesh', 'camera', 'light', 'emitter', 'timeline', 'repeat') instead of "
-        "the whole reference, which is long."
+        "this before authoring a scene. Pass `section` to get one part instead "
+        "of the whole reference, which is long.\n\n"
+        "Sections worth knowing exist, because they are easy not to look for: "
+        "'mesh', 'camera', 'light', 'emitter', 'timeline', 'repeat'; the "
+        "grading controls 'lut', 'lift_gamma_gain', 'qualifier', 'window', "
+        "'bloom'; 'motion_blur'; the per-object 'key' (chroma key); the mesh "
+        "maps 'normal_map' and 'emissive'; the audio 'duck' and channel strip; "
+        "and 'alpha' for keeping a matte."
     )
 )
 def get_authoring_guide(
@@ -275,7 +324,7 @@ def get_authoring_guide(
 def list_vocabulary(
     kind: Annotated[str, Field(
         description="effects | transitions | easings | actions | properties | "
-                    "widgets | shapes | fonts")],
+                    "widgets | shapes | lights | fonts")],
 ) -> str:
     proc = _run(["--list", kind])
     if proc.returncode != 0:
@@ -292,8 +341,9 @@ def list_vocabulary(
         "It cannot tell you whether the scene LOOKS right. Use preview_frames."
     )
 )
-def validate_scene(scene: SceneArg = None, path: PathArg = None) -> str:
-    json_path, tmp = _scene_to_path(scene, path)
+def validate_scene(scene: SceneArg = None, path: PathArg = None,
+                   base_dir: Annotated[str | None, Field(default=None, description="Directory the scene's relative asset paths resolve against (inline scenes only).")] = None) -> str:
+    json_path, tmp = _scene_to_path(scene, path, base_dir)
     try:
         proc = _run([str(json_path), "--check", "--json"])
         if not proc.stdout.strip():
@@ -301,7 +351,8 @@ def validate_scene(scene: SceneArg = None, path: PathArg = None) -> str:
             return json.dumps(
                 {"ok": False,
                  "problems": [{"severity": "error",
-                               "message": proc.stderr.strip() or "could not load project"}]},
+                               "message": (proc.stderr.strip() or "could not load project")
+                                          + _asset_hint(proc.stderr, tmp)}]},
                 indent=2,
             )
         return proc.stdout.strip()
@@ -317,8 +368,9 @@ def validate_scene(scene: SceneArg = None, path: PathArg = None) -> str:
         "this when a scene parses but an object is not where you meant it."
     )
 )
-def describe_scene(scene: SceneArg = None, path: PathArg = None) -> str:
-    json_path, tmp = _scene_to_path(scene, path)
+def describe_scene(scene: SceneArg = None, path: PathArg = None,
+                   base_dir: Annotated[str | None, Field(default=None, description="Directory the scene's relative asset paths resolve against (inline scenes only).")] = None) -> str:
+    json_path, tmp = _scene_to_path(scene, path, base_dir)
     try:
         proc = _run([str(json_path), "--dump", "--json", "--dry-run"])
         if not proc.stdout.strip():
@@ -351,13 +403,14 @@ def preview_frames(
                                     description="Downscale the returned image; the saved file keeps full size.")] = PREVIEW_MAX_WIDTH,
     contact_sheet: Annotated[bool, Field(default=True,
                                          description="Return one tiled strip instead of separate images.")] = True,
+    base_dir: Annotated[str | None, Field(default=None, description="Directory the scene's relative asset paths resolve against (inline scenes only).")] = None,
 ):
     if not times:
         raise EngineError("give at least one timestamp in `times`")
     if len(times) > MAX_PREVIEW_FRAMES:
         raise EngineError(f"at most {MAX_PREVIEW_FRAMES} frames per call")
 
-    json_path, tmp = _scene_to_path(scene, path)
+    json_path, tmp = _scene_to_path(scene, path, base_dir)
     OUT.mkdir(parents=True, exist_ok=True)
     stamp = f"preview_{int(time.time() * 1000)}"
 
@@ -369,7 +422,8 @@ def preview_frames(
             proc = _run([str(json_path), "--frame", str(t), "-o", str(png)])
             if proc.returncode != 0 or not png.exists():
                 raise EngineError(
-                    f"rendering the frame at {t}s failed:\n{proc.stderr.strip()[-1500:]}"
+                    f"rendering the frame at {t}s failed:\n"
+                    f"{proc.stderr.strip()[-1500:]}{_asset_hint(proc.stderr, tmp)}"
                 )
             written.append(png)
     finally:
@@ -394,7 +448,10 @@ def preview_frames(
     description=(
         "Render the scene to an MP4 and return its path. Validate first — a "
         "scene with problems will still render, just not as intended. Give "
-        "`start`/`end` to render only part of the timeline."
+        "`start`/`end` to render only part of the timeline.\n\n"
+        "Rendering cost is not uniform: `project.motion_blur` renders the whole "
+        "scene once per sample, so 16 samples is roughly 14x the time. Check it "
+        "is what you want before rendering a long timeline with it on."
     )
 )
 def render_video(
@@ -403,8 +460,9 @@ def render_video(
     name: Annotated[str | None, Field(default=None, description="Output file name, not a path.")] = None,
     start: Annotated[float | None, Field(default=None, description="Render from this second.")] = None,
     end: Annotated[float | None, Field(default=None, description="Render up to this second.")] = None,
+    base_dir: Annotated[str | None, Field(default=None, description="Directory the scene's relative asset paths resolve against (inline scenes only).")] = None,
 ) -> str:
-    json_path, tmp = _scene_to_path(scene, path)
+    json_path, tmp = _scene_to_path(scene, path, base_dir)
     OUT.mkdir(parents=True, exist_ok=True)
 
     out_name = _safe_name(name or f"render_{int(time.time())}")
@@ -423,7 +481,8 @@ def render_video(
         _cleanup(tmp)
 
     if proc.returncode != 0 or not out_path.exists():
-        raise EngineError(f"render failed:\n{proc.stderr.strip()[-2500:]}")
+        raise EngineError(f"render failed:\n{proc.stderr.strip()[-2500:]}"
+                          f"{_asset_hint(proc.stderr, tmp)}")
 
     # The engine's last line carries the frame count and rate — the most useful
     # single sentence about what just happened.

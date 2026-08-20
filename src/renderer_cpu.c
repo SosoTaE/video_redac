@@ -77,6 +77,9 @@ typedef struct {
 
     uchar4  *frame;      /* RGBA compositing target                            */
     uchar4  *fx;         /* ping-pong buffer for the effects; NULL if unused   */
+    uchar4  *keep;       /* the pre-effect frame, for windowed effects only    */
+    float   *accum;      /* motion-blur accumulator, 4 floats/px; NULL when off */
+    uchar4  *bloom;      /* the isolated highlights; NULL when no bloom         */
     uchar4  *scene[2];   /* the two scenes during a transition; NULL if unused */
     uint8_t *nv12;       /* the frame as NV12 — what goes into the pipe        */
 
@@ -84,6 +87,9 @@ typedef struct {
     int      height;
     size_t   frame_bytes;
     size_t   nv12_bytes;
+    size_t   pipe_bytes;   /* NV12, or the RGBA frame when alpha is kept */
+    bool     alpha_out;
+    const uint8_t *pipe_src;  /* set per frame: whichever buffer goes to ffmpeg */
 } CpuResources;
 
 /* ------------------------------------------------------------------------- */
@@ -109,8 +115,13 @@ bool renderer_init(EditorContext *ctx)
     res->frame_bytes = (size_t)res->width * (size_t)res->height * sizeof(uchar4);
     /* NV12: a full Y plane + half-resolution UV → w*h*3/2. */
     res->nv12_bytes  = (size_t)res->width * (size_t)res->height * 3 / 2;
+    res->alpha_out   = ctx->output.alpha;
+    res->pipe_bytes  = res->alpha_out ? res->frame_bytes : res->nv12_bytes;
 
     res->frame = (uchar4 *)malloc(res->frame_bytes);
+    if (ctx->config.mb_samples > 1) {
+        res->accum = (float *)malloc((size_t)res->width * res->height * 4 * sizeof(float));
+    }
     res->nv12  = (uint8_t *)malloc(res->nv12_bytes);
     if (res->frame == NULL || res->nv12 == NULL) {
         free(res->frame);
@@ -142,6 +153,12 @@ bool renderer_init(EditorContext *ctx)
     }
     if (any_effects) {
         res->fx = (uchar4 *)malloc(res->frame_bytes);
+        if (vr_any_windowed(ctx)) {
+            res->keep = (uchar4 *)malloc(res->frame_bytes);
+        }
+        if (vr_any_effect(ctx, FX_BLOOM)) {
+            res->bloom = (uchar4 *)malloc(res->frame_bytes);
+        }
         if (res->fx == NULL) {
             goto fail;
         }
@@ -174,6 +191,9 @@ bool renderer_init(EditorContext *ctx)
 fail:
     free(res->frame);
     free(res->fx);
+    free(res->keep);
+    free(res->accum);
+    free(res->bloom);
     free(res->scene[0]);
     free(res->scene[1]);
     free(res->nv12);
@@ -193,6 +213,9 @@ void renderer_shutdown(EditorContext *ctx)
         free(res->depth);
         free(res->frame);
         free(res->fx);
+        free(res->keep);
+        free(res->accum);
+        free(res->bloom);
         free(res->scene[0]);
         free(res->scene[1]);
         free(res->nv12);
@@ -313,6 +336,13 @@ static uchar4 *apply_effect_list(const Effect *list, size_t count, CpuResources 
 
         EffectGPU g = vr_effect_sample(fx, t_sec);
 
+        /* The untouched frame, kept aside for a windowed effect — see the GPU
+         * side for why it cannot be recovered from `src` afterwards. */
+        bool windowed = ((g.win_shape != 0 || g.qual_on) && res->keep != NULL);
+        if (windowed) {
+            memcpy(res->keep, src, res->frame_bytes);
+        }
+
         switch (fx->type) {
             case FX_BLUR: {
                 int radius = vr_blur_radius(&g);
@@ -325,6 +355,23 @@ static uchar4 *apply_effect_list(const Effect *list, size_t count, CpuResources 
                 FX_PASS(vr_px_fx_blur(dst, src, w, h, radius, 0, x, y));
                 break;
             }
+            case FX_BLOOM: {
+                if (res->bloom == NULL) {
+                    continue;
+                }
+                int radius = vr_blur_radius(&g);
+                /* `src` survives all three passes — see the CUDA backend. */
+                FX_PASS(vr_px_fx_bloom_cut(res->bloom, src, w, h,
+                                           g.p[FXP_LEVEL], x, y));
+                if (radius > 0) {
+                    FX_PASS(vr_px_fx_blur(dst, res->bloom, w, h, radius, 1, x, y));
+                    FX_PASS(vr_px_fx_blur(res->bloom, dst, w, h, radius, 0, x, y));
+                }
+                FX_PASS(vr_px_fx_bloom_add(dst, src, res->bloom, w, h,
+                                           g.p[FXP_AMOUNT], x, y));
+                break;
+            }
+
             case FX_PIXELATE:
                 FX_PASS(vr_px_fx_pixelate(dst, src, w, h, (int)lrintf(g.p[FXP_SIZE]), x, y));
                 break;
@@ -343,6 +390,10 @@ static uchar4 *apply_effect_list(const Effect *list, size_t count, CpuResources 
                  * one the loader parsed. */
                 FX_PASS(vr_px_fx_point(dst, src, w, h, &g, fx->lut, seed, x, y));
                 break;
+        }
+
+        if (windowed) {
+            FX_PASS(vr_px_fx_window(dst, res->keep, w, h, &g, x, y));
         }
 
         { uchar4 *tmp = src; src = dst; dst = tmp; }
@@ -392,6 +443,11 @@ static void render_scene_into(const EditorContext *ctx, CpuResources *res,
                        ? scene->camera.focal : (float)res->width * 8.0f,
                    view);
 
+    /* The lights, resolved for this instant. Once per frame — every mesh in the
+     * scene sees the same ones. */
+    Light lights[VR_MAX_LIGHTS];
+    int   light_count = vr_scene_lights(scene, (float)local_ms * 0.001f, lights);
+
     if (res->depth != NULL) {
         size_t npx = (size_t)res->width * res->height;
         #pragma omp parallel for schedule(static)
@@ -432,7 +488,7 @@ static void render_scene_into(const EditorContext *ctx, CpuResources *res,
                 ScreenTri *slice = res->tris + mw->tri_base;
                 MeshParams mp;
                 int nt = vr_mesh_project(mw, r, res->width, res->height, view,
-                                         scene->lights, scene->light_count,
+                                         lights, light_count,
                                          slice, (int)(mw->tri_count * 2), &mp);
                 if (nt > 0) {
                     MeshTextures maps;
@@ -510,18 +566,16 @@ static void render_scene_into(const EditorContext *ctx, CpuResources *res,
     }
 }
 
-static void render_one_frame(EditorContext *ctx, CpuResources *res,
-                             long long frame, int time_ms)
+/* The scene stage, run once per motion-blur sample. See the CUDA backend for
+ * why scene selection keeps the frame's own integer millisecond. */
+static void render_stage(EditorContext *ctx, CpuResources *res,
+                         long long frame, int time_ms, float sub_ms, uchar4 *base)
 {
-    float t_sec = (float)time_ms * 0.001f;
-
     /* Which scene — or which pair, mid-transition — is on screen. */
     size_t       si;
     const Scene *A, *B;
     float        p;
     vr_select_scenes(ctx, time_ms, &si, &A, &B, &p);
-
-    uchar4 *base = res->frame;
 
     if (B != NULL && res->scene[0] != NULL) {
         arena_reset(&ctx->frame_arena);
@@ -534,16 +588,17 @@ static void render_one_frame(EditorContext *ctx, CpuResources *res,
             return;
         }
 
-        vr_evaluate_scene(ctx, A, rtA, time_ms - A->start_ms);
-        vr_evaluate_scene(ctx, B, rtB, time_ms - B->start_ms);
+        float la = (float)(time_ms - A->start_ms) + sub_ms;
+        float lb = (float)(time_ms - B->start_ms) + sub_ms;
 
-        render_scene_into(ctx, res, A, rtA, res->scene[0], time_ms - A->start_ms);
-        scene_effects(res, A, res->scene[0],
-                      (float)(time_ms - A->start_ms) * 0.001f, frame);
+        vr_evaluate_scene(ctx, A, rtA, la);
+        vr_evaluate_scene(ctx, B, rtB, lb);
 
-        render_scene_into(ctx, res, B, rtB, res->scene[1], time_ms - B->start_ms);
-        scene_effects(res, B, res->scene[1],
-                      (float)(time_ms - B->start_ms) * 0.001f, frame);
+        render_scene_into(ctx, res, A, rtA, res->scene[0], la);
+        scene_effects(res, A, res->scene[0], la * 0.001f, frame);
+
+        render_scene_into(ctx, res, B, rtB, res->scene[1], lb);
+        scene_effects(res, B, res->scene[1], lb * 0.001f, frame);
 
         TransParams tp;
         tp.w = res->width;
@@ -571,9 +626,52 @@ static void render_one_frame(EditorContext *ctx, CpuResources *res,
         if (rt == NULL) {
             return;
         }
-        vr_evaluate_scene(ctx, A, rt, time_ms - A->start_ms);
-        render_scene_into(ctx, res, A, rt, base, time_ms - A->start_ms);
-        scene_effects(res, A, base, (float)(time_ms - A->start_ms) * 0.001f, frame);
+        float la = (float)(time_ms - A->start_ms) + sub_ms;
+        vr_evaluate_scene(ctx, A, rt, la);
+        render_scene_into(ctx, res, A, rt, base, la);
+        scene_effects(res, A, base, la * 0.001f, frame);
+    }
+}
+
+static void render_one_frame(EditorContext *ctx, CpuResources *res,
+                             long long frame, int time_ms)
+{
+    float   t_sec = (float)time_ms * 0.001f;
+    uchar4 *base  = res->frame;
+
+    int nmb = ctx->config.mb_samples;
+    if (nmb > 1 && res->accum != NULL) {
+        /* Sample centres, not endpoints — see the CUDA backend. */
+        float  shutter_ms = 1000.0f / (float)ctx->config.fps * ctx->config.mb_shutter;
+        size_t npx = (size_t)res->width * res->height;
+
+        for (int k = 0; k < nmb; k++) {
+            float off = shutter_ms * (((float)k + 0.5f) / (float)nmb - 0.5f);
+            render_stage(ctx, res, frame, time_ms, off, base);
+
+            #pragma omp parallel for schedule(static)
+            for (long i = 0; i < (long)npx; i++) {
+                const uchar4 *s = &base[i];
+                float *a = &res->accum[(size_t)i * 4];
+                if (k == 0) {
+                    a[0] = (float)s->x; a[1] = (float)s->y;
+                    a[2] = (float)s->z; a[3] = (float)s->w;
+                } else {
+                    a[0] += (float)s->x; a[1] += (float)s->y;
+                    a[2] += (float)s->z; a[3] += (float)s->w;
+                }
+            }
+        }
+
+        float scale = 1.0f / (float)nmb / 255.0f;
+        #pragma omp parallel for schedule(static)
+        for (long i = 0; i < (long)npx; i++) {
+            const float *a = &res->accum[(size_t)i * 4];
+            base[i] = make_uchar4(vr_u8(a[0] * scale), vr_u8(a[1] * scale),
+                                  vr_u8(a[2] * scale), vr_u8(a[3] * scale));
+        }
+    } else {
+        render_stage(ctx, res, frame, time_ms, 0.0f, base);
     }
 
     /* 3. Film-wide effects on the finished frame. */
@@ -581,7 +679,14 @@ static void render_one_frame(EditorContext *ctx, CpuResources *res,
                                             base, t_sec, frame);
 
     /* 4. RGBA → NV12: 2.67x less data to push into the pipe. */
-    frame_to_nv12(final_frame, res->nv12, res->width, res->height);
+    /* NV12 has nowhere to put an alpha channel, so keeping one means skipping
+     * the conversion and sending the RGBA frame straight through. */
+    if (res->alpha_out) {
+        res->pipe_src = (const uint8_t *)final_frame;
+    } else {
+        frame_to_nv12(final_frame, res->nv12, res->width, res->height);
+        res->pipe_src = res->nv12;
+    }
 }
 
 /* ------------------------------------------------------------------------- */
@@ -667,11 +772,11 @@ bool render_video(EditorContext *ctx, const char *output_file)
 
         render_one_frame(ctx, res, frame, time_ms);
 
-        size_t written = fwrite(res->nv12, 1, res->nv12_bytes, pipe);
-        if (written != res->nv12_bytes) {
+        size_t written = fwrite(res->pipe_src, 1, res->pipe_bytes, pipe);
+        if (written != res->pipe_bytes) {
             fprintf(stderr, "\nerror: writing to the ffmpeg pipe failed "
                             "(%zu / %zu bytes) — the encoder probably closed.\n",
-                    written, res->nv12_bytes);
+                    written, res->pipe_bytes);
             ok = false;
             break;
         }

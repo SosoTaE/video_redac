@@ -93,6 +93,9 @@ struct FrameSlot {
     ScreenTri   *h_tris;    /* pinned staging for that upload                     */
     size_t       tri_cap;   /* how many fit                                       */
     uchar4      *d_fx;      /* ping-pong buffer for the effects                   */
+    uchar4      *d_keep;    /* the pre-effect frame, for windowed effects only    */
+    float4      *d_accum;   /* motion-blur accumulator; NULL when blur is off     */
+    uchar4      *d_bloom;   /* the isolated highlights; NULL when no bloom        */
     uchar4      *d_scene[2];/* two scenes during a transition; NULL if only one  */
     uint8_t     *d_nv12;    /* the same frame as NV12 — only this goes to the host */
     uint8_t     *h_frame;   /* pinned host staging — for fast DMA                 */
@@ -103,7 +106,10 @@ struct FrameSlot {
 struct RenderResources {
     FrameSlot slot[VR_PIPELINE_DEPTH];
     size_t    frame_bytes;  /* size of the RGBA framebuffer (in VRAM)            */
-    size_t    nv12_bytes;   /* w*h*3/2 — what actually crosses the bus           */
+    size_t    nv12_bytes;   /* w*h*3/2 — the NV12 size                          */
+    size_t    pipe_bytes;   /* what actually crosses the bus: NV12, or RGBA when
+                             * the project asked to keep its alpha             */
+    bool      alpha_out;
     int       width;
     int       height;
     size_t    texture_bytes;
@@ -168,6 +174,80 @@ __global__ void k_fx_point(uchar4 *__restrict__ dst, const uchar4 *__restrict__ 
         return;
     }
     vr_px_fx_point(dst, src, w, h, &fx, lut, seed, x, y);
+}
+
+/*
+ * Motion-blur accumulation.
+ *
+ * A float accumulator rather than summing bytes: 32 samples of an 8-bit channel
+ * fit in an integer easily, but the average of them does not — rounding each
+ * sub-frame to a byte before adding throws away exactly the fractional detail
+ * the averaging exists to recover, and a slow pan comes out stepped instead of
+ * smooth.
+ */
+__global__ void k_mb_accum(float4 *__restrict__ acc, const uchar4 *__restrict__ src,
+                           int npx, int first)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= npx) {
+        return;
+    }
+    uchar4 s = src[i];
+    float4 v = make_float4((float)s.x, (float)s.y, (float)s.z, (float)s.w);
+    if (first) {
+        acc[i] = v;
+    } else {
+        float4 a = acc[i];
+        acc[i] = make_float4(a.x + v.x, a.y + v.y, a.z + v.z, a.w + v.w);
+    }
+}
+
+__global__ void k_mb_resolve(uchar4 *__restrict__ dst, const float4 *__restrict__ acc,
+                             int npx, float scale)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= npx) {
+        return;
+    }
+    float4 a = acc[i];
+    dst[i] = make_uchar4(vr_u8(a.x * scale * (1.0f / 255.0f)),
+                         vr_u8(a.y * scale * (1.0f / 255.0f)),
+                         vr_u8(a.z * scale * (1.0f / 255.0f)),
+                         vr_u8(a.w * scale * (1.0f / 255.0f)));
+}
+
+__global__ void k_fx_window(uchar4 *__restrict__ dst, const uchar4 *__restrict__ keep,
+                            int w, int h, EffectGPU fx)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) {
+        return;
+    }
+    vr_px_fx_window(dst, keep, w, h, &fx, x, y);
+}
+
+__global__ void k_fx_bloom_cut(uchar4 *__restrict__ dst, const uchar4 *__restrict__ src,
+                               int w, int h, float threshold)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) {
+        return;
+    }
+    vr_px_fx_bloom_cut(dst, src, w, h, threshold, x, y);
+}
+
+__global__ void k_fx_bloom_add(uchar4 *__restrict__ dst, const uchar4 *__restrict__ src,
+                               const uchar4 *__restrict__ glow, int w, int h,
+                               float intensity)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) {
+        return;
+    }
+    vr_px_fx_bloom_add(dst, src, glow, w, h, intensity, x, y);
 }
 
 __global__ void k_fx_blur(uchar4 *__restrict__ dst, const uchar4 *__restrict__ src,
@@ -441,8 +521,10 @@ bool renderer_init(EditorContext *ctx)
     res->frame_bytes = (size_t)res->width * (size_t)res->height * sizeof(uchar4);
 
     /* NV12: a full Y plane + half-resolution UV → w*h*3/2. */
+    res->alpha_out  = ctx->output.alpha;
     res->nv12_bytes = (size_t)res->width * (size_t)res->height +
                       (size_t)((res->width + 1) / 2) * (size_t)((res->height + 1) / 2) * 2;
+    res->pipe_bytes = res->alpha_out ? res->frame_bytes : res->nv12_bytes;
 
     for (int s = 0; s < VR_PIPELINE_DEPTH; s++) {
         FrameSlot *slot = &res->slot[s];
@@ -480,6 +562,18 @@ bool renderer_init(EditorContext *ctx)
         if (any_fx) {
             CUDA_TRY(cudaMalloc((void **)&slot->d_fx, res->frame_bytes));
         }
+        /* The keep buffer only when some effect actually has a window: it is a
+         * whole frame per slot, and most projects never need one. */
+        if (any_fx && vr_any_windowed(ctx)) {
+            CUDA_TRY(cudaMalloc((void **)&slot->d_keep, res->frame_bytes));
+        }
+        if (any_fx && vr_any_effect(ctx, FX_BLOOM)) {
+            CUDA_TRY(cudaMalloc((void **)&slot->d_bloom, res->frame_bytes));
+        }
+        if (ctx->config.mb_samples > 1) {
+            CUDA_TRY(cudaMalloc((void **)&slot->d_accum,
+                                (size_t)res->width * res->height * sizeof(float4)));
+        }
         /* Scene buffers only when a transition is even possible. */
         if (ctx->scene_count > 1) {
             CUDA_TRY(cudaMalloc((void **)&slot->d_scene[0], res->frame_bytes));
@@ -494,7 +588,7 @@ bool renderer_init(EditorContext *ctx)
          * doubles D2H throughput and, more importantly, makes it genuinely
          * asynchronous.
          */
-        CUDA_TRY(cudaHostAlloc((void **)&slot->h_frame, res->nv12_bytes, cudaHostAllocDefault));
+        CUDA_TRY(cudaHostAlloc((void **)&slot->h_frame, res->pipe_bytes, cudaHostAllocDefault));
         CUDA_TRY(cudaStreamCreate(&slot->stream));
         /* DisableTiming — the event is only for synchronisation, so this is cheaper. */
         CUDA_TRY(cudaEventCreateWithFlags(&slot->done, cudaEventDisableTiming));
@@ -585,6 +679,9 @@ void renderer_shutdown(EditorContext *ctx)
         if (slot->d_frame != NULL) cudaFree(slot->d_frame);
         if (slot->d_nv12  != NULL) cudaFree(slot->d_nv12);
         if (slot->d_fx    != NULL) cudaFree(slot->d_fx);
+        if (slot->d_keep  != NULL) cudaFree(slot->d_keep);
+        if (slot->d_accum != NULL) cudaFree(slot->d_accum);
+        if (slot->d_bloom != NULL) cudaFree(slot->d_bloom);
         if (slot->d_scene[0] != NULL) cudaFree(slot->d_scene[0]);
         if (slot->d_scene[1] != NULL) cudaFree(slot->d_scene[1]);
         if (slot->h_frame != NULL) cudaFreeHost(slot->h_frame);
@@ -668,6 +765,18 @@ static uchar4 *apply_effect_list(const Effect *list, size_t count, RenderResourc
 
         EffectGPU g = vr_effect_sample(fx, t_sec);
 
+        /*
+         * A windowed effect needs the untouched frame kept aside before it
+         * runs. It cannot simply be read back from `src` afterwards, because a
+         * two-pass effect — blur — writes its second pass into the buffer the
+         * original was in.
+         */
+        bool windowed = ((g.win_shape != 0 || g.qual_on) && slot->d_keep != NULL);
+        if (windowed) {
+            gpuErrchk(cudaMemcpyAsync(slot->d_keep, src, res->frame_bytes,
+                                      cudaMemcpyDeviceToDevice, slot->stream));
+        }
+
         switch (fx->type) {
             case FX_BLUR: {
                 int radius = vr_blur_radius(&g);
@@ -684,6 +793,36 @@ static uchar4 *apply_effect_list(const Effect *list, size_t count, RenderResourc
                 CUDA_CHECK_KERNEL();
                 break;
             }
+            case FX_BLOOM: {
+                if (slot->d_bloom == NULL) {
+                    continue;
+                }
+                int radius = vr_blur_radius(&g);
+                /*
+                 * `src` survives all three passes: the highlights go into their
+                 * own buffer, `dst` is only borrowed as scratch between the two
+                 * blur directions, and the combine reads the original back. A
+                 * bloom that blurred in place would glow its own glow.
+                 */
+                k_fx_bloom_cut<<<grid, block, 0, slot->stream>>>(
+                    slot->d_bloom, src, res->width, res->height, g.p[FXP_LEVEL]);
+                CUDA_CHECK_KERNEL();
+
+                if (radius > 0) {
+                    k_fx_blur<<<grid, block, 0, slot->stream>>>(
+                        dst, slot->d_bloom, res->width, res->height, radius, 1);
+                    CUDA_CHECK_KERNEL();
+                    k_fx_blur<<<grid, block, 0, slot->stream>>>(
+                        slot->d_bloom, dst, res->width, res->height, radius, 0);
+                    CUDA_CHECK_KERNEL();
+                }
+
+                k_fx_bloom_add<<<grid, block, 0, slot->stream>>>(
+                    dst, src, slot->d_bloom, res->width, res->height, g.p[FXP_AMOUNT]);
+                CUDA_CHECK_KERNEL();
+                break;
+            }
+
             case FX_PIXELATE:
                 k_fx_pixelate<<<grid, block, 0, slot->stream>>>(
                     dst, src, res->width, res->height, (int)lrintf(g.p[FXP_SIZE]));
@@ -708,6 +847,12 @@ static uchar4 *apply_effect_list(const Effect *list, size_t count, RenderResourc
                     (const float *)fx->d_lut, seed);
                 CUDA_CHECK_KERNEL();
                 break;
+        }
+
+        if (windowed) {
+            k_fx_window<<<grid, block, 0, slot->stream>>>(dst, slot->d_keep,
+                                                          res->width, res->height, g);
+            CUDA_CHECK_KERNEL();
         }
 
         uchar4 *tmp = src; src = dst; dst = tmp;
@@ -742,6 +887,11 @@ static void render_scene_into(const EditorContext *ctx, RenderResources *res, in
                    scene->camera.present && scene->camera.focal > 0.0f
                        ? scene->camera.focal : (float)res->width * 8.0f,
                    view);
+
+    /* The lights, resolved for this instant. Once per frame — every mesh in the
+     * scene sees the same ones. */
+    Light lights[VR_MAX_LIGHTS];
+    int   light_count = vr_scene_lights(scene, (float)local_ms * 0.001f, lights);
 
     if (slot->d_depth != NULL) {
         int npx = res->width * res->height;
@@ -784,7 +934,7 @@ static void render_scene_into(const EditorContext *ctx, RenderResources *res, in
 
                 MeshParams mp;
                 int nt = vr_mesh_project(mw, r, res->width, res->height, view,
-                                         scene->lights, scene->light_count,
+                                         lights, light_count,
                                          h_slice, (int)(mw->tri_count * 2), &mp);
                 if (nt > 0) {
                     gpuErrchk(cudaMemcpyAsync(d_slice, h_slice,
@@ -893,21 +1043,27 @@ static void scene_effects(const EditorContext *ctx, RenderResources *res, int sl
 /* One frame: scene selection, transition, effects, NV12                      */
 /* ------------------------------------------------------------------------- */
 
-static void render_one_frame(EditorContext *ctx, RenderResources *res, int slot_idx,
-                             long long frame, int time_ms)
+/*
+ * The scene stage: everything up to but not including the film-wide effects.
+ *
+ * Split out so it can be run several times for one output frame, at instants
+ * either side of it — which is all motion blur is here. `sub_ms` shifts the
+ * instant that objects, the camera and the lights are evaluated at; scene
+ * selection and transition progress deliberately keep the frame's own integer
+ * millisecond, so a sub-sample near a cut cannot land in the neighbouring
+ * scene and put a ghost of the next shot inside this one.
+ */
+static void render_stage(EditorContext *ctx, RenderResources *res, int slot_idx,
+                         long long frame, int time_ms, float sub_ms, uchar4 *base)
 {
     FrameSlot   *slot   = &res->slot[slot_idx];
     cudaStream_t stream = slot->stream;
-    float        t_sec  = (float)time_ms * 0.001f;
 
     /* Which scene — or which pair, mid-transition — is on screen. */
     size_t       si;
     const Scene *A, *B;
     float        p;
     vr_select_scenes(ctx, time_ms, &si, &A, &B, &p);
-
-    /* --- Rendering the scenes ------------------------------------------- */
-    uchar4 *base = slot->d_frame;
 
     if (B != NULL && slot->d_scene[0] != NULL) {
         arena_reset(&ctx->frame_arena);
@@ -920,18 +1076,17 @@ static void render_one_frame(EditorContext *ctx, RenderResources *res, int slot_
             return;
         }
 
-        vr_evaluate_scene(ctx, A, rtA, time_ms - A->start_ms);
-        vr_evaluate_scene(ctx, B, rtB, time_ms - B->start_ms);
+        float la = (float)(time_ms - A->start_ms) + sub_ms;
+        float lb = (float)(time_ms - B->start_ms) + sub_ms;
 
-        render_scene_into(ctx, res, slot_idx, A, rtA, slot->d_scene[0],
-                          time_ms - A->start_ms);
-        scene_effects(ctx, res, slot_idx, A, slot->d_scene[0],
-                      (float)(time_ms - A->start_ms) * 0.001f, frame);
+        vr_evaluate_scene(ctx, A, rtA, la);
+        vr_evaluate_scene(ctx, B, rtB, lb);
 
-        render_scene_into(ctx, res, slot_idx, B, rtB, slot->d_scene[1],
-                          time_ms - B->start_ms);
-        scene_effects(ctx, res, slot_idx, B, slot->d_scene[1],
-                      (float)(time_ms - B->start_ms) * 0.001f, frame);
+        render_scene_into(ctx, res, slot_idx, A, rtA, slot->d_scene[0], la);
+        scene_effects(ctx, res, slot_idx, A, slot->d_scene[0], la * 0.001f, frame);
+
+        render_scene_into(ctx, res, slot_idx, B, rtB, slot->d_scene[1], lb);
+        scene_effects(ctx, res, slot_idx, B, slot->d_scene[1], lb * 0.001f, frame);
 
         TransParams tp;
         tp.w = res->width;
@@ -957,30 +1112,77 @@ static void render_one_frame(EditorContext *ctx, RenderResources *res, int slot_
         if (rt == NULL) {
             return;
         }
-        vr_evaluate_scene(ctx, A, rt, time_ms - A->start_ms);
-        render_scene_into(ctx, res, slot_idx, A, rt, base, time_ms - A->start_ms);
-        scene_effects(ctx, res, slot_idx, A, base,
-                      (float)(time_ms - A->start_ms) * 0.001f, frame);
+        float la = (float)(time_ms - A->start_ms) + sub_ms;
+        vr_evaluate_scene(ctx, A, rt, la);
+        render_scene_into(ctx, res, slot_idx, A, rt, base, la);
+        scene_effects(ctx, res, slot_idx, A, base, la * 0.001f, frame);
+    }
+}
+
+static void render_one_frame(EditorContext *ctx, RenderResources *res, int slot_idx,
+                             long long frame, int time_ms)
+{
+    FrameSlot   *slot   = &res->slot[slot_idx];
+    cudaStream_t stream = slot->stream;
+    float        t_sec  = (float)time_ms * 0.001f;
+    uchar4      *base   = slot->d_frame;
+
+    int   nmb = ctx->config.mb_samples;
+    if (nmb > 1 && slot->d_accum != NULL) {
+        /*
+         * Samples are placed at the centres of equal slices of the open
+         * shutter, not at its ends. Sampling the endpoints weights the two
+         * extremes of the movement double once the frames either side are
+         * considered, which reads as a smear with a hard bright edge; centres
+         * spread the energy evenly and are the standard box filter.
+         */
+        float shutter_ms = 1000.0f / (float)ctx->config.fps * ctx->config.mb_shutter;
+        int   npx = res->width * res->height;
+        int   blocks = (npx + 255) / 256;
+
+        for (int k = 0; k < nmb; k++) {
+            float off = shutter_ms * (((float)k + 0.5f) / (float)nmb - 0.5f);
+            render_stage(ctx, res, slot_idx, frame, time_ms, off, base);
+            k_mb_accum<<<blocks, 256, 0, stream>>>(slot->d_accum, base, npx, k == 0);
+            CUDA_CHECK_KERNEL();
+        }
+        k_mb_resolve<<<blocks, 256, 0, stream>>>(base, slot->d_accum, npx,
+                                                 1.0f / (float)nmb);
+        CUDA_CHECK_KERNEL();
+    } else {
+        render_stage(ctx, res, slot_idx, frame, time_ms, 0.0f, base);
     }
 
     /* 3. Film-wide effects on the finished frame. */
     uchar4 *final_frame = apply_effect_list(ctx->effects, ctx->effect_count, res, slot_idx,
                                             base, t_sec, frame);
 
-    /* 4. RGBA → NV12 inside VRAM: 2.67x less data to transfer. */
-    uint8_t *y_plane  = slot->d_nv12;
-    uint8_t *uv_plane = slot->d_nv12 + (size_t)res->width * (size_t)res->height;
+    /*
+     * 4. RGBA → NV12 inside VRAM: 2.67x less data to transfer.
+     *
+     * Skipped entirely when the project keeps its alpha, because NV12 has
+     * nowhere to put it. The frame then crosses as RGBA, which is the whole of
+     * the extra cost — two thirds more per frame.
+     */
+    const void *src_ptr;
+    if (res->alpha_out) {
+        src_ptr = final_frame;
+    } else {
+        uint8_t *y_plane  = slot->d_nv12;
+        uint8_t *uv_plane = slot->d_nv12 + (size_t)res->width * (size_t)res->height;
 
-    const dim3 nv_block(16, 16);
-    dim3       nv_grid((((res->width + 1) / 2) + nv_block.x - 1) / nv_block.x,
-                       (((res->height + 1) / 2) + nv_block.y - 1) / nv_block.y);
+        const dim3 nv_block(16, 16);
+        dim3       nv_grid((((res->width + 1) / 2) + nv_block.x - 1) / nv_block.x,
+                           (((res->height + 1) / 2) + nv_block.y - 1) / nv_block.y);
 
-    k_rgba_to_nv12<<<nv_grid, nv_block, 0, stream>>>(final_frame, y_plane, uv_plane,
-                                                     res->width, res->height);
-    CUDA_CHECK_KERNEL();
+        k_rgba_to_nv12<<<nv_grid, nv_block, 0, stream>>>(final_frame, y_plane, uv_plane,
+                                                         res->width, res->height);
+        CUDA_CHECK_KERNEL();
+        src_ptr = slot->d_nv12;
+    }
 
     /* 5. Back to the host + an event so the CPU knows when it is done. */
-    gpuErrchk(cudaMemcpyAsync(slot->h_frame, slot->d_nv12, res->nv12_bytes,
+    gpuErrchk(cudaMemcpyAsync(slot->h_frame, src_ptr, res->pipe_bytes,
                               cudaMemcpyDeviceToHost, stream));
     gpuErrchk(cudaEventRecord(slot->done, stream));
 }
@@ -1072,11 +1274,11 @@ bool render_video(EditorContext *ctx, const char *output_file)
 
             gpuErrchk(cudaEventSynchronize(ps->done));
 
-            size_t written = fwrite(ps->h_frame, 1, res->nv12_bytes, pipe);
-            if (written != res->nv12_bytes) {
+            size_t written = fwrite(ps->h_frame, 1, res->pipe_bytes, pipe);
+            if (written != res->pipe_bytes) {
                 fprintf(stderr, "\nerror: writing to the ffmpeg pipe failed "
                                 "(%zu / %zu bytes) — the encoder probably closed.\n",
-                        written, res->nv12_bytes);
+                        written, res->pipe_bytes);
                 ok = false;
                 break;
             }
@@ -1100,8 +1302,8 @@ bool render_video(EditorContext *ctx, const char *output_file)
 
         gpuErrchk(cudaEventSynchronize(ls->done));
 
-        size_t written = fwrite(ls->h_frame, 1, res->nv12_bytes, pipe);
-        if (written != res->nv12_bytes) {
+        size_t written = fwrite(ls->h_frame, 1, res->pipe_bytes, pipe);
+        if (written != res->pipe_bytes) {
             fprintf(stderr, "\nerror: writing the final frame failed.\n");
             ok = false;
         }

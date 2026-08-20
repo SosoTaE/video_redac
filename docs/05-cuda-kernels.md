@@ -1,6 +1,6 @@
 # CUDA kernels
 
-Nine `__global__` kernels in `src/renderer.cu`.
+Seventeen `__global__` kernels in `src/renderer.cu`.
 
 Launch geometry is 16×16 threads (256 per block) throughout: a multiple of the
 warp size, and neighbouring threads touch neighbouring pixels, so writes
@@ -122,6 +122,53 @@ space. A fully transparent sample returns early, skipping a read-modify-write.
 
 ---
 
+## `k_mesh` and `k_depth_clear`
+
+```c
+__global__ void k_mesh(uchar4 *fb, float *depth, const ScreenTri *tris,
+                       MeshTextures maps, MeshParams p);
+__global__ void k_depth_clear(float *depth, int npx);
+```
+
+The one kernel whose loop is inverted: it iterates **triangles inside one
+pixel**, not pixels inside one triangle.
+
+That inversion is what lets a single implementation serve both backends. The
+depth test becomes a local variable — each thread independently finds the
+nearest face covering its own pixel — so there is no shared z-buffer to race
+over and no atomics. A conventional scanline rasterizer with atomics would be
+faster on heavy meshes but would need two different implementations, and the
+whole architecture rests on not having those.
+
+The cost is **O(triangles) per pixel**, so this suits models of hundreds to a
+few thousand faces rather than scanned assets.
+
+The depth buffer is still shared, and belongs to the *scene* rather than to a
+mesh — clearing it once per frame is what lets several meshes occlude one
+another. `k_depth_clear` runs over a flat 1-D grid because it has no spatial
+structure.
+
+The grid covers only the mesh's projected bounding box, computed on the host
+during `vr_mesh_project`, so a small object in a large frame costs a small
+launch.
+
+`MeshTextures` carries the four maps a surface can wear — base colour,
+occlusion, normal and emissive — as one value, so the signature stops changing
+every time the material model grows.
+
+## `k_highlight`
+
+```c
+__global__ void k_highlight(uchar4 *fb, const uchar4 *plate,
+                            HighlightParams p);
+```
+
+The band drawn behind a range of text lines. It reuses `CompositeParams`
+verbatim rather than carrying its own geometry, which is the point: the band is
+back-projected through exactly the same inverse matrix as the text it sits
+behind, so it inherits position, scale and rotation for free and cannot drift
+out of alignment with the lines it marks.
+
 ## `k_rgba_to_nv12`
 
 ```c
@@ -181,11 +228,13 @@ frame number, so grain is deterministic per frame yet changes between frames.
 
 ```c
 __global__ void k_fx_point(uchar4 *dst, const uchar4 *src, int w, int h,
-                           EffectGPU fx, unsigned int seed);
+                           EffectGPU fx, const float *lut, unsigned int seed);
 ```
 
-All twelve pointwise effects in one kernel, branching on `fx.type` (uniform
-across the grid, so no real divergence).
+All the pointwise effects in one kernel, branching on `fx.type` (uniform across
+the grid, so no real divergence). `lut` is the pointer the LUT effect reads its
+colour cube through — null for every other effect, and the only reason this
+kernel takes anything beyond the parameter block.
 
 | Effect | Maths |
 |---|---|
@@ -201,9 +250,73 @@ across the grid, so no real divergence).
 | `split_tone` | tone from shadows→highlights by luma, soft-light-ish blend |
 | `gradient_map` | `mix(c, mix(shadow, highlight, luma), amount)` |
 | `color_grade` | exposure → brightness → contrast → gamma → temp/tint → saturation → vibrance → hue |
+| `lift_gamma_gain` | `pow((c + lift·(1−c))·gain, 1/gamma)` per channel |
+| `lut` | trilinear lookup in a `size³` cube, mixed by `amount` |
 
 `color_grade`'s order mirrors a real grading session; the hue rotation uses the
 standard YIQ-approximation matrix.
+
+### `k_fx_window`
+
+```c
+__global__ void k_fx_window(uchar4 *dst, const uchar4 *keep, int w, int h,
+                            EffectGPU fx);
+```
+
+The power window and the HSL qualifier, applied as a **separate pass after** the
+effect rather than a test inside it. `keep` is the frame as it was before the
+effect ran; this blends `dst` back toward it wherever the mask says the effect
+does not apply.
+
+That placement is the whole reason it works on every effect. A blur cannot
+honour "skip this pixel" — a blur with half its taps skipped is not a narrower
+blur, it is a wrong one — so the effect runs over the whole frame and the mask
+then chooses how much of the result to keep.
+
+The qualifier is judged on `keep`, not on `dst`: testing the output would make
+the selection chase its own correction.
+
+Runs only for effects that have a window or a qualifier, and the `keep` buffer
+is allocated only when the project contains one.
+
+### `k_fx_bloom_cut` / `k_fx_bloom_add`
+
+```c
+__global__ void k_fx_bloom_cut(uchar4 *dst, const uchar4 *src, int w, int h,
+                               float threshold);
+__global__ void k_fx_bloom_add(uchar4 *dst, const uchar4 *src,
+                               const uchar4 *glow, int w, int h, float intensity);
+```
+
+Bloom in three stages: cut the highlights into their own buffer, blur it with
+the existing `k_fx_blur` (using `dst` as scratch between the two directions),
+then add it back.
+
+`src` survives all three, which is the constraint that dictates the buffer
+layout — a bloom that blurred in place would glow its own glow.
+
+The cut keeps the **excess** over the threshold, not the pixel: 0.8 against a
+threshold of 0.75 contributes 0.05. That is what makes a glint bloom and a white
+wall not. The colour is normalised by the pixel's own luma so the glow takes the
+hue of whatever is glowing.
+
+### `k_mb_accum` / `k_mb_resolve`
+
+```c
+__global__ void k_mb_accum(float4 *acc, const uchar4 *src, int npx, int first);
+__global__ void k_mb_resolve(uchar4 *dst, const float4 *acc, int npx, float scale);
+```
+
+Motion blur: the scene stage is rendered once per sub-frame and summed here,
+then divided at the end.
+
+**A float accumulator, not an integer one.** Thirty-two 8-bit channels sum into
+an integer easily, but rounding each sub-frame back to a byte before adding
+throws away exactly the fractional detail the averaging exists to recover — a
+slow pan comes out stepped instead of smooth.
+
+These are the only kernels launched over a flat 1-D grid rather than 16×16
+tiles, because they have no spatial structure to exploit.
 
 ### `k_fx_blur`
 
@@ -282,17 +395,30 @@ Preset formulas are in [06-algorithms.md](06-algorithms.md#transition-presets).
 
 ## Kernel inventory
 
-| Kernel | Grid over | Reads neighbours |
-|---|---|---|
-| `k_clear_background` | whole frame | no |
-| `k_composite_texture` | destination bbox | yes (bilinear) |
-| `k_rgba_to_nv12` | half-resolution blocks | 2×2 |
-| `k_fx_point` | whole frame | no |
-| `k_fx_blur` | whole frame | yes, 1-D |
-| `k_fx_pixelate` | whole frame | yes |
-| `k_fx_rgb_split` | whole frame | yes |
-| `k_fx_glitch` | whole frame | yes |
-| `k_transition` | whole frame | yes (bilinear ×2) |
+| Kernel | Grid over | Reads neighbours | Present when |
+|---|---|---|---|
+| `k_clear_background` | whole frame | no | always |
+| `k_composite_texture` | destination bbox | yes (bilinear) | always |
+| `k_mesh` | the mesh's screen bbox | no — loops triangles | a scene has meshes |
+| `k_depth_clear` | flat 1-D | no | a scene has meshes |
+| `k_highlight` | destination bbox | yes | a highlight event |
+| `k_rgba_to_nv12` | half-resolution blocks | 2×2 | `output.alpha` is off |
+| `k_fx_point` | whole frame | no | any pointwise effect |
+| `k_fx_window` | whole frame | no | an effect has a window or qualifier |
+| `k_fx_bloom_cut` | whole frame | no | `bloom` |
+| `k_fx_bloom_add` | whole frame | no | `bloom` |
+| `k_fx_blur` | whole frame | yes, 1-D | `blur`, `bloom` |
+| `k_fx_pixelate` | whole frame | yes | `pixelate` |
+| `k_fx_rgb_split` | whole frame | yes | `rgb_split` |
+| `k_fx_glitch` | whole frame | yes | `glitch` |
+| `k_mb_accum` | flat 1-D | no | `motion_blur` |
+| `k_mb_resolve` | flat 1-D | no | `motion_blur` |
+| `k_transition` | whole frame | yes (bilinear ×2) | mid-transition |
 
-All nine are verified with `compute-sanitizer` `memcheck` and `initcheck`: zero
-errors, zero leaked bytes. See [07-cli-and-build.md](07-cli-and-build.md#sanitizers).
+**`k_rgba_to_nv12` is skipped entirely** when `output.alpha` is set: NV12 has no
+alpha channel to carry one in, so the frame crosses the bus as RGBA and there is
+no colour conversion at all. See
+[03-json-reference.md](03-json-reference.md#alpha--keeping-the-matte).
+
+Verified with `compute-sanitizer` `memcheck` and `initcheck`: zero errors, zero
+leaked bytes. See [07-cli-and-build.md](07-cli-and-build.md#sanitizers).

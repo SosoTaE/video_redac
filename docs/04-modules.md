@@ -122,10 +122,100 @@ bool        effect_needs_neighbors(EffectType);
 void        effect_free(Effect*);
 ```
 
-Only the host-side bookkeeping; the pixel maths is in `renderer.cu`.
-`effect_needs_neighbors` is true for `blur`, `pixelate`, `rgb_split` and
-`glitch` — the effects that read pixels other than their own and therefore
+Only the host-side bookkeeping; the pixel maths is in `include/pixel_ops.h`.
+`effect_needs_neighbors` is true for `bloom`, `blur`, `pixelate`, `rgb_split`
+and `glitch` — the effects that read pixels other than their own and therefore
 cannot run in place.
+
+`effect_free` also releases the colour cube a `lut` effect owns and the tracks
+its power window uses. It deliberately does **not** free `d_lut`: that is device
+memory the renderer allocated and frees with the rest of its own, and freeing it
+here would be a double free on the CUDA backend.
+
+---
+
+## `lut.c` — Adobe/Iridas `.cube` files
+
+```c
+bool lut_load_cube(const char *path, float **out, int *size);
+```
+
+Reads a colour lookup table into a cube of `size³` RGB triples, red varying
+fastest — the order the file itself stores.
+
+**1D tables are expanded into a cube on load.** A 1D LUT means the three axes
+are independent, so the cube is separable and the expansion is exact rather than
+an approximation; the pixel loop then has one case instead of two.
+
+What makes a reader non-trivial is that files in the wild are sloppy: Windows
+line endings, tabs, comments after data, keywords this reader does not know, a
+declared size that disagrees with the row count. Each is handled rather than
+producing a plausible-looking but wrong image — **a LUT read with the wrong
+stride still renders, in wrong colour**, which is why a size mismatch is a hard
+error and not a warning.
+
+A `DOMAIN_MIN`/`DOMAIN_MAX` other than 0..1 is reported and then used as-is:
+such files expect log footage, which nothing here produces.
+
+---
+
+## `mesh.c` — primitives, OBJ, and the shared geometry helpers
+
+```c
+bool        mesh_load(MeshWidget*);
+const char *mesh_shape_name(size_t i);
+void        mesh_free(MeshWidget*);
+
+/* src/mesh_internal.h — shared with the format readers */
+bool vr_mesh_push_vert(MeshWidget*, size_t *cap, float x, float y, float z);
+bool vr_mesh_push_tri(MeshWidget*, size_t *cap, int a, int b, int c);
+bool vr_mesh_ensure_attribs(MeshWidget*, size_t cap);
+void vr_mesh_set_attrib(MeshWidget*, float nx, float ny, float nz, float u, float v);
+bool vr_mesh_ensure_tangents(MeshWidget*, size_t cap);
+void vr_mesh_set_tangent(MeshWidget*, float x, float y, float z, float w);
+```
+
+`mesh_load` dispatches on the path's extension or, with no path, on `shape`
+through a table shared with `--list shapes` so the two cannot disagree.
+
+Everything is normalised into a unit cube about the origin afterwards. Without
+that, `size` would mean something different for every file — an OBJ in
+millimetres and one in metres differ by a thousand — and models built far from
+the origin would rotate about a point outside themselves.
+
+Two derivation passes run after normalisation, in that order because each is the
+next one's input:
+
+* `derive_normals` — area-weighted, so a sliver does not skew a surface.
+* `derive_tangents` — **not** area-weighted, deliberately. See
+  [06-algorithms.md](06-algorithms.md#tangent-frames-for-normal-mapping). Only
+  built for a mesh that actually has a normal map.
+
+---
+
+## `gltf.c` — glTF 2.0
+
+```c
+bool vr_mesh_load_gltf(MeshWidget*, size_t *vc, size_t *tc);
+```
+
+Both `.gltf` (external or base64 buffers) and `.glb`. Everything reads through
+`acc_read`, which turns "component c of element i of accessor a" into a float
+regardless of how it was packed — reading buffers directly works for one
+exporter's files and breaks on the next.
+
+Geometry, the node hierarchy's transforms, and from the material: base colour,
+occlusion, normal and emissive textures plus `normalTexture.scale` and
+`emissiveFactor`. Animation, skinning and morph targets are out of scope and
+reported rather than silently dropped.
+
+**Two conventions are converted on the way in**, and both are invisible until
+they bite — a half turn about X, and reversed winding. See
+[03-json-reference.md](03-json-reference.md#file-formats--obj-and-gltf).
+
+`TANGENT` is read only when *every* primitive supplies it; otherwise the partial
+array is discarded and `mesh.c` derives the whole set from the UVs. One
+consistent frame beats a marginally better one on half the object.
 
 ---
 
@@ -393,8 +483,17 @@ whose start is measured from the clip's end.
 [N:a] aresample=48000 → aformat → atrim → volume → afade(in) → afade(out) → adelay
 ```
 
-then sums with `amix=normalize=0` and a limiter. Order matters: trim, then gain,
-then fades, and only then position on the timeline.
+then sums with `amix=normalize=0` and a limiter.
+
+The chain order is a mixing desk's: **trim → volume → eq → compressor → pan →
+fades → timeline delay**. A compressor has to see the level it will actually act
+on, so it sits after the fader and the EQ; the fades and the delay come last
+because they are about *when*, not what.
+
+`duck` is the exception and cannot be a link in that chain — it needs the *other*
+track's signal — so the graph is built in three parts: the chains, then an
+`asplit` of each key into one copy per ducker plus one for the mix, then the
+`sidechaincompress` stages.
 
 ---
 
